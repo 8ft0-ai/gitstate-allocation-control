@@ -1,0 +1,10 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gitstate-phase2-intake"
+version = "0.1.0"
+description = "Trusted intake and authorisation boundary for the bounded Gitstate Phase 2 experiment"
+requires-python = ">=3.11"
+dependencies = []

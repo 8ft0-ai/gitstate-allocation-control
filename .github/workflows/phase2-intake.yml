@@ -1,0 +1,207 @@
+name: Phase 2 trusted intake
+
+on:
+  issue_comment:
+    types: [created, edited, deleted]
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Trusted manual operation
+        required: true
+        default: reconcile
+        type: choice
+        options:
+          - reconcile
+          - scope_probe
+
+concurrency:
+  group: beads-allocation-v0.2-${{ github.repository }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: read
+
+jobs:
+  static-authorisation:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      issues: read
+    outputs:
+      action: ${{ steps.intake.outputs.action }}
+      candidate: ${{ steps.intake.outputs.candidate }}
+      reason_code: ${{ steps.intake.outputs.reason_code }}
+      report_issue_number: ${{ steps.intake.outputs.report_issue_number }}
+      source_comment_id: ${{ steps.intake.outputs.source_comment_id }}
+      trusted_sha: ${{ steps.intake.outputs.trusted_sha }}
+    steps:
+      - name: Run immutable static intake without checkout
+        id: intake
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_ACTOR: ${{ github.actor }}
+          TRUSTED_SHA: ${{ github.workflow_sha }}
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const { spawnSync } = require('child_process');
+            const files = [
+              'phase2/__init__.py', 'phase2/control_surface.py', 'phase2/parser.py',
+              'phase2/policy.py', 'phase2/discovery.py', 'phase2/github_api.py',
+              'phase2/static_intake.py', 'policy/actors.json'
+            ];
+            const root = path.join(process.env.RUNNER_TEMP, `phase2-static-${process.env.GITHUB_RUN_ID}`);
+            for (const file of files) {
+              const response = await github.rest.repos.getContent({
+                owner: context.repo.owner, repo: context.repo.repo, path: file, ref: process.env.TRUSTED_SHA
+              });
+              const target = path.join(root, file);
+              fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
+              fs.writeFileSync(target, Buffer.from(response.data.content, 'base64'), { mode: 0o600 });
+            }
+            const run = spawnSync('python3', ['-m', 'phase2.static_intake'], {
+              cwd: root,
+              encoding: 'utf8',
+              env: {
+                ...process.env,
+                GITHUB_TOKEN: process.env.GITHUB_TOKEN,
+                GITHUB_ACTOR: process.env.GITHUB_ACTOR,
+                PHASE2_TRUSTED_SHA: process.env.TRUSTED_SHA
+              }
+            });
+            const last = run.stdout.trim().split('\n').pop();
+            if (!last) {
+              core.setFailed('Static intake returned no result');
+              return;
+            }
+            const result = JSON.parse(last);
+            for (const [key, value] of Object.entries(result)) core.setOutput(key, value ?? '');
+            core.setOutput('trusted_sha', process.env.TRUSTED_SHA);
+            if (run.status !== 0 || result.action === 'blocked') core.setFailed(`Static intake blocked: ${result.reason_code}`);
+
+  report-static-rejection:
+    needs: static-authorisation
+    if: >-
+      needs.static-authorisation.outputs.action == 'rejected' &&
+      vars.PHASE2_INTAKE_ENABLED == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: none
+      issues: write
+    steps:
+      - name: Post bounded static rejection
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3
+        env:
+          ISSUE_NUMBER: ${{ needs.static-authorisation.outputs.report_issue_number }}
+          REASON_CODE: ${{ needs.static-authorisation.outputs.reason_code }}
+          SOURCE_COMMENT_ID: ${{ needs.static-authorisation.outputs.source_comment_id }}
+        with:
+          script: |
+            const issue_number = Number(process.env.ISSUE_NUMBER);
+            if (!Number.isSafeInteger(issue_number)) return;
+            const source = Number(process.env.SOURCE_COMMENT_ID);
+            const body = `Phase 2 intake rejected.\n\n\`\`\`json\n${JSON.stringify({
+              execution_may_begin: false,
+              protocol: 'beads-allocation/v0.2',
+              reason_code: process.env.REASON_CODE,
+              source_comment_id: Number.isSafeInteger(source) ? source : null
+            })}\n\`\`\``;
+            await github.rest.issues.createComment({ ...context.repo, issue_number, body });
+
+  source-revalidation:
+    needs: static-authorisation
+    if: >-
+      needs.static-authorisation.outputs.action == 'live_check' &&
+      vars.PHASE2_INTAKE_ENABLED == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      issues: read
+    outputs:
+      action: ${{ steps.source.outputs.action }}
+      reason_code: ${{ steps.source.outputs.reason_code }}
+      report_issue_number: ${{ steps.source.outputs.report_issue_number }}
+      source_comment_id: ${{ steps.source.outputs.source_comment_id }}
+    steps:
+      - name: Checkout immutable trusted content without persisted credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ needs.static-authorisation.outputs.trusted_sha }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Revalidate current source without App credentials
+        id: source
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PHASE2_CANDIDATE: ${{ needs.static-authorisation.outputs.candidate }}
+          PHASE2_TRUSTED_SHA: ${{ needs.static-authorisation.outputs.trusted_sha }}
+        run: python3 -m phase2.source_revalidation
+
+  report-source-rejection:
+    needs: source-revalidation
+    if: needs.source-revalidation.outputs.action == 'rejected'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: none
+      issues: write
+    steps:
+      - name: Post bounded source rejection
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3
+        env:
+          ISSUE_NUMBER: ${{ needs.source-revalidation.outputs.report_issue_number }}
+          REASON_CODE: ${{ needs.source-revalidation.outputs.reason_code }}
+          SOURCE_COMMENT_ID: ${{ needs.source-revalidation.outputs.source_comment_id }}
+        with:
+          script: |
+            const issue_number = Number(process.env.ISSUE_NUMBER);
+            const source = Number(process.env.SOURCE_COMMENT_ID);
+            if (!Number.isSafeInteger(issue_number) || !Number.isSafeInteger(source)) return;
+            const body = `Phase 2 intake rejected.\n\n\`\`\`json\n${JSON.stringify({
+              execution_may_begin: false,
+              protocol: 'beads-allocation/v0.2',
+              reason_code: process.env.REASON_CODE,
+              source_comment_id: source
+            })}\n\`\`\``;
+            await github.rest.issues.createComment({ ...context.repo, issue_number, body });
+
+  trusted-live-check:
+    needs: [static-authorisation, source-revalidation]
+    if: >-
+      always() &&
+      (
+        (
+          needs.static-authorisation.outputs.action == 'live_check' &&
+          vars.PHASE2_INTAKE_ENABLED == 'true' &&
+          needs.source-revalidation.result == 'success' &&
+          needs.source-revalidation.outputs.action == 'live_check'
+        ) ||
+        needs.static-authorisation.outputs.action == 'scope_probe'
+      )
+    runs-on: ubuntu-24.04
+    environment: phase-2-allocator
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Checkout immutable protected-default-branch content
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ needs.static-authorisation.outputs.trusted_sha }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Revalidate live installation and bounded scope
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PHASE2_ACTION: ${{ needs.static-authorisation.outputs.action }}
+          PHASE2_ALLOCATOR_APP_ID: ${{ vars.PHASE2_ALLOCATOR_APP_ID }}
+          PHASE2_ALLOCATOR_INSTALLATION_ID: ${{ vars.PHASE2_ALLOCATOR_INSTALLATION_ID }}
+          PHASE2_ALLOCATOR_APP_PRIVATE_KEY: ${{ secrets.PHASE2_ALLOCATOR_APP_PRIVATE_KEY }}
+          PHASE2_SOURCE_COMMENT_ID: ${{ needs.source-revalidation.outputs.source_comment_id }}
+          PHASE2_STATE_REPOSITORY_ID: ${{ secrets.PHASE2_STATE_REPOSITORY_ID }}
+          PHASE2_TRUSTED_SHA: ${{ needs.static-authorisation.outputs.trusted_sha }}
+        run: python3 -m phase2.trusted_intake
