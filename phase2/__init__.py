@@ -7,4 +7,5 @@ __all__ = [
     "parser",
     "policy",
     "source_revalidation",
+    "workflow_policy",
 ]

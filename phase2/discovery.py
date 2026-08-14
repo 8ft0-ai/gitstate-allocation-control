@@ -104,11 +104,28 @@ def classify(comment: dict[str, Any], repository: str, policy: dict[str, Any]) -
     return Candidate(comment_id, "READY_FOR_LIVE_CHECK", None, parsed.payload_hash, parsed.payload["request_id"], principal.encode())
 
 
-def oldest_unprocessed(comments: Iterable[dict[str, Any]], repository: str, policy: dict[str, Any], processed_comment_ids: set[int]) -> Candidate | None:
+def discover_candidates(
+    comments: Iterable[dict[str, Any]],
+    repository: str,
+    policy: dict[str, Any],
+    processed_comment_ids: set[int],
+) -> list[Candidate]:
+    """Return every protocol candidate not already represented by canonical state.
+
+    Workstream A deliberately returns the complete numeric-order candidate set.
+    A later canonical state-aware stage supplies processed_comment_ids and selects
+    the oldest remaining valid request; the credential-free discovery layer must
+    not invent processed state or starve later retained comments.
+    """
     candidates = [
         candidate
         for comment in comments
         if comment["id"] not in processed_comment_ids
         if (candidate := classify(comment, repository, policy)) is not None
     ]
-    return min(candidates, key=lambda item: item.comment_id, default=None)
+    return sorted(candidates, key=lambda item: item.comment_id)
+
+
+def oldest_unprocessed(comments: Iterable[dict[str, Any]], repository: str, policy: dict[str, Any], processed_comment_ids: set[int]) -> Candidate | None:
+    candidates = discover_candidates(comments, repository, policy, processed_comment_ids)
+    return candidates[0] if candidates else None

@@ -1,3 +1,4 @@
+import base64
 import json
 import tempfile
 import unittest
@@ -17,7 +18,7 @@ def request_comment(comment_id=77):
         "agent_id": "agent://human/8ft0-ai/session/01",
         "capabilities": [],
         "protocol": "beads-allocation/v0.2",
-        "request_id": "01K00000000000000000000000",
+        "request_id": f"01K{comment_id:023d}"[-26:],
         "task_types": [],
         "type": "ALLOCATE_NEXT",
     }
@@ -63,6 +64,11 @@ def environment(event_name, event):
     }
 
 
+def decode(value):
+    padding = "=" * (-len(value) % 4)
+    return json.loads(base64.urlsafe_b64decode(value + padding))
+
+
 class StaticIntakeTests(unittest.TestCase):
     def tearDown(self):
         for path in getattr(self, "_paths", []):
@@ -77,7 +83,7 @@ class StaticIntakeTests(unittest.TestCase):
     def _api(self, issue=None, comments=None):
         api = Mock()
         api.get.return_value = issue or control_issue()
-        api.request.return_value = (comments or [request_comment()], {})
+        api.request.return_value = ([request_comment()] if comments is None else comments, {})
         return api
 
     def test_schedule_scans_valid_control_surface(self):
@@ -85,8 +91,46 @@ class StaticIntakeTests(unittest.TestCase):
         with patch("phase2.static_intake.GitHubAPI", return_value=api):
             result = run(self._env("schedule", base_event()))
         self.assertEqual(result["action"], "live_check")
+        self.assertEqual(result["candidate_count"], 1)
+        self.assertEqual(
+            [item["comment_id"] for item in decode(result["candidate_set"])["candidates"]],
+            [77],
+        )
         api.get.assert_called_once()
         api.request.assert_called_once()
+
+    def test_complete_candidate_set_survives_reconciliation_retry(self):
+        comments = [request_comment(30), request_comment(31), request_comment(32)]
+        api = self._api(comments=comments)
+        with patch("phase2.static_intake.GitHubAPI", return_value=api):
+            first = run(self._env("schedule", base_event()))
+        api = self._api(comments=comments)
+        with patch("phase2.static_intake.GitHubAPI", return_value=api):
+            retry = run(self._env("schedule", base_event()))
+        self.assertEqual(first["candidate_count"], 3)
+        self.assertEqual(
+            [item["comment_id"] for item in decode(first["candidate_set"])["candidates"]],
+            [30, 31, 32],
+        )
+        self.assertEqual(first["candidate_set"], retry["candidate_set"])
+
+    def test_rejected_comment_does_not_starve_later_valid_comment(self):
+        edited = request_comment(40)
+        edited["updated_at"] = "2026-01-01T00:00:01Z"
+        api = self._api(comments=[edited, request_comment(41)])
+        with patch("phase2.static_intake.GitHubAPI", return_value=api):
+            result = run(self._env("schedule", base_event()))
+        self.assertEqual(result["action"], "live_check")
+        self.assertEqual(result["candidate_count"], 1)
+        self.assertEqual(result["rejection_count"], 1)
+        self.assertEqual(
+            [item["comment_id"] for item in decode(result["candidate_set"])["candidates"]],
+            [41],
+        )
+        self.assertEqual(
+            decode(result["rejection_set"])["rejections"],
+            [{"reason_code": "SOURCE_COMMENT_EDITED_BEFORE_INGRESS", "source_comment_id": 40}],
+        )
 
     def test_control_surface_label_and_state_fail_closed(self):
         cases = [
@@ -120,10 +164,11 @@ class StaticIntakeTests(unittest.TestCase):
     def test_manual_reconcile_uses_same_scan(self):
         event = base_event()
         event.update({"sender": {"login": "8ft0-ai"}, "inputs": {"operation": "reconcile"}})
-        api = self._api()
+        api = self._api(comments=[request_comment(10), request_comment(11)])
         with patch("phase2.static_intake.GitHubAPI", return_value=api):
             result = run(self._env("workflow_dispatch", event))
         self.assertEqual(result["action"], "live_check")
+        self.assertEqual(result["candidate_count"], 2)
         api.request.assert_called_once()
 
     def test_manual_scope_probe_is_explicit_and_operator_authorised(self):

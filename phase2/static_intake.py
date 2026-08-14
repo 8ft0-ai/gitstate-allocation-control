@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .control_surface import ControlSurfaceError, validate_control_surface
-from .discovery import Candidate, DiscoveryError, oldest_unprocessed, paginate_comments
+from .discovery import Candidate, DiscoveryError, discover_candidates, paginate_comments
 from .github_api import GitHubAPI
 from .parser import PREFIX
 from .policy import load_policy
@@ -22,15 +22,41 @@ def _result(action: str, **values: Any) -> dict[str, Any]:
     return {"action": action, **values}
 
 
-def _candidate_payload(candidate: Candidate, trusted_sha: str) -> str:
-    value = {
+def _encode(value: dict[str, Any]) -> str:
+    raw = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def _candidate_record(candidate: Candidate) -> dict[str, Any]:
+    return {
         "comment_id": candidate.comment_id,
         "payload_hash": candidate.payload_hash,
         "principal": candidate.principal,
         "request_id": candidate.request_id,
-        "trusted_sha": trusted_sha,
     }
-    return base64.urlsafe_b64encode(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).decode()
+
+
+def _candidate_set_payload(candidates: list[Candidate], trusted_sha: str) -> str:
+    return _encode(
+        {
+            "candidates": [_candidate_record(candidate) for candidate in candidates],
+            "trusted_sha": trusted_sha,
+            "version": 1,
+        }
+    )
+
+
+def _rejection_set_payload(candidates: list[Candidate], trusted_sha: str) -> str:
+    return _encode(
+        {
+            "rejections": [
+                {"reason_code": candidate.reason_code, "source_comment_id": candidate.comment_id}
+                for candidate in candidates
+            ],
+            "trusted_sha": trusted_sha,
+            "version": 1,
+        }
+    )
 
 
 def run(env: dict[str, str] | None = None) -> dict[str, Any]:
@@ -93,20 +119,44 @@ def run(env: dict[str, str] | None = None) -> dict[str, Any]:
         return payload, 'rel="next"' in link
 
     try:
-        comments = paginate_comments(fetch_page)
+        candidates = discover_candidates(
+            paginate_comments(fetch_page),
+            policy["control_repository"],
+            policy,
+            set(),
+        )
     except DiscoveryError as exc:
         return _result("blocked", reason_code=str(exc))
-    candidate = oldest_unprocessed(comments, policy["control_repository"], policy, set())
-    if candidate is None:
+
+    if not candidates:
         return _result("noop")
-    if candidate.disposition == "REJECTED":
+
+    ready = [candidate for candidate in candidates if candidate.disposition == "READY_FOR_LIVE_CHECK"]
+    rejected = [candidate for candidate in candidates if candidate.disposition == "REJECTED"]
+    common: dict[str, Any] = {
+        "candidate_count": len(ready),
+        "rejection_count": len(rejected),
+        "report_issue_number": policy["allocation_issue_number"],
+        "trusted_sha": trusted_sha,
+    }
+    if rejected:
+        common["rejection_set"] = _rejection_set_payload(rejected, trusted_sha)
+
+    if ready:
         return _result(
-            "rejected",
-            reason_code=candidate.reason_code,
-            report_issue_number=policy["allocation_issue_number"],
-            source_comment_id=candidate.comment_id,
+            "live_check",
+            **common,
+            candidate_set=_candidate_set_payload(ready, trusted_sha),
+            source_comment_id=ready[0].comment_id,
         )
-    return _result("live_check", candidate=_candidate_payload(candidate, trusted_sha), trusted_sha=trusted_sha)
+
+    first = rejected[0]
+    return _result(
+        "rejected",
+        **common,
+        reason_code=first.reason_code,
+        source_comment_id=first.comment_id,
+    )
 
 
 def main() -> int:

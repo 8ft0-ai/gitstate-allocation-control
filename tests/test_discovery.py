@@ -1,9 +1,15 @@
+import hashlib
 import json
 import unittest
 
-import hashlib
-
-from phase2.discovery import CanonicalSource, DiscoveryError, oldest_unprocessed, paginate_comments, reconcile_canonical_sources
+from phase2.discovery import (
+    CanonicalSource,
+    DiscoveryError,
+    discover_candidates,
+    oldest_unprocessed,
+    paginate_comments,
+    reconcile_canonical_sources,
+)
 from phase2.parser import PREFIX
 
 
@@ -12,8 +18,36 @@ def page_fetch(pages, links):
 
 
 def request(comment_id):
-    payload = {"agent_id": "agent://human/human/session/01", "capabilities": [], "protocol": "beads-allocation/v0.2", "request_id": f"01K{comment_id:023d}"[-26:], "task_types": [], "type": "ALLOCATE_NEXT"}
-    return {"id": comment_id, "body": (PREFIX + json.dumps(payload, separators=(",", ":")).encode()).decode(), "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z", "user": {"id": 1, "login": "human", "type": "User"}}
+    payload = {
+        "agent_id": "agent://human/human/session/01",
+        "capabilities": [],
+        "protocol": "beads-allocation/v0.2",
+        "request_id": f"01K{comment_id:023d}"[-26:],
+        "task_types": [],
+        "type": "ALLOCATE_NEXT",
+    }
+    return {
+        "id": comment_id,
+        "body": (PREFIX + json.dumps(payload, separators=(",", ":")).encode()).decode(),
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-01T00:00:00Z",
+        "user": {"id": 1, "login": "human", "type": "User"},
+    }
+
+
+def policy():
+    return {
+        "version": 1,
+        "operators": [],
+        "principals": [
+            {
+                "actor_login": "human",
+                "actor_type": "User",
+                "agent_prefixes": ["agent://human/human/session/"],
+            }
+        ],
+        "github_apps": [],
+    }
 
 
 class DiscoveryTests(unittest.TestCase):
@@ -34,12 +68,17 @@ class DiscoveryTests(unittest.TestCase):
                     paginate_comments(page_fetch(pages, links))
                 self.assertEqual(str(error.exception), reason)
 
-    def test_cancelled_run_replays_oldest(self):
-        policy = {"version": 1, "operators": [], "principals": [{"actor_login": "human", "actor_type": "User", "agent_prefixes": ["agent://human/human/session/"]}], "github_apps": []}
+    def test_complete_candidate_set_prevents_starvation(self):
         comments = [request(30), request(31), request(32)]
-        self.assertEqual(oldest_unprocessed(comments, "example/control", policy, set()).comment_id, 30)
-        self.assertEqual(oldest_unprocessed(comments, "example/control", policy, set()).comment_id, 30)
-        self.assertEqual(oldest_unprocessed(comments, "example/control", policy, {30}).comment_id, 31)
+        first = discover_candidates(comments, "example/control", policy(), set())
+        retry = discover_candidates(comments, "example/control", policy(), set())
+        self.assertEqual([item.comment_id for item in first], [30, 31, 32])
+        self.assertEqual([item.comment_id for item in retry], [30, 31, 32])
+        self.assertEqual(oldest_unprocessed(comments, "example/control", policy(), set()).comment_id, 30)
+        self.assertEqual(
+            [item.comment_id for item in discover_candidates(comments, "example/control", policy(), {30})],
+            [31, 32],
+        )
 
     def test_edit_before_ingress(self):
         comment = request(40)

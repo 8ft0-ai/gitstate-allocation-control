@@ -32,8 +32,11 @@ jobs:
       issues: read
     outputs:
       action: ${{ steps.intake.outputs.action }}
-      candidate: ${{ steps.intake.outputs.candidate }}
+      candidate_count: ${{ steps.intake.outputs.candidate_count }}
+      candidate_set: ${{ steps.intake.outputs.candidate_set }}
       reason_code: ${{ steps.intake.outputs.reason_code }}
+      rejection_count: ${{ steps.intake.outputs.rejection_count }}
+      rejection_set: ${{ steps.intake.outputs.rejection_set }}
       report_issue_number: ${{ steps.intake.outputs.report_issue_number }}
       source_comment_id: ${{ steps.intake.outputs.source_comment_id }}
       trusted_sha: ${{ steps.intake.outputs.trusted_sha }}
@@ -87,29 +90,27 @@ jobs:
   report-static-rejection:
     needs: static-authorisation
     if: >-
-      needs.static-authorisation.outputs.action == 'rejected' &&
+      needs.static-authorisation.outputs.rejection_count != '0' &&
       vars.PHASE2_INTAKE_ENABLED == 'true'
     runs-on: ubuntu-24.04
     permissions:
       contents: none
       issues: write
     steps:
-      - name: Post bounded static rejection
+      - name: Post bounded static rejection set
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3
         env:
           ISSUE_NUMBER: ${{ needs.static-authorisation.outputs.report_issue_number }}
-          REASON_CODE: ${{ needs.static-authorisation.outputs.reason_code }}
-          SOURCE_COMMENT_ID: ${{ needs.static-authorisation.outputs.source_comment_id }}
+          REJECTION_SET: ${{ needs.static-authorisation.outputs.rejection_set }}
         with:
           script: |
             const issue_number = Number(process.env.ISSUE_NUMBER);
-            if (!Number.isSafeInteger(issue_number)) return;
-            const source = Number(process.env.SOURCE_COMMENT_ID);
+            if (!Number.isSafeInteger(issue_number) || !process.env.REJECTION_SET) return;
+            const envelope = JSON.parse(Buffer.from(process.env.REJECTION_SET, 'base64url').toString('utf8'));
             const body = `Phase 2 intake rejected.\n\n\`\`\`json\n${JSON.stringify({
               execution_may_begin: false,
               protocol: 'beads-allocation/v0.2',
-              reason_code: process.env.REASON_CODE,
-              source_comment_id: Number.isSafeInteger(source) ? source : null
+              rejections: envelope.rejections
             })}\n\`\`\``;
             await github.rest.issues.createComment({ ...context.repo, issue_number, body });
 
@@ -124,7 +125,11 @@ jobs:
       issues: read
     outputs:
       action: ${{ steps.source.outputs.action }}
+      candidate_count: ${{ steps.source.outputs.candidate_count }}
+      candidate_set: ${{ steps.source.outputs.candidate_set }}
       reason_code: ${{ steps.source.outputs.reason_code }}
+      rejection_count: ${{ steps.source.outputs.rejection_count }}
+      rejection_set: ${{ steps.source.outputs.rejection_set }}
       report_issue_number: ${{ steps.source.outputs.report_issue_number }}
       source_comment_id: ${{ steps.source.outputs.source_comment_id }}
     steps:
@@ -134,38 +139,38 @@ jobs:
           ref: ${{ needs.static-authorisation.outputs.trusted_sha }}
           persist-credentials: false
           fetch-depth: 1
-      - name: Revalidate current source without App credentials
+      - name: Revalidate current source set without App credentials
         id: source
         env:
           GITHUB_TOKEN: ${{ github.token }}
-          PHASE2_CANDIDATE: ${{ needs.static-authorisation.outputs.candidate }}
+          PHASE2_CANDIDATE_SET: ${{ needs.static-authorisation.outputs.candidate_set }}
           PHASE2_TRUSTED_SHA: ${{ needs.static-authorisation.outputs.trusted_sha }}
         run: python3 -m phase2.source_revalidation
 
   report-source-rejection:
     needs: source-revalidation
-    if: needs.source-revalidation.outputs.action == 'rejected'
+    if: >-
+      needs.source-revalidation.outputs.rejection_count != '0' &&
+      vars.PHASE2_INTAKE_ENABLED == 'true'
     runs-on: ubuntu-24.04
     permissions:
       contents: none
       issues: write
     steps:
-      - name: Post bounded source rejection
+      - name: Post bounded source rejection set
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3
         env:
           ISSUE_NUMBER: ${{ needs.source-revalidation.outputs.report_issue_number }}
-          REASON_CODE: ${{ needs.source-revalidation.outputs.reason_code }}
-          SOURCE_COMMENT_ID: ${{ needs.source-revalidation.outputs.source_comment_id }}
+          REJECTION_SET: ${{ needs.source-revalidation.outputs.rejection_set }}
         with:
           script: |
             const issue_number = Number(process.env.ISSUE_NUMBER);
-            const source = Number(process.env.SOURCE_COMMENT_ID);
-            if (!Number.isSafeInteger(issue_number) || !Number.isSafeInteger(source)) return;
+            if (!Number.isSafeInteger(issue_number) || !process.env.REJECTION_SET) return;
+            const envelope = JSON.parse(Buffer.from(process.env.REJECTION_SET, 'base64url').toString('utf8'));
             const body = `Phase 2 intake rejected.\n\n\`\`\`json\n${JSON.stringify({
               execution_may_begin: false,
               protocol: 'beads-allocation/v0.2',
-              reason_code: process.env.REASON_CODE,
-              source_comment_id: source
+              rejections: envelope.rejections
             })}\n\`\`\``;
             await github.rest.issues.createComment({ ...context.repo, issue_number, body });
 
