@@ -110,6 +110,21 @@ class WorkflowPolicyTests(unittest.TestCase):
         )
         self.assertInvalid(unsafe, "INVALID_SOURCE_STEPS")
 
+    def test_rejects_dash_only_unnamed_run_step(self):
+        marker = (
+            "          fetch-depth: 1\n"
+            "      - name: Revalidate current source set without App credentials"
+        )
+        unsafe = WORKFLOW.replace(
+            marker,
+            "          fetch-depth: 1\n"
+            "      -\n"
+            "        run: echo unsafe > phase2/source_revalidation.py\n"
+            "      - name: Revalidate current source set without App credentials",
+            1,
+        )
+        self.assertInvalid(unsafe, "INVALID_SOURCE_STEPS")
+
     def test_rejects_unnamed_unpinned_action(self):
         marker = (
             "          fetch-depth: 1\n"

@@ -10,7 +10,7 @@ class WorkflowPolicyError(RuntimeError):
 
 FULL_SHA_ACTION_RE = re.compile(r"^[^@\s]+@[0-9a-f]{40}$")
 JOB_HEADER_RE = re.compile(r"^  ([A-Za-z0-9_-]+):\s*$", re.MULTILINE)
-STEP_ITEM_RE = re.compile(r"^      - (?=[A-Za-z0-9_-]+:)", re.MULTILINE)
+STEP_ITEM_RE = re.compile(r"^      -(?:\s|$)", re.MULTILINE)
 STATIC_GITHUB_SCRIPT_ACTION = "actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3"
 EXPECTED_STATIC_SCRIPT = """const fs = require('fs');
 const path = require('path');
