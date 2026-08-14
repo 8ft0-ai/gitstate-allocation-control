@@ -59,6 +59,18 @@ def _rejection_set_payload(candidates: list[Candidate], trusted_sha: str) -> str
     )
 
 
+def _single_rejection_set_payload(reason_code: str, source_comment_id: int, trusted_sha: str) -> str:
+    return _encode(
+        {
+            "rejections": [
+                {"reason_code": reason_code, "source_comment_id": source_comment_id}
+            ],
+            "trusted_sha": trusted_sha,
+            "version": 1,
+        }
+    )
+
+
 def run(env: dict[str, str] | None = None) -> dict[str, Any]:
     values = os.environ if env is None else env
     policy = load_policy(values.get("PHASE2_POLICY", "policy/actors.json"))
@@ -94,11 +106,20 @@ def run(env: dict[str, str] | None = None) -> dict[str, Any]:
         is_pull_request = isinstance(issue.get("pull_request"), dict)
         if issue.get("number") != policy["allocation_issue_number"] or is_pull_request:
             if isinstance(body, str) and body.encode("utf-8").startswith(PREFIX):
+                report_issue_number = issue.get("number")
+                source_comment_id = comment.get("id")
+                if not isinstance(report_issue_number, int) or not isinstance(source_comment_id, int):
+                    return _result("blocked", reason_code="INVALID_EVENT_IDENTITY")
                 return _result(
                     "rejected",
                     reason_code="NON_CONTROL_SURFACE",
-                    report_issue_number=issue.get("number"),
-                    source_comment_id=comment.get("id"),
+                    rejection_count=1,
+                    rejection_set=_single_rejection_set_payload(
+                        "NON_CONTROL_SURFACE", source_comment_id, trusted_sha
+                    ),
+                    report_issue_number=report_issue_number,
+                    source_comment_id=source_comment_id,
+                    trusted_sha=trusted_sha,
                 )
             return _result("noop")
 
