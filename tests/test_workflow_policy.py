@@ -83,7 +83,7 @@ class WorkflowPolicyTests(unittest.TestCase):
     def test_rejects_static_action_substitution_even_when_fully_pinned(self):
         unsafe = WORKFLOW.replace(
             "actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3",
-            "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+            "actions/github-script@0000000000000000000000000000000000000000",
             1,
         )
         self.assertInvalid(unsafe, "INVALID_STATIC_ACTION")
