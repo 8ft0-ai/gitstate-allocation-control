@@ -11,6 +11,43 @@ class WorkflowPolicyError(RuntimeError):
 FULL_SHA_ACTION_RE = re.compile(r"^[^@\s]+@[0-9a-f]{40}$")
 JOB_HEADER_RE = re.compile(r"^  ([A-Za-z0-9_-]+):\s*$", re.MULTILINE)
 STEP_HEADER_RE = re.compile(r"^      - name:\s*(.+?)\s*$", re.MULTILINE)
+STATIC_GITHUB_SCRIPT_ACTION = "actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3"
+EXPECTED_STATIC_SCRIPT = """const fs = require('fs');
+const path = require('path');
+const { spawnSync } = require('child_process');
+const files = [
+  'phase2/__init__.py', 'phase2/control_surface.py', 'phase2/parser.py',
+  'phase2/policy.py', 'phase2/discovery.py', 'phase2/github_api.py',
+  'phase2/static_intake.py', 'policy/actors.json'
+];
+const root = path.join(process.env.RUNNER_TEMP, `phase2-static-${process.env.GITHUB_RUN_ID}`);
+for (const file of files) {
+  const response = await github.rest.repos.getContent({
+    owner: context.repo.owner, repo: context.repo.repo, path: file, ref: process.env.TRUSTED_SHA
+  });
+  const target = path.join(root, file);
+  fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(target, Buffer.from(response.data.content, 'base64'), { mode: 0o600 });
+}
+const run = spawnSync('python3', ['-m', 'phase2.static_intake'], {
+  cwd: root,
+  encoding: 'utf8',
+  env: {
+    ...process.env,
+    GITHUB_TOKEN: process.env.GITHUB_TOKEN,
+    GITHUB_ACTOR: process.env.GITHUB_ACTOR,
+    PHASE2_TRUSTED_SHA: process.env.TRUSTED_SHA
+  }
+});
+const last = run.stdout.trim().split('\\n').pop();
+if (!last) {
+  core.setFailed('Static intake returned no result');
+  return;
+}
+const result = JSON.parse(last);
+for (const [key, value] of Object.entries(result)) core.setOutput(key, value ?? '');
+core.setOutput('trusted_sha', process.env.TRUSTED_SHA);
+if (run.status !== 0 || result.action === 'blocked') core.setFailed(`Static intake blocked: ${result.reason_code}`);"""
 
 
 @dataclass(frozen=True)
@@ -60,6 +97,27 @@ def _mapping_after(text: str, key: str, indent: int) -> dict[str, str]:
                 result[name.strip()] = value.strip()
             return result
     raise WorkflowPolicyError(f"MISSING_{key.upper()}")
+
+
+def _literal_block_after(text: str, key: str, indent: int) -> str:
+    prefix = " " * indent + key + ": |"
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        if line != prefix:
+            continue
+        child_indent = indent + 2
+        values: list[str] = []
+        for child in lines[index + 1 :]:
+            if child.strip() and _line_indent(child) <= indent:
+                break
+            if not child.strip():
+                values.append("")
+                continue
+            if _line_indent(child) < child_indent:
+                raise WorkflowPolicyError(f"INVALID_{key.upper()}_BLOCK")
+            values.append(child[child_indent:])
+        return "\n".join(values).rstrip()
+    raise WorkflowPolicyError(f"MISSING_{key.upper()}_BLOCK")
 
 
 def _job_blocks(text: str) -> dict[str, str]:
@@ -120,6 +178,19 @@ def _step_scalar(step: Step, key: str) -> str | None:
 
 def _step_mapping(step: Step, key: str) -> dict[str, str]:
     return _mapping_after(step.text, key, 8)
+
+
+def _step_keys(step: Step) -> set[str]:
+    keys: set[str] = set()
+    for line in step.text.splitlines():
+        if _line_indent(line) != 8:
+            continue
+        stripped = line.strip()
+        if ":" not in stripped:
+            raise WorkflowPolicyError("INVALID_STEP_STRUCTURE")
+        key, _ = stripped.split(":", 1)
+        keys.add(key)
+    return keys
 
 
 def _require(condition: bool, code: str) -> None:
@@ -209,8 +280,24 @@ def validate_workflow(text: str) -> None:
     _require("actions/checkout@" not in static, "STATIC_CHECKOUT_PRESENT")
     _require("PHASE2_ALLOCATOR_APP_PRIVATE_KEY" not in static, "STATIC_SECRET_PRESENT")
     _require("PHASE2_STATE_REPOSITORY_ID" not in static, "STATIC_STATE_CONFIG_PRESENT")
-    _require("github.workflow_sha" in static, "MISSING_TRUSTED_WORKFLOW_SHA")
-    _require("phase2/static_intake.py" in static, "MISSING_STATIC_INTAKE")
+    static_steps = _steps(static)
+    _require(len(static_steps) == 1, "INVALID_STATIC_STEPS")
+    static_step = static_steps[0]
+    _require(static_step.name == "Run immutable static intake without checkout", "INVALID_STATIC_STEP")
+    _require(_step_keys(static_step) == {"id", "uses", "env", "with"}, "INVALID_STATIC_STEP")
+    _require(_step_scalar(static_step, "id") == "intake", "INVALID_STATIC_STEP")
+    _require(_step_scalar(static_step, "uses") == STATIC_GITHUB_SCRIPT_ACTION, "INVALID_STATIC_ACTION")
+    _require(
+        _step_mapping(static_step, "env")
+        == {
+            "GITHUB_TOKEN": "${{ github.token }}",
+            "GITHUB_ACTOR": "${{ github.actor }}",
+            "TRUSTED_SHA": "${{ github.workflow_sha }}",
+        },
+        "INVALID_STATIC_ENV",
+    )
+    _require(_step_mapping(static_step, "with") == {"script": "|"}, "INVALID_STATIC_WITH")
+    _require(_literal_block_after(static_step.text, "script", 10) == EXPECTED_STATIC_SCRIPT, "INVALID_STATIC_SCRIPT")
 
     report_static = jobs["report-static-rejection"]
     _require(
