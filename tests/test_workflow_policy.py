@@ -96,6 +96,34 @@ class WorkflowPolicyTests(unittest.TestCase):
         )
         self.assertInvalid(unsafe, "UNPINNED_ACTION")
 
+    def test_rejects_unnamed_run_between_source_checkout_and_revalidation(self):
+        marker = (
+            "          fetch-depth: 1\n"
+            "      - name: Revalidate current source set without App credentials"
+        )
+        unsafe = WORKFLOW.replace(
+            marker,
+            "          fetch-depth: 1\n"
+            "      - run: echo unsafe > phase2/source_revalidation.py\n"
+            "      - name: Revalidate current source set without App credentials",
+            1,
+        )
+        self.assertInvalid(unsafe, "INVALID_SOURCE_STEPS")
+
+    def test_rejects_unnamed_unpinned_action(self):
+        marker = (
+            "          fetch-depth: 1\n"
+            "      - name: Revalidate current source set without App credentials"
+        )
+        unsafe = WORKFLOW.replace(
+            marker,
+            "          fetch-depth: 1\n"
+            "      - uses: actions/github-script@v7\n"
+            "      - name: Revalidate current source set without App credentials",
+            1,
+        )
+        self.assertInvalid(unsafe, "UNPINNED_ACTION")
+
     def test_rejects_weakened_trusted_condition(self):
         unsafe = WORKFLOW.replace(
             "      always() &&",

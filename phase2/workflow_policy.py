@@ -10,7 +10,7 @@ class WorkflowPolicyError(RuntimeError):
 
 FULL_SHA_ACTION_RE = re.compile(r"^[^@\s]+@[0-9a-f]{40}$")
 JOB_HEADER_RE = re.compile(r"^  ([A-Za-z0-9_-]+):\s*$", re.MULTILINE)
-STEP_HEADER_RE = re.compile(r"^      - name:\s*(.+?)\s*$", re.MULTILINE)
+STEP_ITEM_RE = re.compile(r"^      - (?=[A-Za-z0-9_-]+:)", re.MULTILINE)
 STATIC_GITHUB_SCRIPT_ACTION = "actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3"
 EXPECTED_STATIC_SCRIPT = """const fs = require('fs');
 const path = require('path');
@@ -52,7 +52,7 @@ if (run.status !== 0 || result.action === 'blocked') core.setFailed(`Static inta
 
 @dataclass(frozen=True)
 class Step:
-    name: str
+    name: str | None
     text: str
 
 
@@ -161,19 +161,27 @@ def _job_block_value(block: str, key: str) -> str | None:
     return None
 
 
+def _step_text_scalar(text: str, key: str) -> str | None:
+    first = re.search(rf"^      - {re.escape(key)}:\s*(.*?)\s*$", text, re.MULTILINE)
+    if first is not None:
+        return first.group(1)
+    child = re.search(rf"^        {re.escape(key)}:\s*(.*?)\s*$", text, re.MULTILINE)
+    return None if child is None else child.group(1)
+
+
 def _steps(block: str) -> list[Step]:
-    matches = list(STEP_HEADER_RE.finditer(block))
+    matches = list(STEP_ITEM_RE.finditer(block))
     result: list[Step] = []
     for index, match in enumerate(matches):
         start = match.start()
         end = matches[index + 1].start() if index + 1 < len(matches) else len(block)
-        result.append(Step(match.group(1), block[start:end]))
+        text = block[start:end]
+        result.append(Step(_step_text_scalar(text, "name"), text))
     return result
 
 
 def _step_scalar(step: Step, key: str) -> str | None:
-    match = re.search(rf"^        {re.escape(key)}:\s*(.*?)\s*$", step.text, re.MULTILINE)
-    return None if match is None else match.group(1)
+    return _step_text_scalar(step.text, key)
 
 
 def _step_mapping(step: Step, key: str) -> dict[str, str]:
@@ -182,13 +190,20 @@ def _step_mapping(step: Step, key: str) -> dict[str, str]:
 
 def _step_keys(step: Step) -> set[str]:
     keys: set[str] = set()
-    for line in step.text.splitlines():
+    first = re.match(r"^      - ([A-Za-z0-9_-]+):", step.text)
+    if first is None:
+        raise WorkflowPolicyError("INVALID_STEP_STRUCTURE")
+    if first.group(1) != "name":
+        keys.add(first.group(1))
+    for line in step.text.splitlines()[1:]:
         if _line_indent(line) != 8:
             continue
         stripped = line.strip()
         if ":" not in stripped:
             raise WorkflowPolicyError("INVALID_STEP_STRUCTURE")
         key, _ = stripped.split(":", 1)
+        if key == "name":
+            continue
         keys.add(key)
     return keys
 
@@ -205,6 +220,12 @@ def _needs(value: str | None) -> set[str]:
     if value.startswith("[") and value.endswith("]"):
         return {item.strip() for item in value[1:-1].split(",") if item.strip()}
     return {value}
+
+
+def _require_step_names(block: str, expected: list[str], code: str) -> list[Step]:
+    steps = _steps(block)
+    _require([step.name for step in steps] == expected, code)
+    return steps
 
 
 def _step_by_run(block: str, command: str) -> Step:
@@ -300,6 +321,12 @@ def validate_workflow(text: str) -> None:
     _require(_literal_block_after(static_step.text, "script", 10) == EXPECTED_STATIC_SCRIPT, "INVALID_STATIC_SCRIPT")
 
     report_static = jobs["report-static-rejection"]
+    report_static_steps = _require_step_names(
+        report_static,
+        ["Post bounded static rejection set"],
+        "INVALID_STATIC_REPORT_STEPS",
+    )
+    _require(_step_keys(report_static_steps[0]) == {"uses", "env", "with"}, "INVALID_STATIC_REPORT_STEPS")
     _require(
         _job_block_value(report_static, "if")
         == "needs.static-authorisation.outputs.rejection_count != '0' && vars.PHASE2_INTAKE_ENABLED == 'true'",
@@ -317,8 +344,19 @@ def validate_workflow(text: str) -> None:
     _require(_job_scalar(source, "environment") is None, "SOURCE_ENVIRONMENT_PRESENT")
     _require("PHASE2_ALLOCATOR_APP_PRIVATE_KEY" not in source, "SOURCE_SECRET_PRESENT")
     _require("PHASE2_STATE_REPOSITORY_ID" not in source, "SOURCE_STATE_CONFIG_PRESENT")
-    _validate_checkout(_checkout_step(source))
-    source_run = _step_by_run(source, "python3 -m phase2.source_revalidation")
+    source_steps = _require_step_names(
+        source,
+        [
+            "Checkout immutable trusted content without persisted credentials",
+            "Revalidate current source set without App credentials",
+        ],
+        "INVALID_SOURCE_STEPS",
+    )
+    _require(_step_keys(source_steps[0]) == {"uses", "with"}, "INVALID_SOURCE_STEPS")
+    _require(_step_keys(source_steps[1]) == {"id", "env", "run"}, "INVALID_SOURCE_STEPS")
+    _validate_checkout(source_steps[0])
+    source_run = source_steps[1]
+    _require(_step_scalar(source_run, "run") == "python3 -m phase2.source_revalidation", "INVALID_RUN_STEP")
     _require(
         _step_mapping(source_run, "env")
         == {
@@ -330,6 +368,12 @@ def validate_workflow(text: str) -> None:
     )
 
     report_source = jobs["report-source-rejection"]
+    report_source_steps = _require_step_names(
+        report_source,
+        ["Post bounded source rejection set"],
+        "INVALID_SOURCE_REPORT_STEPS",
+    )
+    _require(_step_keys(report_source_steps[0]) == {"uses", "env", "with"}, "INVALID_SOURCE_REPORT_STEPS")
     _require(
         _job_block_value(report_source, "if")
         == "needs.source-revalidation.outputs.rejection_count != '0' && vars.PHASE2_INTAKE_ENABLED == 'true'",
@@ -357,8 +401,19 @@ def validate_workflow(text: str) -> None:
         "needs.static-authorisation.outputs.action == 'scope_probe' )"
     )
     _require(_job_block_value(trusted, "if") == expected_trusted_condition, "INVALID_TRUSTED_CONDITION")
-    _validate_checkout(_checkout_step(trusted))
-    trusted_run = _step_by_run(trusted, "python3 -m phase2.trusted_intake")
+    trusted_steps = _require_step_names(
+        trusted,
+        [
+            "Checkout immutable protected-default-branch content",
+            "Revalidate live installation and bounded scope",
+        ],
+        "INVALID_TRUSTED_STEPS",
+    )
+    _require(_step_keys(trusted_steps[0]) == {"uses", "with"}, "INVALID_TRUSTED_STEPS")
+    _require(_step_keys(trusted_steps[1]) == {"env", "run"}, "INVALID_TRUSTED_STEPS")
+    _validate_checkout(trusted_steps[0])
+    trusted_run = trusted_steps[1]
+    _require(_step_scalar(trusted_run, "run") == "python3 -m phase2.trusted_intake", "INVALID_RUN_STEP")
     _require(
         _step_mapping(trusted_run, "env")
         == {
