@@ -144,13 +144,49 @@ class StaticIntakeTests(unittest.TestCase):
             self.assertEqual(result, {"action": "blocked", "reason_code": reason})
             api.request.assert_not_called()
 
-    def test_wrong_issue_protocol_request_is_rejected_without_scan(self):
+    def test_wrong_issue_protocol_request_is_rejected_with_report_envelope_without_scan(self):
         event = base_event()
         event.update({"issue": {"number": 99}, "comment": request_comment()})
         with patch("phase2.static_intake.GitHubAPI") as api:
             result = run(self._env("issue_comment", event))
         self.assertEqual(result["action"], "rejected")
         self.assertEqual(result["reason_code"], "NON_CONTROL_SURFACE")
+        self.assertEqual(result["rejection_count"], 1)
+        self.assertEqual(result["report_issue_number"], 99)
+        self.assertEqual(result["source_comment_id"], 77)
+        self.assertEqual(
+            decode(result["rejection_set"]),
+            {
+                "rejections": [{"reason_code": "NON_CONTROL_SURFACE", "source_comment_id": 77}],
+                "trusted_sha": TRUSTED_SHA,
+                "version": 1,
+            },
+        )
+        api.assert_not_called()
+
+    def test_pull_request_protocol_request_is_rejected_with_report_envelope_without_scan(self):
+        event = base_event()
+        event.update(
+            {
+                "issue": {"number": 2, "pull_request": {"url": "https://api.github.invalid/pulls/2"}},
+                "comment": request_comment(88),
+            }
+        )
+        with patch("phase2.static_intake.GitHubAPI") as api:
+            result = run(self._env("issue_comment", event))
+        self.assertEqual(result["action"], "rejected")
+        self.assertEqual(result["reason_code"], "NON_CONTROL_SURFACE")
+        self.assertEqual(result["rejection_count"], 1)
+        self.assertEqual(result["report_issue_number"], 2)
+        self.assertEqual(result["source_comment_id"], 88)
+        self.assertEqual(
+            decode(result["rejection_set"]),
+            {
+                "rejections": [{"reason_code": "NON_CONTROL_SURFACE", "source_comment_id": 88}],
+                "trusted_sha": TRUSTED_SHA,
+                "version": 1,
+            },
+        )
         api.assert_not_called()
 
     def test_unrelated_comment_elsewhere_is_noop(self):
