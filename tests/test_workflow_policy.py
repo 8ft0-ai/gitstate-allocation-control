@@ -24,6 +24,32 @@ class WorkflowPolicyTests(unittest.TestCase):
         )
         self.assertInvalid(unsafe, "UNTRUSTED_CHECKOUT_REF")
 
+    def test_rejects_fully_pinned_source_checkout_action_substitution(self):
+        marker = (
+            "      - name: Checkout immutable trusted content without persisted credentials\n"
+            "        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
+        )
+        unsafe = WORKFLOW.replace(
+            marker,
+            "      - name: Checkout immutable trusted content without persisted credentials\n"
+            "        uses: example/unsafe-action@0000000000000000000000000000000000000000",
+            1,
+        )
+        self.assertInvalid(unsafe, "INVALID_CHECKOUT_ACTION")
+
+    def test_rejects_fully_pinned_trusted_checkout_action_substitution(self):
+        marker = (
+            "      - name: Checkout immutable protected-default-branch content\n"
+            "        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
+        )
+        unsafe = WORKFLOW.replace(
+            marker,
+            "      - name: Checkout immutable protected-default-branch content\n"
+            "        uses: example/unsafe-action@0000000000000000000000000000000000000000",
+            1,
+        )
+        self.assertInvalid(unsafe, "INVALID_CHECKOUT_ACTION")
+
     def test_rejects_app_secret_in_source_job(self):
         marker = "          PHASE2_CANDIDATE_SET: ${{ needs.static-authorisation.outputs.candidate_set }}"
         unsafe = WORKFLOW.replace(
@@ -66,6 +92,22 @@ class WorkflowPolicyTests(unittest.TestCase):
         )
         self.assertInvalid(unsafe, "INVALID_STATIC_ENV")
 
+    def test_rejects_static_trusted_sha_output_rewire(self):
+        unsafe = WORKFLOW.replace(
+            "      trusted_sha: ${{ steps.intake.outputs.trusted_sha }}",
+            "      trusted_sha: ${{ github.head_ref }}",
+            1,
+        )
+        self.assertInvalid(unsafe, "INVALID_STATIC_OUTPUTS")
+
+    def test_rejects_source_output_rewire(self):
+        unsafe = WORKFLOW.replace(
+            "      source_comment_id: ${{ steps.source.outputs.source_comment_id }}",
+            "      source_comment_id: ${{ github.event.comment.id }}",
+            1,
+        )
+        self.assertInvalid(unsafe, "INVALID_SOURCE_OUTPUTS")
+
     def test_rejects_static_entrypoint_rewire_even_if_path_survives_in_dead_text(self):
         unsafe = WORKFLOW.replace(
             "              'phase2/static_intake.py', 'policy/actors.json'",
@@ -87,6 +129,40 @@ class WorkflowPolicyTests(unittest.TestCase):
             1,
         )
         self.assertInvalid(unsafe, "INVALID_STATIC_ACTION")
+
+    def test_rejects_fully_pinned_static_report_action_substitution(self):
+        marker = (
+            "      - name: Post bounded static rejection set\n"
+            "        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3"
+        )
+        unsafe = WORKFLOW.replace(
+            marker,
+            "      - name: Post bounded static rejection set\n"
+            "        uses: example/unsafe-action@0000000000000000000000000000000000000000",
+            1,
+        )
+        self.assertInvalid(unsafe, "INVALID_STATIC_REPORT_ACTION")
+
+    def test_rejects_fully_pinned_source_report_action_substitution(self):
+        marker = (
+            "      - name: Post bounded source rejection set\n"
+            "        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3"
+        )
+        unsafe = WORKFLOW.replace(
+            marker,
+            "      - name: Post bounded source rejection set\n"
+            "        uses: example/unsafe-action@0000000000000000000000000000000000000000",
+            1,
+        )
+        self.assertInvalid(unsafe, "INVALID_SOURCE_REPORT_ACTION")
+
+    def test_rejects_static_report_script_rewire(self):
+        unsafe = WORKFLOW.replace(
+            "            const body = `Phase 2 intake rejected.",
+            "            const body = `execution_may_begin: true",
+            1,
+        )
+        self.assertInvalid(unsafe, "INVALID_STATIC_REPORT_SCRIPT")
 
     def test_rejects_unpinned_action(self):
         unsafe = WORKFLOW.replace(
@@ -138,6 +214,38 @@ class WorkflowPolicyTests(unittest.TestCase):
             1,
         )
         self.assertInvalid(unsafe, "UNPINNED_ACTION")
+
+    def test_rejects_duplicate_source_checkout_uses(self):
+        marker = (
+            "        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1\n"
+            "        with:\n"
+            "          ref: ${{ needs.static-authorisation.outputs.trusted_sha }}"
+        )
+        unsafe = WORKFLOW.replace(
+            marker,
+            "        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1\n"
+            "        uses: example/unsafe-action@0000000000000000000000000000000000000000\n"
+            "        with:\n"
+            "          ref: ${{ needs.static-authorisation.outputs.trusted_sha }}",
+            1,
+        )
+        self.assertInvalid(unsafe, "DUPLICATE_STEP_KEY")
+
+    def test_rejects_source_job_container(self):
+        marker = (
+            "  source-revalidation:\n"
+            "    needs: static-authorisation\n"
+            "    if: >-\n"
+        )
+        unsafe = WORKFLOW.replace(
+            marker,
+            "  source-revalidation:\n"
+            "    needs: static-authorisation\n"
+            "    container: example/unsafe:latest\n"
+            "    if: >-\n",
+            1,
+        )
+        self.assertInvalid(unsafe, "INVALID_JOB_KEYS")
 
     def test_rejects_weakened_trusted_condition(self):
         unsafe = WORKFLOW.replace(
