@@ -52,6 +52,42 @@ class WorkflowPolicyTests(unittest.TestCase):
         unsafe = WORKFLOW.replace(marker, marker[:-4] + "write", 1)
         self.assertInvalid(unsafe, "INVALID_STATIC_PERMISSIONS")
 
+    def test_rejects_static_trusted_sha_rewire_even_if_literal_survives_in_dead_text(self):
+        unsafe = WORKFLOW.replace(
+            "          TRUSTED_SHA: ${{ github.workflow_sha }}",
+            "          TRUSTED_SHA: ${{ github.sha }}",
+            1,
+        )
+        unsafe = unsafe.replace(
+            "            const fs = require('fs');",
+            "            const expectedButUnused = 'github.workflow_sha';\n"
+            "            const fs = require('fs');",
+            1,
+        )
+        self.assertInvalid(unsafe, "INVALID_STATIC_ENV")
+
+    def test_rejects_static_entrypoint_rewire_even_if_path_survives_in_dead_text(self):
+        unsafe = WORKFLOW.replace(
+            "              'phase2/static_intake.py', 'policy/actors.json'",
+            "              'phase2/unsafe_static.py', 'policy/actors.json'",
+            1,
+        )
+        unsafe = unsafe.replace(
+            "            const run = spawnSync('python3', ['-m', 'phase2.static_intake'], {",
+            "            const expectedButUnused = 'phase2/static_intake.py';\n"
+            "            const run = spawnSync('python3', ['-m', 'phase2.unsafe_static'], {",
+            1,
+        )
+        self.assertInvalid(unsafe, "INVALID_STATIC_SCRIPT")
+
+    def test_rejects_static_action_substitution_even_when_fully_pinned(self):
+        unsafe = WORKFLOW.replace(
+            "actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3",
+            "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+            1,
+        )
+        self.assertInvalid(unsafe, "INVALID_STATIC_ACTION")
+
     def test_rejects_unpinned_action(self):
         unsafe = WORKFLOW.replace(
             "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
