@@ -156,18 +156,35 @@ def _job_blocks(text: str) -> dict[str, str]:
     jobs_match = re.search(r"^jobs:\s*$", text, re.MULTILINE)
     if jobs_match is None:
         raise WorkflowPolicyError("MISSING_JOBS")
-    tail = text[jobs_match.end() :]
-    matches = list(JOB_HEADER_RE.finditer(tail))
-    if not matches:
+    section = _top_section(text, "jobs")
+    direct_names: list[str] = []
+    for line in section.splitlines():
+        if not line.strip():
+            continue
+        indent = _line_indent(line)
+        if indent < 2:
+            raise WorkflowPolicyError("UNAPPROVED_JOB_GRAPH")
+        if indent != 2:
+            continue
+        header = re.fullmatch(r"  ([A-Za-z0-9_-]+):", line)
+        if header is None:
+            raise WorkflowPolicyError("UNAPPROVED_JOB_GRAPH")
+        direct_names.append(header.group(1))
+    if not direct_names:
         raise WorkflowPolicyError("MISSING_JOBS")
+    if len(direct_names) != len(set(direct_names)):
+        raise WorkflowPolicyError("DUPLICATE_JOB")
+    matches = list(JOB_HEADER_RE.finditer(section))
+    if len(matches) != len(direct_names):
+        raise WorkflowPolicyError("UNAPPROVED_JOB_GRAPH")
     blocks: dict[str, str] = {}
     for index, match in enumerate(matches):
         start = match.start()
-        end = matches[index + 1].start() if index + 1 < len(matches) else len(tail)
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(section)
         name = match.group(1)
         if name in blocks:
             raise WorkflowPolicyError("DUPLICATE_JOB")
-        blocks[name] = tail[start:end]
+        blocks[name] = section[start:end]
     return blocks
 
 
