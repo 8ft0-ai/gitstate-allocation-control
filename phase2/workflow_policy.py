@@ -23,6 +23,21 @@ def _line_indent(line: str) -> int:
     return len(line) - len(line.lstrip(" "))
 
 
+def _top_section(text: str, key: str) -> str:
+    lines = text.splitlines()
+    header = f"{key}:"
+    for index, line in enumerate(lines):
+        if line != header:
+            continue
+        values: list[str] = []
+        for child in lines[index + 1 :]:
+            if child and _line_indent(child) == 0:
+                break
+            values.append(child)
+        return "\n".join(values).rstrip()
+    raise WorkflowPolicyError(f"MISSING_{key.upper()}_SECTION")
+
+
 def _mapping_after(text: str, key: str, indent: int) -> dict[str, str]:
     prefix = " " * indent + key + ":"
     lines = text.splitlines()
@@ -121,6 +136,12 @@ def _needs(value: str | None) -> set[str]:
     return {value}
 
 
+def _step_by_run(block: str, command: str) -> Step:
+    matches = [step for step in _steps(block) if _step_scalar(step, "run") == command]
+    _require(len(matches) == 1, "INVALID_RUN_STEP")
+    return matches[0]
+
+
 def _checkout_step(block: str) -> Step:
     matches = [step for step in _steps(block) if (_step_scalar(step, "uses") or "").startswith("actions/checkout@")]
     _require(len(matches) == 1, "INVALID_CHECKOUT_COUNT")
@@ -136,9 +157,33 @@ def _validate_checkout(step: Step) -> None:
         "UNTRUSTED_CHECKOUT_REF",
     )
     _require(with_values.get("persist-credentials") == "false", "PERSISTED_CHECKOUT_CREDENTIALS")
+    _require(with_values.get("fetch-depth") == "1", "INVALID_CHECKOUT_DEPTH")
 
 
 def validate_workflow(text: str) -> None:
+    expected_triggers = """  issue_comment:
+    types: [created, edited, deleted]
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Trusted manual operation
+        required: true
+        default: reconcile
+        type: choice
+        options:
+          - reconcile
+          - scope_probe"""
+    _require(_top_section(text, "on") == expected_triggers, "INVALID_TRIGGERS")
+    _require(
+        _mapping_after(text, "concurrency", 0)
+        == {
+            "group": "beads-allocation-v0.2-${{ github.repository }}",
+            "cancel-in-progress": "false",
+        },
+        "INVALID_CONCURRENCY",
+    )
     top_permissions = _mapping_after(text, "permissions", 0)
     _require(top_permissions == {"contents": "read", "issues": "read"}, "INVALID_TOP_LEVEL_PERMISSIONS")
 
@@ -167,15 +212,42 @@ def validate_workflow(text: str) -> None:
     _require("github.workflow_sha" in static, "MISSING_TRUSTED_WORKFLOW_SHA")
     _require("phase2/static_intake.py" in static, "MISSING_STATIC_INTAKE")
 
+    report_static = jobs["report-static-rejection"]
+    _require(
+        _job_block_value(report_static, "if")
+        == "needs.static-authorisation.outputs.rejection_count != '0' && vars.PHASE2_INTAKE_ENABLED == 'true'",
+        "INVALID_STATIC_REPORT_CONDITION",
+    )
+
     source = jobs["source-revalidation"]
     _require(_needs(_job_scalar(source, "needs")) == {"static-authorisation"}, "INVALID_SOURCE_DEPENDENCY")
+    _require(
+        _job_block_value(source, "if")
+        == "needs.static-authorisation.outputs.action == 'live_check' && vars.PHASE2_INTAKE_ENABLED == 'true'",
+        "INVALID_SOURCE_CONDITION",
+    )
     _require(_mapping_after(source, "permissions", 4) == {"contents": "read", "issues": "read"}, "INVALID_SOURCE_PERMISSIONS")
     _require(_job_scalar(source, "environment") is None, "SOURCE_ENVIRONMENT_PRESENT")
     _require("PHASE2_ALLOCATOR_APP_PRIVATE_KEY" not in source, "SOURCE_SECRET_PRESENT")
     _require("PHASE2_STATE_REPOSITORY_ID" not in source, "SOURCE_STATE_CONFIG_PRESENT")
-    _require("PHASE2_CANDIDATE_SET: ${{ needs.static-authorisation.outputs.candidate_set }}" in source, "MISSING_CANDIDATE_SET_HANDOFF")
     _validate_checkout(_checkout_step(source))
-    _require(any(_step_scalar(step, "run") == "python3 -m phase2.source_revalidation" for step in _steps(source)), "MISSING_SOURCE_REVALIDATION")
+    source_run = _step_by_run(source, "python3 -m phase2.source_revalidation")
+    _require(
+        _step_mapping(source_run, "env")
+        == {
+            "GITHUB_TOKEN": "${{ github.token }}",
+            "PHASE2_CANDIDATE_SET": "${{ needs.static-authorisation.outputs.candidate_set }}",
+            "PHASE2_TRUSTED_SHA": "${{ needs.static-authorisation.outputs.trusted_sha }}",
+        },
+        "INVALID_SOURCE_HANDOFF",
+    )
+
+    report_source = jobs["report-source-rejection"]
+    _require(
+        _job_block_value(report_source, "if")
+        == "needs.source-revalidation.outputs.rejection_count != '0' && vars.PHASE2_INTAKE_ENABLED == 'true'",
+        "INVALID_SOURCE_REPORT_CONDITION",
+    )
 
     for name in ("report-static-rejection", "report-source-rejection"):
         block = jobs[name]
@@ -191,16 +263,29 @@ def validate_workflow(text: str) -> None:
     )
     _require(_job_scalar(trusted, "environment") == "phase-2-allocator", "INVALID_TRUSTED_ENVIRONMENT")
     _require(_mapping_after(trusted, "permissions", 4) == {"contents": "read", "issues": "write"}, "INVALID_TRUSTED_PERMISSIONS")
-    condition = _job_block_value(trusted, "if") or ""
-    for required in (
-        "needs.static-authorisation.outputs.action == 'live_check'",
-        "vars.PHASE2_INTAKE_ENABLED == 'true'",
-        "needs.source-revalidation.result == 'success'",
-        "needs.source-revalidation.outputs.action == 'live_check'",
-        "needs.static-authorisation.outputs.action == 'scope_probe'",
-    ):
-        _require(required in condition, "INVALID_TRUSTED_CONDITION")
+    expected_trusted_condition = (
+        "always() && ( ( needs.static-authorisation.outputs.action == 'live_check' && "
+        "vars.PHASE2_INTAKE_ENABLED == 'true' && needs.source-revalidation.result == 'success' && "
+        "needs.source-revalidation.outputs.action == 'live_check' ) || "
+        "needs.static-authorisation.outputs.action == 'scope_probe' )"
+    )
+    _require(_job_block_value(trusted, "if") == expected_trusted_condition, "INVALID_TRUSTED_CONDITION")
     _validate_checkout(_checkout_step(trusted))
+    trusted_run = _step_by_run(trusted, "python3 -m phase2.trusted_intake")
+    _require(
+        _step_mapping(trusted_run, "env")
+        == {
+            "GITHUB_TOKEN": "${{ github.token }}",
+            "PHASE2_ACTION": "${{ needs.static-authorisation.outputs.action }}",
+            "PHASE2_ALLOCATOR_APP_ID": "${{ vars.PHASE2_ALLOCATOR_APP_ID }}",
+            "PHASE2_ALLOCATOR_INSTALLATION_ID": "${{ vars.PHASE2_ALLOCATOR_INSTALLATION_ID }}",
+            "PHASE2_ALLOCATOR_APP_PRIVATE_KEY": "${{ secrets.PHASE2_ALLOCATOR_APP_PRIVATE_KEY }}",
+            "PHASE2_SOURCE_COMMENT_ID": "${{ needs.source-revalidation.outputs.source_comment_id }}",
+            "PHASE2_STATE_REPOSITORY_ID": "${{ secrets.PHASE2_STATE_REPOSITORY_ID }}",
+            "PHASE2_TRUSTED_SHA": "${{ needs.static-authorisation.outputs.trusted_sha }}",
+        },
+        "INVALID_TRUSTED_ENV",
+    )
     _require(trusted.count("secrets.PHASE2_ALLOCATOR_APP_PRIVATE_KEY") == 1, "INVALID_PRIVATE_KEY_PLACEMENT")
     _require(trusted.count("secrets.PHASE2_STATE_REPOSITORY_ID") == 1, "INVALID_STATE_SECRET_PLACEMENT")
 

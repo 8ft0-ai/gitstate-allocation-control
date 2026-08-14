@@ -60,6 +60,22 @@ class WorkflowPolicyTests(unittest.TestCase):
         )
         self.assertInvalid(unsafe, "UNPINNED_ACTION")
 
+    def test_rejects_weakened_trusted_condition(self):
+        unsafe = WORKFLOW.replace(
+            "      always() &&",
+            "      false && always() &&",
+            1,
+        )
+        self.assertInvalid(unsafe, "INVALID_TRUSTED_CONDITION")
+
+    def test_rejects_concurrency_cancellation(self):
+        unsafe = WORKFLOW.replace("  cancel-in-progress: false", "  cancel-in-progress: true", 1)
+        self.assertInvalid(unsafe, "INVALID_CONCURRENCY")
+
+    def test_rejects_manual_scope_probe_default(self):
+        unsafe = WORKFLOW.replace("        default: reconcile", "        default: scope_probe", 1)
+        self.assertInvalid(unsafe, "INVALID_TRIGGERS")
+
     def test_rejects_extra_job_even_if_required_fragments_remain(self):
         unsafe = WORKFLOW + (
             "\n  unsafe-helper:\n"
