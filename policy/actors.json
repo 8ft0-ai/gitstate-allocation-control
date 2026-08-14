@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "control_repository": "8ft0-ai/gitstate-allocation-control",
+  "control_repository_id": 1321106380,
+  "allocation_issue_number": 1,
+  "allocation_issue_required_label": "phase-2-control",
+  "allocation_issue_required_state": "open",
+  "operators": [
+    "8ft0-ai"
+  ],
+  "principals": [
+    {
+      "actor_login": "8ft0-ai",
+      "actor_type": "User",
+      "agent_prefixes": [
+        "agent://human/8ft0-ai/session/"
+      ]
+    }
+  ],
+  "github_apps": [],
+  "allocator": {
+    "app_id_env": "PHASE2_ALLOCATOR_APP_ID",
+    "installation_id_env": "PHASE2_ALLOCATOR_INSTALLATION_ID",
+    "app_slug": "gitstate-phase-2-allocator",
+    "owner": "8ft0-ai"
+  },
+  "state_repository_id_env": "PHASE2_STATE_REPOSITORY_ID"
+}
