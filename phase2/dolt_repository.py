@@ -1,14 +1,21 @@
-"""Concrete isolated Git/Dolt canonical repository implementation.
+"""Concrete isolated Git-backed Dolt canonical repository implementation.
 
 This module intentionally has no default live credentials or repository URL.
-Callers must inject the already-authorised state-repository URL and a PEP-249
-connection factory for the isolated checkout.  Publication is always a normal
-fast-forward push to ``refs/dolt/data`` guarded by an explicit expected-old SHA;
-there is no force option.
+Callers inject the already-authorised state-repository URL and a PEP-249
+connection factory for the isolated Dolt clone. The factory is bound to that
+clone by independently comparing the connection's Dolt ``HEAD`` and active
+branch with the cloned database through the pinned Dolt CLI.
+
+``refs/dolt/data`` is a Dolt Git-remote storage ref, not an ordinary checkout.
+Bootstrap therefore clones through Dolt's Git-remote transport and publication
+uses a normal ``dolt push``. The Git ref SHA is used only as the explicit
+expected-old compare-and-swap token. No force option is exposed or used.
 """
 
 from __future__ import annotations
 
+import csv
+import io
 import shutil
 import subprocess
 import tempfile
@@ -42,20 +49,43 @@ def _run(command: Sequence[str], cwd: Path) -> subprocess.CompletedProcess[str]:
     )
 
 
+def _normalise_dolt_remote(remote_url: str) -> str:
+    """Mirror the pinned Beads v1.1.0 Git-to-Dolt remote conversion."""
+    native = (
+        "dolthub://",
+        "file://",
+        "aws://",
+        "gs://",
+        "git+https://",
+        "git+http://",
+        "git+ssh://",
+        "git+file://",
+    )
+    if remote_url.startswith(native):
+        return remote_url
+    if remote_url.startswith(("https://", "http://", "ssh://")):
+        return "git+" + remote_url
+    if "@" in remote_url:
+        colon = remote_url.find(":")
+        if colon > 0 and "/" not in remote_url[:colon]:
+            return "git+ssh://" + remote_url[:colon] + "/" + remote_url[colon + 1 :]
+    return remote_url
+
+
 def _scalar(connection: Any, sql: str) -> str:
     cursor = connection.cursor()
     try:
         cursor.execute(sql)
         row = cursor.fetchone()
         if row is None:
-            raise CanonicalIdentityMismatch("MISSING_CANONICAL_DOLT_COMMIT")
+            raise CanonicalIdentityMismatch("MISSING_CANONICAL_DOLT_IDENTITY")
         if isinstance(row, dict):
             value = next(iter(row.values()))
         else:
             value = row[0]
         text = str(value)
         if not text or any(char.isspace() for char in text):
-            raise CanonicalIdentityMismatch("INVALID_CANONICAL_DOLT_COMMIT")
+            raise CanonicalIdentityMismatch("INVALID_CANONICAL_DOLT_IDENTITY")
         return text
     finally:
         cursor.close()
@@ -74,6 +104,7 @@ class DoltCanonicalSnapshot:
     identity: CanonicalIdentity
     connection: Any
     workspace: Path
+    database: Path
 
     def close(self) -> None:
         try:
@@ -83,7 +114,7 @@ class DoltCanonicalSnapshot:
 
 
 class DoltCanonicalRepository:
-    """Isolated canonical checkout plus no-force expected-old-SHA publication."""
+    """Fresh Dolt clone plus expected-old-SHA, non-force publication."""
 
     def __init__(
         self,
@@ -91,6 +122,8 @@ class DoltCanonicalRepository:
         connection_factory: ConnectionFactory,
         *,
         git_bin: str = "git",
+        dolt_bin: str = "dolt",
+        dolt_branch: str = "main",
         state_ref: str = CANONICAL_REF,
         run_command: RunCommand = _run,
         workspace_root: str | Path | None = None,
@@ -99,9 +132,14 @@ class DoltCanonicalRepository:
             raise CanonicalIdentityMismatch("CANONICAL_REF_MISMATCH")
         if not remote_url:
             raise ValueError("remote_url is required")
+        if not dolt_branch or any(char.isspace() for char in dolt_branch):
+            raise ValueError("dolt_branch is required")
         self.remote_url = remote_url
+        self.dolt_remote_url = _normalise_dolt_remote(remote_url)
         self.connection_factory = connection_factory
         self.git_bin = git_bin
+        self.dolt_bin = dolt_bin
+        self.dolt_branch = dolt_branch
         self.state_ref = state_ref
         self.run_command = run_command
         self.workspace_root = None if workspace_root is None else Path(workspace_root)
@@ -112,6 +150,50 @@ class DoltCanonicalRepository:
             raise CanonicalPushFailed(failure)
         return completed.stdout.strip()
 
+    def _remote_sha(self, workspace: Path) -> str:
+        output = self._command(
+            (self.git_bin, "ls-remote", "--refs", self.remote_url, self.state_ref),
+            workspace,
+            "CANONICAL_REMOTE_REF_LOOKUP_FAILED",
+        )
+        fields = output.split()
+        if len(fields) != 2 or fields[1] != self.state_ref:
+            raise CanonicalIdentityMismatch("CANONICAL_REMOTE_REF_MISSING")
+        git_sha = fields[0]
+        verify_canonical_identity(CanonicalIdentity(self.state_ref, git_sha, "probe"))
+        return git_sha
+
+    def _cli_scalar(self, database: Path, sql: str, failure: str) -> str:
+        output = self._command(
+            (self.dolt_bin, "sql", "-q", sql, "-r", "csv"),
+            database,
+            failure,
+        )
+        try:
+            rows = list(csv.reader(io.StringIO(output)))
+        except csv.Error as exc:
+            raise CanonicalIdentityMismatch("INVALID_CANONICAL_DOLT_CLI_OUTPUT") from exc
+        if len(rows) != 2 or len(rows[1]) != 1:
+            raise CanonicalIdentityMismatch("INVALID_CANONICAL_DOLT_CLI_OUTPUT")
+        value = rows[1][0].strip()
+        if not value or any(char.isspace() for char in value):
+            raise CanonicalIdentityMismatch("INVALID_CANONICAL_DOLT_CLI_OUTPUT")
+        return value
+
+    def _verify_connection_binding(self, connection: Any, database: Path) -> str:
+        connection_head = _scalar(connection, "SELECT DOLT_HASHOF('HEAD')")
+        cli_head = self._cli_scalar(
+            database,
+            "SELECT DOLT_HASHOF('HEAD') AS commit_hash",
+            "CANONICAL_DOLT_HEAD_LOOKUP_FAILED",
+        )
+        if connection_head != cli_head:
+            raise CanonicalIdentityMismatch("CANONICAL_DOLT_CONNECTION_MISMATCH")
+        active_branch = _scalar(connection, "SELECT ACTIVE_BRANCH()")
+        if active_branch != self.dolt_branch:
+            raise CanonicalIdentityMismatch("CANONICAL_DOLT_BRANCH_MISMATCH")
+        return connection_head
+
     def bootstrap(self) -> DoltCanonicalSnapshot:
         workspace = Path(
             tempfile.mkdtemp(
@@ -119,89 +201,58 @@ class DoltCanonicalRepository:
                 dir=None if self.workspace_root is None else str(self.workspace_root),
             )
         )
+        connection = None
         try:
-            self._command((self.git_bin, "init", "-q"), workspace, "CANONICAL_GIT_INIT_FAILED")
+            expected_git_sha = self._remote_sha(workspace)
+            database = workspace / "canonical"
             self._command(
-                (self.git_bin, "remote", "add", "origin", self.remote_url),
+                (self.dolt_bin, "clone", self.dolt_remote_url, database.name),
                 workspace,
-                "CANONICAL_REMOTE_SETUP_FAILED",
+                "CANONICAL_DOLT_CLONE_FAILED",
             )
-            self._command(
-                (self.git_bin, "fetch", "--no-tags", "origin", f"+{self.state_ref}:{self.state_ref}"),
-                workspace,
-                "CANONICAL_FETCH_FAILED",
-            )
-            git_sha = self._command(
-                (self.git_bin, "rev-parse", self.state_ref), workspace, "CANONICAL_REF_RESOLVE_FAILED"
-            )
-            self._command(
-                (self.git_bin, "checkout", "--detach", "-q", git_sha),
-                workspace,
-                "CANONICAL_CHECKOUT_FAILED",
-            )
-            connection = self.connection_factory(workspace)
-            dolt_commit = _scalar(connection, "SELECT DOLT_HASHOF('HEAD')")
-            identity = CanonicalIdentity(self.state_ref, git_sha, dolt_commit)
+
+            # A ref movement while clone was in flight invalidates this snapshot.
+            if self._remote_sha(workspace) != expected_git_sha:
+                raise StaleCanonicalBase("STALE_EXPECTED_OLD_SHA")
+
+            connection = self.connection_factory(database)
+            dolt_commit = self._verify_connection_binding(connection, database)
+            identity = CanonicalIdentity(self.state_ref, expected_git_sha, dolt_commit)
             verify_canonical_identity(identity)
-            return DoltCanonicalSnapshot(identity, connection, workspace)
+            return DoltCanonicalSnapshot(identity, connection, workspace, database)
         except Exception:
+            if connection is not None:
+                try:
+                    connection.close()
+                except Exception:
+                    pass
             shutil.rmtree(workspace, ignore_errors=True)
             raise
 
     def store(self, snapshot: DoltCanonicalSnapshot) -> DoltAllocationStore:
         return DoltAllocationStore(snapshot.connection)
 
-    def _remote_sha(self, workspace: Path) -> str:
-        output = self._command(
-            (self.git_bin, "ls-remote", "--refs", "origin", self.state_ref),
-            workspace,
-            "CANONICAL_REMOTE_REF_LOOKUP_FAILED",
-        )
-        fields = output.split()
-        if len(fields) != 2 or fields[1] != self.state_ref:
-            raise CanonicalIdentityMismatch("CANONICAL_REMOTE_REF_MISSING")
-        return fields[0]
-
     def publish(self, expected_old_sha: str, snapshot: DoltCanonicalSnapshot) -> CanonicalIdentity:
         verify_canonical_identity(snapshot.identity, expected_git_sha=expected_old_sha)
         if self._remote_sha(snapshot.workspace) != expected_old_sha:
             raise StaleCanonicalBase("STALE_EXPECTED_OLD_SHA")
 
-        # Version the SQL transaction in Dolt before wrapping the resulting
-        # database files in the Git commit that advances refs/dolt/data.
+        # The accepted SQL transaction is committed in the cloned Dolt database.
+        # The independent CLI read below proves the injected connection changed
+        # that exact clone rather than some unrelated server/database.
         _call(snapshot.connection, "CALL DOLT_ADD('-A')")
         _call(snapshot.connection, "CALL DOLT_COMMIT('-am', 'phase2 canonical allocation')")
         snapshot.connection.commit()
-        dolt_commit = _scalar(snapshot.connection, "SELECT DOLT_HASHOF('HEAD')")
+        dolt_commit = self._verify_connection_binding(snapshot.connection, snapshot.database)
 
-        self._command((self.git_bin, "add", "-A"), snapshot.workspace, "CANONICAL_GIT_ADD_FAILED")
-        self._command(
-            (
-                self.git_bin,
-                "-c",
-                "user.name=phase2-allocator",
-                "-c",
-                "user.email=phase2-allocator@invalid",
-                "commit",
-                "-q",
-                "-m",
-                "Phase 2 canonical allocation",
-            ),
-            snapshot.workspace,
-            "CANONICAL_GIT_COMMIT_FAILED",
-        )
-        candidate_sha = self._command(
-            (self.git_bin, "rev-parse", "HEAD"), snapshot.workspace, "CANONICAL_GIT_COMMIT_RESOLVE_FAILED"
-        )
-
-        # Re-check immediately before the normal push. A race after this check
-        # is still safe: the non-force push is rejected because the candidate is
-        # a child of expected_old_sha, never of a newer writer.
+        # Re-check immediately before a normal Dolt push. A race after this
+        # check remains fail-closed because no force option is supplied; the
+        # Git-backed Dolt remote must accept the update as a normal push.
         if self._remote_sha(snapshot.workspace) != expected_old_sha:
             raise StaleCanonicalBase("STALE_EXPECTED_OLD_SHA")
         pushed = self.run_command(
-            (self.git_bin, "push", "origin", f"{candidate_sha}:{self.state_ref}"),
-            snapshot.workspace,
+            (self.dolt_bin, "push", "origin", self.dolt_branch),
+            snapshot.database,
         )
         if pushed.returncode != 0:
             try:
@@ -212,6 +263,9 @@ class DoltCanonicalRepository:
                 raise StaleCanonicalBase("STALE_EXPECTED_OLD_SHA")
             raise CanonicalPushFailed("CANONICAL_PUSH_FAILED")
 
-        accepted = CanonicalIdentity(self.state_ref, candidate_sha, dolt_commit)
+        accepted_git_sha = self._remote_sha(snapshot.workspace)
+        if accepted_git_sha == expected_old_sha:
+            raise CanonicalPushFailed("CANONICAL_REF_NOT_ADVANCED")
+        accepted = CanonicalIdentity(self.state_ref, accepted_git_sha, dolt_commit)
         verify_canonical_identity(accepted)
         return accepted
