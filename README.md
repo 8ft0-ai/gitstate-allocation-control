@@ -34,11 +34,17 @@ It publishes only through that bound connection with normal
 out or commits the Dolt data ref as an ordinary Git worktree and exposes no
 force option.
 
-Fast tests retain an in-memory canonical repository; focused adapter tests
-additionally exercise the real Beads `issues`/`dependencies`/`labels` contract
-and Dolt Git-remote non-force publication semantics. The implementation does not
-post GitHub projections, authorise work to begin, mint credentials, dispatch
-intake or itself select/access live `refs/dolt/data`. Result projection and
-reconciliation remain separate governed work.
+The concrete store consumes Beads' maintained `issues.is_blocked` readiness
+materialisation and `capability:*` labels instead of reimplementing only part of
+Beads dependency, gate or wisp semantics. Fast tests retain an in-memory
+canonical repository; credential-free integration tests additionally use
+cryptographically pinned Beads v1.1.0 and its exact Dolt v2.1.4 dependency
+against an isolated local Git-backed Dolt remote. They apply the authoritative
+DDL and exercise database constraints, atomic grant/release mirroring,
+append-only history, canonical Beads readiness and non-force stale-writer CAS.
+
+The implementation does not post GitHub projections, authorise work to begin,
+mint credentials, dispatch intake or itself select/access live `refs/dolt/data`.
+Result projection and reconciliation remain separate governed work.
 
 Normal request-side writes and credentialed live checks remain fail-closed unless the separately reviewed activation variable `PHASE2_INTAKE_ENABLED` is exactly `true`. Neither Workstream A nor B creates that variable. Manual `workflow_dispatch` defaults to operator reconciliation; the protected scope probe is a separate explicit manual operation and never mutates canonical state.
