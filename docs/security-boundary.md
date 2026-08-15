@@ -17,3 +17,12 @@ The owner-authenticated complete selected-repository inventory remains a separat
 The workflow security contract is checked structurally rather than by substring presence. The dependency-free validator parses the expected job graph, permissions, dependencies, conditions, checkout refs, action pins, environment placement and secret-bearing boundary, and negative tests prove that unsafe mutations are rejected.
 
 The request-side reporting, source-revalidation and credentialed live-check paths are inactive unless the explicit `PHASE2_INTAKE_ENABLED=true` activation variable is introduced through a later reviewed change. Manual `workflow_dispatch` defaults to operator-authorised reconciliation through the same deterministic complete scan. The protected scope probe is a separate explicit manual operation and is the only credentialed operation enabled by this slice.
+
+## Workstream B isolation
+
+The canonical mutation library is downstream of this completed Workstream A
+boundary and accepts only an injected, already-authorised request context. It
+does not mint an App token, call GitHub, dispatch the intake workflow, post a
+result projection or provide a default live `refs/dolt/data` adapter. Canonical
+tests use an isolated SQLite conformance fixture and an in-memory CAS repository
+so failure and concurrency evidence cannot mutate live state.

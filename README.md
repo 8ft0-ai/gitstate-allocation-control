@@ -16,6 +16,16 @@ The static job validates the repository and current control-surface metadata, co
 
 The protected job receives the App key only after those request-side gates succeed. It then checks the live selected installation and current control-repository access before any reduced installation token can be requested.
 
-This Workstream A implementation does not allocate, release, mutate canonical state or authorise work to begin.
+Workstream A supplies the completed intake and credential boundary. Workstream B
+adds the canonical Dolt schema, deterministic allocation/release library and a
+no-force expected-old-SHA compare-and-swap abstraction. The allocation row is
+the singular ownership authority; its active-task uniqueness entry and Beads
+status/assignee materialisation change in the same database transaction.
 
-Normal request-side writes and credentialed live checks remain fail-closed unless the separately reviewed activation variable `PHASE2_INTAKE_ENABLED` is exactly `true`. Workstream A does not create that variable. Manual `workflow_dispatch` defaults to operator reconciliation; the protected scope probe is a separate explicit manual operation and never mutates canonical state.
+The Workstream B implementation has no default live-state adapter. Its tests use
+only an isolated in-memory canonical repository and synthetic Beads fixtures.
+It does not post GitHub projections, authorise work to begin, mint credentials,
+or access `refs/dolt/data`. Runtime wiring and all result projection or
+reconciliation behaviour remain separate governed work.
+
+Normal request-side writes and credentialed live checks remain fail-closed unless the separately reviewed activation variable `PHASE2_INTAKE_ENABLED` is exactly `true`. Neither Workstream A nor B creates that variable. Manual `workflow_dispatch` defaults to operator reconciliation; the protected scope probe is a separate explicit manual operation and never mutates canonical state.
