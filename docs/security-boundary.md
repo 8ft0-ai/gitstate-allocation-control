@@ -30,14 +30,16 @@ database explicitly.
 
 The adapter does not check out `refs/dolt/data` as an ordinary Git worktree. It
 uses the ref only as an expected-old CAS identity, clones canonical state through
-Dolt's Git-remote transport, verifies that the injected SQL connection is bound
-to that exact clone by comparing Dolt `HEAD` independently through the CLI, and
-publishes only with a normal `dolt push origin main`. It rechecks the expected
-old ref before publication, has no force option and classifies a moved ref as a
-stale writer requiring a fresh clone.
+Dolt's Git-remote transport, reads the clone's Dolt `HEAD` before opening the SQL
+connection, and then fails closed unless that connection is bound to the same
+Dolt head and expected branch. Publication is performed through that bound
+connection with normal `DOLT_PUSH('origin', 'main')`, matching pinned Beads'
+non-force path. The adapter rechecks the expected old ref before publication,
+has no force option and classifies a moved ref as a stale writer requiring a
+fresh clone.
 
 Fast failure and concurrency tests use the isolated SQLite conformance fixture
 and in-memory CAS repository. Separate runtime-adapter tests exercise the Beads
-`issues`, `dependencies` and `labels` shape and the concrete no-force Dolt
+`issues`, `dependencies` and `labels` shape and the concrete non-force Dolt
 Git-remote publication path without live state or credentials. No Workstream B
 test or candidate code selects the private state repository on its own.
