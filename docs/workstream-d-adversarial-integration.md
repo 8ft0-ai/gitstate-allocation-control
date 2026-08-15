@@ -19,8 +19,10 @@ The harness defines:
   ledger and final summary rather than inferred from the first evidence record;
 - one-to-one assertion evidence bound to each exact protocol assertion;
 - one explicit typed fault identity and outcome for every required fault control,
-  with each identity exactly qualified by the authorised run/attempt namespace and
-  each recorded actual outcome required to equal its expected fail-closed outcome;
+  with each identity exactly qualified by the authorised run/attempt namespace
+  and each expected outcome owned by the harness contract rather than supplied by
+  the evidence record; a fixture cannot pass by declaring an arbitrary expected
+  result equal to its arbitrary actual result;
 - one typed clean-environment transcript digest for every required
   Git-capable/API-only client contract;
 - executable identities containing path, blob SHA and the exact trusted commit
@@ -33,16 +35,19 @@ The harness defines:
   PyMySQL;
 - structured scenario-specific source, Git/Dolt, canonical-row and projection
   evidence;
-- exact evidence cardinality for the multi-request scenarios: scenarios 1 and 2
-  require two distinct source comments, two accepted canonical publications/two
-  Dolt identities, at least two canonical row records and exactly two projections;
-  scenario 3 requires at least three distinct retained source comments and at least
-  one terminal accepted ref, Dolt identity, canonical-row record and projection per
-  retained request;
-- scenario 4 repeated-result evidence that requires identical projection
-  digests, an unchanged canonical ref and unchanged request/allocation row counts;
-- scenario 6 winner/final-owner evidence that requires the final allocation and
-  final accepted ref to equal the winning publication and excludes the stale allocation;
+- explicit terminal-request bundles for scenarios 1–3, each binding one distinct
+  retained source comment and request ID to its exact terminal result code,
+  accepted Git ref, Dolt commit, canonical-row identity and projection URL;
+  top-level evidence must equal those bundles exactly, and duplicate refs, Dolt
+  commits, canonical rows, request IDs or projections fail closed;
+- scenario 4 repeated-result evidence bound to the retained request ID, canonical
+  request row, exact accepted ref and the exact original/repeated projection URLs,
+  in addition to identical projection digests and unchanged request/allocation row
+  counts;
+- scenario 6 winner/final-owner evidence bound to a structured retained canonical
+  allocation row whose allocation ID, row identity, accepted ref, ACTIVE state and
+  owner identity are validated, while the stale allocation is prohibited from the
+  retained canonical allocation-row set;
 - scenario 13 evidence with each required attribution, bot, installation,
   namespace/release, inventory and token-policy negative represented as its own
   exact fault control rather than an umbrella result name;
@@ -69,12 +74,17 @@ isolated `LocalCanonicalRepository` fixture. In particular it verifies:
 - exact scenario coverage and run/attempt isolation;
 - exact-authority binding in the driver, ledger and final summary;
 - one-to-one assertion, fault and client evidence binding;
-- fail-closed rejection of scenario-13 fault evidence whose identity is outside
-  the authorised attempt or whose actual outcome differs from its expected outcome;
-- exact two-request evidence for scenarios 1 and 2 and three-or-more retained,
-  terminal canonical request evidence for scenario 3;
-- scenario 4 exact repeated-result/non-mutation evidence;
-- scenario 6 exact winner/final-owner/ref evidence;
+- rejection of fault evidence whose expected outcome is self-defined instead of
+  the contract-owned outcome, whose identity is outside the authorised attempt,
+  whose fixture failed or whose actual outcome differs from the contract outcome;
+- scenarios 1 and 2 requiring exactly two distinct bound terminal-result bundles,
+  and scenario 3 requiring one distinct terminal bundle for every retained source
+  request rather than accepting parallel arrays that merely have sufficient
+  cardinality;
+- scenario 4 exact repeated-result/non-mutation evidence plus binding to the
+  retained request/ref/row/projection evidence;
+- scenario 6 exact winner/final-owner/ref evidence plus binding to the retained
+  canonical allocation row and rejection of any stale allocation row;
 - scenario 13 individual negative-fixture coverage plus exact inventory and token scopes;
 - scenario 14 complete GitHub durability and network inventory;
 - executable path/blob/trusted-commit binding by reading the actual checked-out
@@ -123,26 +133,30 @@ ledger nor final summary accepts a different but syntactically valid control or
 protocol SHA. A first record therefore cannot redefine the authority boundary.
 
 Evidence is rejected if an assertion is missing, duplicated, substituted or
-failed; a required individual fault lacks its exact run/attempt-qualified identity,
-records a failed fixture, or records an actual outcome different from its expected
-outcome; a client contract lacks a clean transcript digest; required
-source/ref/Dolt/row or projection evidence is absent or under-counted for scenarios
-1–3; an executable path/blob is not independently resolved from the exact trusted
-commit's Git tree and matched to the retained tree entry/blob identity; the trusted
-commit object is unavailable to the verifier; the pinned dependency set differs;
-the scenario exits non-zero; the run is a rerun; evidence crosses runs/attempts; or
-durability relies on a service outside GitHub Issues, repositories, refs or Actions.
+failed; a required individual fault lacks its exact run/attempt-qualified
+identity, declares an expected outcome different from the contract-owned value,
+records a failed fixture, or records an actual outcome different from that
+contract value; a client contract lacks a clean transcript digest; any scenarios
+1–3 terminal bundle is missing, duplicated or does not map exactly to the retained
+source/request/ref/Dolt/row/projection evidence; an executable path/blob is not
+independently resolved from the exact trusted commit's Git tree and matched to
+the retained tree entry/blob identity; the trusted commit object is unavailable
+to the verifier; the pinned dependency set differs; the scenario exits non-zero;
+the run is a rerun; evidence crosses runs/attempts; or durability relies on a
+service outside GitHub Issues, repositories, refs or Actions.
 
 Scenario 4 additionally requires proof that the repeated result envelope is
-identical and that neither the canonical ref nor request/allocation row counts
-change. Scenario 6 additionally requires a structured winner/final-owner record
-whose owner and final ref match the winning accepted publication. Scenario 13
-requires a current exact two-repository installation inventory, exact reduced
-control/state token request and returned scopes, cross-repository denial, and
-individual evidence for every required negative fixture. Scenario 14 requires
-the complete GitHub durability category inventory and a recorded network
-inventory. The final summary is derived only after the complete exact-authority
-ledger revalidates all fourteen records.
+identical, that neither the canonical ref nor request/allocation row counts
+change, and that the repeated proof names the exact retained canonical request
+row, accepted ref and original/repeated projection records. Scenario 6
+additionally requires a structured canonical allocation-row record for the
+winning allocation and proves that the stale allocation did not become a retained
+canonical row. Scenario 13 requires a current exact two-repository installation
+inventory, exact reduced control/state token request and returned scopes,
+cross-repository denial, and individual evidence for every required negative
+fixture. Scenario 14 requires the complete GitHub durability category inventory
+and a recorded network inventory. The final summary is derived only after the
+complete exact-authority ledger revalidates all fourteen records.
 
 ## Non-goals
 
