@@ -66,6 +66,41 @@ SCENARIO_13_FAULT_CONTROLS = (
     "control_token_cross_repository_access",
     "state_token_cross_repository_access",
 )
+EXPECTED_FAULT_OUTCOMES = {
+    "close_timed_requests": "requests_retained_and_serialised",
+    "cancel_queued_attempt": "retained_requests_reconciled_after_cancellation",
+    "multi_page_comment_fixture": "complete_pagination_verified",
+    "delay_publication": "stale_writer_rejected_without_force",
+    "fail_canonical_push": "canonical_push_failed_without_visibility",
+    "fail_projection_post": "missing_projection_repaired_from_canonical_state",
+    "inject_orphan_projection": "orphan_projection_invalidated_without_ownership",
+    "edit_before_ingress": "source_comment_edited_before_ingress_rejected",
+    "delete_before_ingress": "unobserved_pre_ingress_delete_not_claimed_durable",
+    "edit_after_ingress": "canonical_result_immutable_after_source_edit",
+    "delete_after_ingress": "canonical_result_immutable_after_source_delete",
+    "inject_mirror_mismatch": "canonical_ownership_mismatch_fail_closed",
+    "missing_comment_app_attribution": "agent_not_authorised_before_app_key_job",
+    "wrong_comment_app_id": "agent_not_authorised_before_app_key_job",
+    "wrong_comment_app_slug": "agent_not_authorised_before_app_key_job",
+    "wrong_bot_id": "agent_not_authorised_before_app_key_job",
+    "wrong_bot_login": "agent_not_authorised_before_app_key_job",
+    "wrong_installation_mapping": "agent_not_authorised_without_state_token_or_canonical_access",
+    "lost_control_repository_access": "agent_not_authorised_without_state_token_or_canonical_access",
+    "misleading_event_installation": "agent_not_authorised_before_app_key_job",
+    "human_namespace_impersonation": "agent_not_authorised_before_app_key_job",
+    "unauthorised_release": "release_not_authorised_without_ownership_mutation",
+    "inventory_additional_repository": "installation_inventory_mismatch_credentials_disabled",
+    "inventory_missing_repository": "installation_inventory_mismatch_credentials_disabled",
+    "inventory_stale_after_settings_change": "stale_inventory_credentials_disabled",
+    "token_repository_restriction_omitted": "token_request_rejected_before_use",
+    "token_permission_restriction_omitted": "token_request_rejected_before_use",
+    "default_token_request": "token_request_rejected_before_use",
+    "multi_repository_token_request": "token_request_rejected_before_use",
+    "unapproved_permission_request": "token_request_rejected_before_use",
+    "returned_scope_mismatch": "returned_scope_mismatch_token_unused",
+    "control_token_cross_repository_access": "cross_repository_access_denied",
+    "state_token_cross_repository_access": "cross_repository_access_denied",
+}
 _ATTEMPT_RE = re.compile(
     r"^wd-(?P<run>[1-9][0-9]*)-(?P<attempt>[1-9][0-9]*)-(?P<nonce>[a-z0-9]{6,24})$"
 )
@@ -136,6 +171,8 @@ class ScenarioSpec:
             raise AdversarialContractError("DUPLICATE_CLIENT_CONTRACT")
         if len(set(self.fault_controls)) != len(self.fault_controls):
             raise AdversarialContractError("DUPLICATE_FAULT_CONTROL")
+        if any(control not in EXPECTED_FAULT_OUTCOMES for control in self.fault_controls):
+            raise AdversarialContractError("FAULT_CONTROL_WITHOUT_CONTRACT_OUTCOME")
 
 
 SCENARIOS: tuple[ScenarioSpec, ...] = (
@@ -419,9 +456,14 @@ class FaultEvidence:
         expected_identity = f"{attempt_namespace}:{scenario_id}:{self.control}"
         if self.identity != expected_identity:
             raise AdversarialContractError(f"FAULT_IDENTITY_NOT_ATTEMPT_BOUND:{self.control}")
+        contract_outcome = EXPECTED_FAULT_OUTCOMES.get(self.control)
+        if contract_outcome is None:
+            raise AdversarialContractError(f"UNKNOWN_FAULT_CONTROL:{self.control}")
+        if self.expected_outcome != contract_outcome:
+            raise AdversarialContractError(f"FAULT_EXPECTED_OUTCOME_MISMATCH:{self.control}")
         if not self.passed:
             raise AdversarialContractError(f"FAULT_OUTCOME_FAILED:{self.control}")
-        if self.actual_outcome != self.expected_outcome:
+        if self.actual_outcome != contract_outcome:
             raise AdversarialContractError(f"FAULT_OUTCOME_MISMATCH:{self.control}")
 
 
@@ -441,6 +483,35 @@ class ClientTranscript:
             raise AdversarialContractError("CLIENT_ENVIRONMENT_NOT_CLEAN")
         if self.prohibited_capabilities_used:
             raise AdversarialContractError("CLIENT_CONTRACT_VIOLATION")
+
+
+@dataclass(frozen=True)
+class TerminalRequestEvidence:
+    source_comment_id: int
+    request_id: str
+    terminal_status: str
+    result_code: str
+    accepted_ref_sha: str
+    dolt_commit: str
+    canonical_row: str
+    projection_url: str
+
+    def validate(self) -> None:
+        if self.source_comment_id <= 0 or not all(
+            (
+                self.request_id,
+                self.terminal_status,
+                self.result_code,
+                self.dolt_commit,
+                self.canonical_row,
+                self.projection_url,
+            )
+        ):
+            raise AdversarialContractError("INCOMPLETE_TERMINAL_REQUEST_EVIDENCE")
+        if self.terminal_status not in {"ALLOCATED", "REJECTED", "RELEASED"}:
+            raise AdversarialContractError("NON_TERMINAL_REQUEST_EVIDENCE")
+        if not _FULL_SHA.fullmatch(self.accepted_ref_sha):
+            raise AdversarialContractError("INVALID_TERMINAL_ACCEPTED_REF")
 
 
 @dataclass(frozen=True)
@@ -494,6 +565,9 @@ class ExecutableIdentity:
 @dataclass(frozen=True)
 class RepeatedResultEvidence:
     request_id: str
+    canonical_request_row: str
+    original_projection_url: str
+    repeated_projection_url: str
     original_projection_sha256: str
     repeated_projection_sha256: str
     canonical_ref_before: str
@@ -504,8 +578,17 @@ class RepeatedResultEvidence:
     allocation_rows_after: int
 
     def validate(self) -> None:
-        if not self.request_id:
+        if not all(
+            (
+                self.request_id,
+                self.canonical_request_row,
+                self.original_projection_url,
+                self.repeated_projection_url,
+            )
+        ):
             raise AdversarialContractError("MISSING_REPEATED_RESULT_REQUEST")
+        if self.original_projection_url == self.repeated_projection_url:
+            raise AdversarialContractError("REPEATED_RESULT_PROJECTION_URL_NOT_DISTINCT")
         if not _SHA256.fullmatch(self.original_projection_sha256) or not _SHA256.fullmatch(
             self.repeated_projection_sha256
         ):
@@ -524,6 +607,23 @@ class RepeatedResultEvidence:
 
 
 @dataclass(frozen=True)
+class CanonicalAllocationEvidence:
+    allocation_id: str
+    row_identity: str
+    accepted_ref_sha: str
+    state: str
+    agent_id: str
+
+    def validate(self) -> None:
+        if not all((self.allocation_id, self.row_identity, self.agent_id)):
+            raise AdversarialContractError("INCOMPLETE_CANONICAL_ALLOCATION_EVIDENCE")
+        if not _FULL_SHA.fullmatch(self.accepted_ref_sha):
+            raise AdversarialContractError("INVALID_CANONICAL_ALLOCATION_REF")
+        if self.state not in {"ACTIVE", "RELEASED"}:
+            raise AdversarialContractError("INVALID_CANONICAL_ALLOCATION_STATE")
+
+
+@dataclass(frozen=True)
 class FinalOwnerEvidence:
     winning_allocation_id: str
     final_owner_allocation_id: str
@@ -531,7 +631,13 @@ class FinalOwnerEvidence:
     winning_ref_sha: str
     final_ref_sha: str
 
-    def validate(self, *, accepted_ref_shas: tuple[str, ...]) -> None:
+    def validate(
+        self,
+        *,
+        accepted_ref_shas: tuple[str, ...],
+        canonical_rows: tuple[str, ...],
+        allocation_rows: tuple[CanonicalAllocationEvidence, ...],
+    ) -> None:
         if not all(
             (
                 self.winning_allocation_id,
@@ -547,9 +653,22 @@ class FinalOwnerEvidence:
         if (
             not _FULL_SHA.fullmatch(self.winning_ref_sha)
             or self.winning_ref_sha != self.final_ref_sha
-            or self.winning_ref_sha not in accepted_ref_shas
+            or not accepted_ref_shas
+            or self.winning_ref_sha != accepted_ref_shas[-1]
         ):
             raise AdversarialContractError("FINAL_OWNER_REF_MISMATCH")
+        winning_rows = tuple(
+            row for row in allocation_rows if row.allocation_id == self.winning_allocation_id
+        )
+        if len(winning_rows) != 1:
+            raise AdversarialContractError("MISSING_FINAL_OWNER_ALLOCATION_ROW")
+        winning_row = winning_rows[0]
+        if winning_row.state != "ACTIVE" or winning_row.accepted_ref_sha != self.winning_ref_sha:
+            raise AdversarialContractError("FINAL_OWNER_ALLOCATION_ROW_MISMATCH")
+        if winning_row.row_identity not in canonical_rows:
+            raise AdversarialContractError("FINAL_OWNER_ROW_NOT_RETAINED")
+        if any(row.allocation_id == self.stale_allocation_id for row in allocation_rows):
+            raise AdversarialContractError("STALE_ALLOCATION_PRESENT_IN_CANONICAL_ROWS")
 
 
 @dataclass(frozen=True)
@@ -592,9 +711,30 @@ def _require_distinct(values: tuple[object, ...], *, code: str) -> None:
         raise AdversarialContractError(code)
 
 
-def _require_at_least(values: tuple[object, ...], count: int, *, code: str) -> None:
-    if len(values) < count:
-        raise AdversarialContractError(code)
+def _validate_terminal_request_bindings(evidence: "ScenarioEvidence", *, exact_count: int | None) -> None:
+    if exact_count is not None and len(evidence.terminal_requests) != exact_count:
+        raise AdversarialContractError("SCENARIO_TERMINAL_RESULT_COUNT_MISMATCH")
+    if exact_count is None and len(evidence.terminal_requests) != len(evidence.source_comment_ids):
+        raise AdversarialContractError("SCENARIO_TERMINAL_RESULT_COUNT_MISMATCH")
+    for record in evidence.terminal_requests:
+        record.validate()
+    if tuple(record.source_comment_id for record in evidence.terminal_requests) != evidence.source_comment_ids:
+        raise AdversarialContractError("TERMINAL_SOURCE_BINDING_MISMATCH")
+    if tuple(record.request_id for record in evidence.terminal_requests) != evidence.request_ids:
+        raise AdversarialContractError("TERMINAL_REQUEST_ID_BINDING_MISMATCH")
+    if tuple(record.accepted_ref_sha for record in evidence.terminal_requests) != evidence.accepted_ref_shas:
+        raise AdversarialContractError("TERMINAL_ACCEPTED_REF_BINDING_MISMATCH")
+    if tuple(record.dolt_commit for record in evidence.terminal_requests) != evidence.dolt_commits:
+        raise AdversarialContractError("TERMINAL_DOLT_BINDING_MISMATCH")
+    if tuple(record.canonical_row for record in evidence.terminal_requests) != evidence.canonical_rows:
+        raise AdversarialContractError("TERMINAL_CANONICAL_ROW_BINDING_MISMATCH")
+    if tuple(record.projection_url for record in evidence.terminal_requests) != evidence.projection_urls:
+        raise AdversarialContractError("TERMINAL_PROJECTION_BINDING_MISMATCH")
+    _require_distinct(evidence.request_ids, code="DUPLICATE_TERMINAL_REQUEST_ID")
+    _require_distinct(evidence.accepted_ref_shas, code="DUPLICATE_TERMINAL_ACCEPTED_REF")
+    _require_distinct(evidence.dolt_commits, code="DUPLICATE_TERMINAL_DOLT_COMMIT")
+    _require_distinct(evidence.canonical_rows, code="DUPLICATE_TERMINAL_CANONICAL_ROW")
+    _require_distinct(evidence.projection_urls, code="DUPLICATE_TERMINAL_PROJECTION")
 
 
 @dataclass(frozen=True)
@@ -609,11 +749,14 @@ class ScenarioEvidence:
     state_repository_id: int
     exit_status: int
     source_comment_ids: tuple[int, ...] = ()
+    request_ids: tuple[str, ...] = ()
     base_ref_shas: tuple[str, ...] = ()
     accepted_ref_shas: tuple[str, ...] = ()
     dolt_commits: tuple[str, ...] = ()
     canonical_rows: tuple[str, ...] = ()
     projection_urls: tuple[str, ...] = ()
+    terminal_requests: tuple[TerminalRequestEvidence, ...] = ()
+    allocation_rows: tuple[CanonicalAllocationEvidence, ...] = ()
     fault_ids: tuple[FaultEvidence, ...] = ()
     assertions: tuple[AssertionEvidence, ...] = ()
     client_transcripts: tuple[ClientTranscript, ...] = ()
@@ -713,52 +856,76 @@ class ScenarioEvidence:
         if self.scenario_id in {1, 2, 3, 4, 5, 8, 9, 11, 12, 14} and not self.projection_urls:
             raise AdversarialContractError("MISSING_PROJECTION_EVIDENCE")
 
+        for row in self.allocation_rows:
+            row.validate()
+            if row.row_identity not in self.canonical_rows:
+                raise AdversarialContractError("CANONICAL_ALLOCATION_ROW_NOT_RETAINED")
+        if len({row.allocation_id for row in self.allocation_rows}) != len(self.allocation_rows):
+            raise AdversarialContractError("DUPLICATE_CANONICAL_ALLOCATION_ID")
+        if len({row.row_identity for row in self.allocation_rows}) != len(self.allocation_rows):
+            raise AdversarialContractError("DUPLICATE_CANONICAL_ALLOCATION_ROW")
+
         if self.scenario_id in {1, 2}:
             if len(self.source_comment_ids) != 2:
                 raise AdversarialContractError("SCENARIO_CONCURRENT_SOURCE_COUNT_MISMATCH")
-            _require_at_least(
-                self.accepted_ref_shas, 2, code="SCENARIO_CONCURRENT_ACCEPTED_REF_EVIDENCE_INCOMPLETE"
-            )
-            _require_at_least(
-                self.dolt_commits, 2, code="SCENARIO_CONCURRENT_DOLT_EVIDENCE_INCOMPLETE"
-            )
-            _require_at_least(
-                self.canonical_rows, 2, code="SCENARIO_CONCURRENT_CANONICAL_ROW_EVIDENCE_INCOMPLETE"
-            )
-            if len(self.projection_urls) != 2:
-                raise AdversarialContractError("SCENARIO_CONCURRENT_PROJECTION_COUNT_MISMATCH")
+            _validate_terminal_request_bindings(self, exact_count=2)
+            if self.scenario_id == 1:
+                if tuple(record.result_code for record in self.terminal_requests) != (
+                    "ALLOCATED",
+                    "ALLOCATED",
+                ):
+                    raise AdversarialContractError("SCENARIO_1_TERMINAL_RESULT_MISMATCH")
+            else:
+                if sorted(record.result_code for record in self.terminal_requests) != [
+                    "ALLOCATED",
+                    "TASK_ALREADY_ALLOCATED",
+                ]:
+                    raise AdversarialContractError("SCENARIO_2_TERMINAL_RESULT_MISMATCH")
+        elif self.terminal_requests:
+            if self.scenario_id != 3:
+                raise AdversarialContractError("UNEXPECTED_TERMINAL_REQUEST_EVIDENCE")
 
         if self.scenario_id == 3:
-            _require_at_least(
-                self.source_comment_ids, 3, code="SCENARIO_3_SOURCE_EVIDENCE_INCOMPLETE"
-            )
-            required = len(self.source_comment_ids)
-            _require_at_least(
-                self.accepted_ref_shas, required, code="SCENARIO_3_ACCEPTED_REF_EVIDENCE_INCOMPLETE"
-            )
-            _require_at_least(
-                self.dolt_commits, required, code="SCENARIO_3_DOLT_EVIDENCE_INCOMPLETE"
-            )
-            _require_at_least(
-                self.canonical_rows, required, code="SCENARIO_3_CANONICAL_ROW_EVIDENCE_INCOMPLETE"
-            )
-            _require_at_least(
-                self.projection_urls, required, code="SCENARIO_3_PROJECTION_EVIDENCE_INCOMPLETE"
-            )
+            if len(self.source_comment_ids) < 3:
+                raise AdversarialContractError("SCENARIO_3_SOURCE_EVIDENCE_INCOMPLETE")
+            _validate_terminal_request_bindings(self, exact_count=None)
 
         if self.scenario_id == 4:
             if self.repeated_result is None:
                 raise AdversarialContractError("MISSING_REPEATED_RESULT_EVIDENCE")
             self.repeated_result.validate()
+            if self.request_ids != (self.repeated_result.request_id,):
+                raise AdversarialContractError("REPEATED_RESULT_REQUEST_NOT_RETAINED")
+            if self.repeated_result.canonical_request_row not in self.canonical_rows:
+                raise AdversarialContractError("REPEATED_RESULT_ROW_NOT_RETAINED")
+            if (
+                not self.accepted_ref_shas
+                or self.repeated_result.canonical_ref_before != self.accepted_ref_shas[-1]
+                or self.repeated_result.canonical_ref_after != self.accepted_ref_shas[-1]
+            ):
+                raise AdversarialContractError("REPEATED_RESULT_REF_NOT_RETAINED")
+            expected_projection_urls = (
+                self.repeated_result.original_projection_url,
+                self.repeated_result.repeated_projection_url,
+            )
+            if self.projection_urls != expected_projection_urls:
+                raise AdversarialContractError("REPEATED_RESULT_PROJECTION_NOT_RETAINED")
         elif self.repeated_result is not None:
             raise AdversarialContractError("UNEXPECTED_REPEATED_RESULT_EVIDENCE")
 
         if self.scenario_id == 6:
             if self.final_owner is None:
                 raise AdversarialContractError("MISSING_FINAL_OWNER_EVIDENCE")
-            self.final_owner.validate(accepted_ref_shas=self.accepted_ref_shas)
-        elif self.final_owner is not None:
-            raise AdversarialContractError("UNEXPECTED_FINAL_OWNER_EVIDENCE")
+            self.final_owner.validate(
+                accepted_ref_shas=self.accepted_ref_shas,
+                canonical_rows=self.canonical_rows,
+                allocation_rows=self.allocation_rows,
+            )
+        else:
+            if self.final_owner is not None:
+                raise AdversarialContractError("UNEXPECTED_FINAL_OWNER_EVIDENCE")
+            if self.allocation_rows:
+                raise AdversarialContractError("UNEXPECTED_CANONICAL_ALLOCATION_EVIDENCE")
 
         if self.scenario_id == 13:
             if tuple(sorted(self.installation_inventory_repository_ids)) != tuple(
@@ -800,11 +967,14 @@ class ScenarioEvidence:
                 "state_repository_id": self.state_repository_id,
                 "exit_status": self.exit_status,
                 "source_comment_ids": list(self.source_comment_ids),
+                "request_ids": list(self.request_ids),
                 "base_ref_shas": list(self.base_ref_shas),
                 "accepted_ref_shas": list(self.accepted_ref_shas),
                 "dolt_commits": list(self.dolt_commits),
                 "canonical_rows": list(self.canonical_rows),
                 "projection_urls": list(self.projection_urls),
+                "terminal_requests": [r.__dict__ for r in self.terminal_requests],
+                "allocation_rows": [r.__dict__ for r in self.allocation_rows],
                 "fault_ids": [f.__dict__ for f in self.fault_ids],
                 "assertions": [a.__dict__ for a in self.assertions],
                 "client_transcripts": [
