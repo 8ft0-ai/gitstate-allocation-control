@@ -68,8 +68,6 @@ class ManagedDoltConnection:
                 "127.0.0.1",
                 "--port",
                 str(self.port),
-                "--user",
-                "root",
                 "--loglevel",
                 "warning",
             ],
