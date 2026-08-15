@@ -22,7 +22,15 @@ The request-side reporting, source-revalidation and credentialed live-check path
 
 The canonical mutation library is downstream of this completed Workstream A
 boundary and accepts only an injected, already-authorised request context. It
-does not mint an App token, call GitHub, dispatch the intake workflow, post a
-result projection or provide a default live `refs/dolt/data` adapter. Canonical
-tests use an isolated SQLite conformance fixture and an in-memory CAS repository
-so failure and concurrency evidence cannot mutate live state.
+does not mint an App token, call GitHub, dispatch the intake workflow or post a
+result projection. The concrete Git/Dolt adapter has no configured repository,
+credential or default live connection: the already-authorised caller must inject
+the state-repository URL and isolated database connection explicitly. It fetches
+only `refs/dolt/data` into a temporary workspace and publishes only through a
+normal expected-old-SHA fast-forward push with no force option.
+
+Fast failure and concurrency tests use the isolated SQLite conformance fixture
+and in-memory CAS repository. Separate runtime-adapter tests exercise the Beads
+`issues`, `dependencies` and `labels` shape and the concrete no-force Git/Dolt
+publication path without live state or credentials. No Workstream B test or
+candidate code selects the private state repository on its own.
