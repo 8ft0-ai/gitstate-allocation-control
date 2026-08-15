@@ -22,18 +22,20 @@ unit tests. `phase2.dolt_repository.DoltCanonicalRepository` is the concrete
 isolated Git-backed Dolt adapter. `refs/dolt/data` is treated only as the
 expected-old Git CAS identity: the adapter probes it with `git ls-remote`,
 normalises the repository URL using the pinned Beads v1.1.0 Git-to-Dolt rules,
-and performs a fresh `dolt clone` into an isolated temporary database. The
-caller-supplied PEP-249 connection must open that exact clone; bootstrap fails
-closed unless its `DOLT_HASHOF('HEAD')` equals an independent Dolt-CLI read from
-the clone and `ACTIVE_BRANCH()` is the expected `main` branch. Ref movement
-while the clone is in flight invalidates the snapshot.
+and performs a fresh `dolt clone` into an isolated temporary database. Before
+opening the caller-supplied PEP-249 connection, it reads the cloned Dolt
+`HEAD` through the CLI. Bootstrap then fails closed unless the opened
+connection reports that exact `DOLT_HASHOF('HEAD')` and the expected `main`
+branch. Ref movement while the clone is in flight invalidates the snapshot.
 
 Publication versions the accepted SQL transaction with `DOLT_ADD` and
-`DOLT_COMMIT`, repeats the connection-versus-clone identity check, rechecks the
-expected old `refs/dolt/data` SHA immediately before publication, then performs
-only `dolt push origin main`. No Git checkout, Git worktree commit or force push
-is used for canonical data. A failed push is classified as stale if the remote
-CAS identity moved and otherwise as a canonical push failure; a successful push
+`DOLT_COMMIT` through that already-bound connection, rechecks the expected old
+`refs/dolt/data` SHA immediately before publication, and then calls normal
+`DOLT_PUSH('origin', 'main')` through the same connection. This is the pinned
+Beads non-force publication path: no `--force` argument exists, and canonical
+data is never published by checking out or committing `refs/dolt/data` as an
+ordinary Git worktree. A failed push is classified as stale if the remote CAS
+identity moved and otherwise as a canonical push failure; a successful push
 must advance the canonical Git ref before an accepted identity is returned.
 Bounded stale retries always start from a fresh Dolt clone.
 
