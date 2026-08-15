@@ -131,15 +131,8 @@ class DoltStoreTests(unittest.TestCase):
               issue_type TEXT NOT NULL,
               assignee TEXT,
               created_at TEXT NOT NULL,
-              created_by TEXT NOT NULL
-            );
-            CREATE TABLE dependencies (
-              id TEXT PRIMARY KEY,
-              issue_id TEXT NOT NULL,
-              depends_on_issue_id TEXT,
-              depends_on_wisp_id TEXT,
-              depends_on_external TEXT,
-              type TEXT NOT NULL DEFAULT 'blocks'
+              created_by TEXT NOT NULL,
+              is_blocked INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE labels (
               issue_id TEXT NOT NULL,
@@ -211,17 +204,8 @@ class DoltStoreTests(unittest.TestCase):
         self.assertEqual((status, assignee), ("open", None))
         self.assertEqual(self.inner.execute("SELECT COUNT(*) FROM active_task_allocations").fetchone()[0], 0)
 
-    def test_beads_dependencies_and_capability_labels_drive_readiness(self):
-        self.inner.execute(
-            """INSERT INTO issues VALUES
-               ('blocker', 'blocker', '', '', '', '', 'open', 0, 'task', NULL, ?, 'fixture')""",
-            (NOW,),
-        )
-        self.inner.execute(
-            """INSERT INTO dependencies
-               (id, issue_id, depends_on_issue_id, type)
-               VALUES ('dep-1', 'task-1', 'blocker', 'blocks')"""
-        )
+    def test_beads_canonical_readiness_and_capability_labels_drive_eligibility(self):
+        self.inner.execute("UPDATE issues SET is_blocked = 1 WHERE id = 'task-1'")
         task = self.store.task("task-1")
         self.assertTrue(task.blocked)
         self.assertFalse(task.ready)
