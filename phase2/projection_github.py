@@ -18,11 +18,14 @@ REPOSITORY_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 
 class GitHubIssueGateway:
-    def __init__(self, api: GitHubAPI, repository: str) -> None:
+    def __init__(self, api: GitHubAPI, repository: str, *, max_pages: int = 1000) -> None:
         if not REPOSITORY_RE.fullmatch(repository):
             raise ValueError("invalid repository")
+        if max_pages <= 0:
+            raise ValueError("max_pages must be positive")
         self.api = api
         self.repository = repository
+        self.max_pages = max_pages
 
     @property
     def _base(self) -> str:
@@ -42,6 +45,7 @@ class GitHubIssueGateway:
         if issue_number <= 0:
             raise ValueError("issue_number must be positive")
         comments: list[DurableComment] = []
+        previous_id = 0
         page = 1
         while True:
             value = self.api.get(
@@ -49,6 +53,8 @@ class GitHubIssueGateway:
             )
             if not isinstance(value, list):
                 raise ValueError("GitHub comments response is not a list")
+            if len(value) > 100:
+                raise ValueError("GitHub comments page exceeds requested size")
             for item in value:
                 if not isinstance(item, dict):
                     raise ValueError("GitHub comment response item is not an object")
@@ -62,9 +68,14 @@ class GitHubIssueGateway:
                     or not isinstance(html_url, str)
                 ):
                     raise ValueError("GitHub comment response item is incomplete")
+                if comment_id <= previous_id:
+                    raise ValueError("GitHub comment pagination is repeated or decreasing")
+                previous_id = comment_id
                 comments.append(DurableComment(comment_id, body, html_url))
             if len(value) < 100:
                 break
+            if page >= self.max_pages:
+                raise ValueError("GitHub comment pagination did not terminate within bound")
             page += 1
         return comments
 
