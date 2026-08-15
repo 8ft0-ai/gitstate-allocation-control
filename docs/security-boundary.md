@@ -38,8 +38,14 @@ non-force path. The adapter rechecks the expected old ref before publication,
 has no force option and classifies a moved ref as a stale writer requiring a
 fresh clone.
 
-Fast failure and concurrency tests use the isolated SQLite conformance fixture
-and in-memory CAS repository. Separate runtime-adapter tests exercise the Beads
-`issues`, `dependencies` and `labels` shape and the concrete non-force Dolt
-Git-remote publication path without live state or credentials. No Workstream B
-test or candidate code selects the private state repository on its own.
+The runtime store consumes Beads' maintained `issues.is_blocked` value for
+canonical readiness and `capability:*` labels for capability filtering. It does
+not implement a competing dependency/gate/wisp readiness algorithm. Fast failure
+and concurrency tests use the isolated SQLite conformance fixture and in-memory
+CAS repository. Separate credential-free integration tests download only
+SHA-256-pinned public Beads v1.1.0 and Dolt v2.1.4 artefacts, use a hash-pinned
+PEP-249 client in a throwaway venv, and operate only on temporary local Git-backed
+Dolt repositories. They apply the Workstream B DDL and exercise real database
+constraints, grant/release atomicity, append-only events, Beads canonical
+readiness and non-force stale-writer CAS. No Workstream B test or candidate code
+selects the private state repository on its own.
