@@ -6,8 +6,10 @@ from phase2.adversarial import (
     AdversarialContractError,
     AssertionEvidence,
     AttemptNamespace,
+    CanonicalAllocationEvidence,
     ClientTranscript,
     CONTROL_REPOSITORY_ID,
+    EXPECTED_FAULT_OUTCOMES,
     EvidenceLedger,
     ExecutableIdentity,
     FaultEvidence,
@@ -20,6 +22,7 @@ from phase2.adversarial import (
     RepeatedResultEvidence,
     ScenarioDriver,
     ScenarioEvidence,
+    TerminalRequestEvidence,
     TokenScopeEvidence,
     evidence_summary,
     scenario_by_id,
@@ -155,7 +158,9 @@ def evidence_for(
             else ()
         )
         canonical_count = 1 if scenario_id in {4, 5, 6, 7, 8, 9, 10, 12, 14} else 0
-        projection_count = 1 if scenario_id in {4, 5, 8, 9, 11, 12, 14} else 0
+        projection_count = 2 if scenario_id == 4 else (
+            1 if scenario_id in {5, 8, 9, 11, 12, 14} else 0
+        )
 
     accepted_refs = tuple(f"{i + 2:040x}" for i in range(canonical_count))
     base_refs = tuple(f"{i + 1:040x}" for i in range(canonical_count))
@@ -167,10 +172,45 @@ def evidence_for(
     )
     accepted_ref = accepted_refs[-1] if accepted_refs else "2" * 40
 
+    if scenario_id in {1, 2, 3}:
+        request_ids = tuple(
+            f"01KWORKSTREAMD{scenario_id:02d}{index + 1:02d}REQUEST"
+            for index in range(len(source_comments))
+        )
+    elif scenario_id == 4:
+        request_ids = ("01KWORKSTREAMDREPEATED0001",)
+    else:
+        request_ids = ()
+
+    terminal_requests = ()
+    if scenario_id in {1, 2, 3}:
+        if scenario_id == 2:
+            result_codes = ("ALLOCATED", "TASK_ALREADY_ALLOCATED")
+            terminal_statuses = ("ALLOCATED", "REJECTED")
+        else:
+            result_codes = tuple("ALLOCATED" for _ in source_comments)
+            terminal_statuses = tuple("ALLOCATED" for _ in source_comments)
+        terminal_requests = tuple(
+            TerminalRequestEvidence(
+                source_comment_id=source_comments[index],
+                request_id=request_ids[index],
+                terminal_status=terminal_statuses[index],
+                result_code=result_codes[index],
+                accepted_ref_sha=accepted_refs[index],
+                dolt_commit=dolt_commits[index],
+                canonical_row=canonical_rows[index],
+                projection_url=projections[index],
+            )
+            for index in range(len(source_comments))
+        )
+
     repeated_result = None
     if scenario_id == 4:
         repeated_result = RepeatedResultEvidence(
-            request_id="01KWORKSTREAMDREPEATED0001",
+            request_id=request_ids[0],
+            canonical_request_row=canonical_rows[0],
+            original_projection_url=projections[0],
+            repeated_projection_url=projections[1],
             original_projection_sha256=PROJECTION_DIGEST,
             repeated_projection_sha256=PROJECTION_DIGEST,
             canonical_ref_before=accepted_ref,
@@ -180,8 +220,19 @@ def evidence_for(
             allocation_rows_before=1,
             allocation_rows_after=1,
         )
+
+    allocation_rows = ()
     final_owner = None
     if scenario_id == 6:
+        allocation_rows = (
+            CanonicalAllocationEvidence(
+                allocation_id="allocation-winner",
+                row_identity=canonical_rows[0],
+                accepted_ref_sha=accepted_ref,
+                state="ACTIVE",
+                agent_id=AGENT,
+            ),
+        )
         final_owner = FinalOwnerEvidence(
             winning_allocation_id="allocation-winner",
             final_owner_allocation_id="allocation-winner",
@@ -201,18 +252,21 @@ def evidence_for(
         state_repository_id=STATE_REPOSITORY_ID,
         exit_status=0,
         source_comment_ids=source_comments,
+        request_ids=request_ids,
         base_ref_shas=base_refs,
         accepted_ref_shas=accepted_refs,
         dolt_commits=dolt_commits,
         canonical_rows=canonical_rows,
         projection_urls=projections,
+        terminal_requests=terminal_requests,
+        allocation_rows=allocation_rows,
         fault_ids=tuple(
             FaultEvidence(
                 control=control,
                 identity=f"{namespace}:{scenario_id}:{control}",
                 passed=True,
-                expected_outcome=f"{control}:blocked-or-injected",
-                actual_outcome=f"{control}:blocked-or-injected",
+                expected_outcome=EXPECTED_FAULT_OUTCOMES[control],
+                actual_outcome=EXPECTED_FAULT_OUTCOMES[control],
             )
             for control in spec.fault_controls
         ),
@@ -263,6 +317,7 @@ class CatalogueTests(unittest.TestCase):
         self.assertGreaterEqual(len(spec.fault_controls), 20)
         self.assertNotIn("static_identity_negative", spec.fault_controls)
         self.assertNotIn("token_scope_negative", spec.fault_controls)
+        self.assertTrue(all(control in EXPECTED_FAULT_OUTCOMES for control in spec.fault_controls))
 
     def test_attempt_namespace_is_bound_to_run_and_first_attempt(self):
         parsed = AttemptNamespace.parse(NAMESPACE, run_id=RUN_ID, run_attempt=1)
@@ -318,7 +373,7 @@ class EvidenceTests(unittest.TestCase):
         with self.assertRaisesRegex(AdversarialContractError, "ASSERTION_BINDING_MISMATCH"):
             mutated.validate()
 
-    def test_every_fault_control_requires_its_own_matching_attempt_bound_outcome(self):
+    def test_every_fault_control_requires_contract_owned_attempt_bound_outcome(self):
         evidence = evidence_for(13)
         mutated = ScenarioEvidence(**{**evidence.__dict__, "fault_ids": evidence.fault_ids[:-1]})
         with self.assertRaisesRegex(AdversarialContractError, "FAULT_EVIDENCE_BINDING_MISMATCH"):
@@ -329,8 +384,8 @@ class EvidenceTests(unittest.TestCase):
             control=first.control,
             identity=first.identity,
             passed=False,
-            expected_outcome="blocked",
-            actual_outcome="blocked",
+            expected_outcome=first.expected_outcome,
+            actual_outcome=first.actual_outcome,
         )
         with self.assertRaisesRegex(AdversarialContractError, "FAULT_OUTCOME_FAILED"):
             ScenarioEvidence(**{**evidence.__dict__, "fault_ids": (failed,) + evidence.fault_ids[1:]}).validate()
@@ -339,11 +394,21 @@ class EvidenceTests(unittest.TestCase):
             control=first.control,
             identity=first.identity,
             passed=True,
-            expected_outcome="blocked",
+            expected_outcome=first.expected_outcome,
             actual_outcome="unexpectedly-passed",
         )
         with self.assertRaisesRegex(AdversarialContractError, "FAULT_OUTCOME_MISMATCH"):
             ScenarioEvidence(**{**evidence.__dict__, "fault_ids": (mismatch,) + evidence.fault_ids[1:]}).validate()
+
+        self_defined = FaultEvidence(
+            control=first.control,
+            identity=first.identity,
+            passed=True,
+            expected_outcome="self-defined-wrong-outcome",
+            actual_outcome="self-defined-wrong-outcome",
+        )
+        with self.assertRaisesRegex(AdversarialContractError, "FAULT_EXPECTED_OUTCOME_MISMATCH"):
+            ScenarioEvidence(**{**evidence.__dict__, "fault_ids": (self_defined,) + evidence.fault_ids[1:]}).validate()
 
         wrong_identity = FaultEvidence(
             control=first.control,
@@ -355,31 +420,119 @@ class EvidenceTests(unittest.TestCase):
         with self.assertRaisesRegex(AdversarialContractError, "FAULT_IDENTITY_NOT_ATTEMPT_BOUND"):
             ScenarioEvidence(**{**evidence.__dict__, "fault_ids": (wrong_identity,) + evidence.fault_ids[1:]}).validate()
 
-    def test_scenarios_1_and_2_require_two_distinct_requests_and_results(self):
+    def test_scenarios_1_and_2_require_one_to_one_distinct_terminal_results(self):
         for scenario_id in (1, 2):
             evidence = evidence_for(scenario_id)
-            for override, code in (
-                ({"source_comment_ids": evidence.source_comment_ids[:1]}, "SCENARIO_CONCURRENT_SOURCE_COUNT_MISMATCH"),
-                ({"accepted_ref_shas": evidence.accepted_ref_shas[:1]}, "SCENARIO_CONCURRENT_ACCEPTED_REF_EVIDENCE_INCOMPLETE"),
-                ({"dolt_commits": evidence.dolt_commits[:1]}, "SCENARIO_CONCURRENT_DOLT_EVIDENCE_INCOMPLETE"),
-                ({"canonical_rows": evidence.canonical_rows[:1]}, "SCENARIO_CONCURRENT_CANONICAL_ROW_EVIDENCE_INCOMPLETE"),
-                ({"projection_urls": evidence.projection_urls[:1]}, "SCENARIO_CONCURRENT_PROJECTION_COUNT_MISMATCH"),
-            ):
-                with self.subTest(scenario=scenario_id, code=code):
-                    with self.assertRaisesRegex(AdversarialContractError, code):
-                        ScenarioEvidence(**{**evidence.__dict__, **override}).validate()
+            with self.subTest(scenario=scenario_id, case="missing-terminal-bundle"):
+                with self.assertRaisesRegex(AdversarialContractError, "SCENARIO_TERMINAL_RESULT_COUNT_MISMATCH"):
+                    ScenarioEvidence(
+                        **{**evidence.__dict__, "terminal_requests": evidence.terminal_requests[:1]}
+                    ).validate()
 
-    def test_scenario_3_requires_three_retained_requests_and_terminal_canonical_evidence(self):
+            duplicate = evidence.terminal_requests[1]
+            duplicate_ref = TerminalRequestEvidence(
+                **{
+                    **duplicate.__dict__,
+                    "accepted_ref_sha": evidence.terminal_requests[0].accepted_ref_sha,
+                }
+            )
+            with self.subTest(scenario=scenario_id, case="duplicate-ref"):
+                with self.assertRaisesRegex(AdversarialContractError, "DUPLICATE_TERMINAL_ACCEPTED_REF"):
+                    ScenarioEvidence(
+                        **{
+                            **evidence.__dict__,
+                            "accepted_ref_shas": (
+                                evidence.accepted_ref_shas[0],
+                                evidence.accepted_ref_shas[0],
+                            ),
+                            "terminal_requests": (
+                                evidence.terminal_requests[0],
+                                duplicate_ref,
+                            ),
+                        }
+                    ).validate()
+
+            duplicate_row = TerminalRequestEvidence(
+                **{
+                    **duplicate.__dict__,
+                    "canonical_row": evidence.terminal_requests[0].canonical_row,
+                }
+            )
+            with self.subTest(scenario=scenario_id, case="duplicate-row"):
+                with self.assertRaisesRegex(AdversarialContractError, "DUPLICATE_TERMINAL_CANONICAL_ROW"):
+                    ScenarioEvidence(
+                        **{
+                            **evidence.__dict__,
+                            "canonical_rows": (
+                                evidence.canonical_rows[0],
+                                evidence.canonical_rows[0],
+                            ),
+                            "terminal_requests": (
+                                evidence.terminal_requests[0],
+                                duplicate_row,
+                            ),
+                        }
+                    ).validate()
+
+            wrong_source = TerminalRequestEvidence(
+                **{**duplicate.__dict__, "source_comment_id": evidence.source_comment_ids[0]}
+            )
+            with self.subTest(scenario=scenario_id, case="source-binding"):
+                with self.assertRaisesRegex(AdversarialContractError, "TERMINAL_SOURCE_BINDING_MISMATCH"):
+                    ScenarioEvidence(
+                        **{
+                            **evidence.__dict__,
+                            "terminal_requests": (
+                                evidence.terminal_requests[0],
+                                wrong_source,
+                            ),
+                        }
+                    ).validate()
+
+    def test_scenario_3_requires_one_terminal_bundle_per_retained_request(self):
         evidence = evidence_for(3)
-        for override, code in (
-            ({"source_comment_ids": evidence.source_comment_ids[:2]}, "SCENARIO_3_SOURCE_EVIDENCE_INCOMPLETE"),
-            ({"accepted_ref_shas": evidence.accepted_ref_shas[:2]}, "SCENARIO_3_ACCEPTED_REF_EVIDENCE_INCOMPLETE"),
-            ({"dolt_commits": evidence.dolt_commits[:2]}, "SCENARIO_3_DOLT_EVIDENCE_INCOMPLETE"),
-            ({"canonical_rows": evidence.canonical_rows[:2]}, "SCENARIO_3_CANONICAL_ROW_EVIDENCE_INCOMPLETE"),
-            ({"projection_urls": evidence.projection_urls[:2]}, "SCENARIO_3_PROJECTION_EVIDENCE_INCOMPLETE"),
-        ):
-            with self.assertRaisesRegex(AdversarialContractError, code):
-                ScenarioEvidence(**{**evidence.__dict__, **override}).validate()
+        with self.assertRaisesRegex(AdversarialContractError, "SCENARIO_3_SOURCE_EVIDENCE_INCOMPLETE"):
+            ScenarioEvidence(
+                **{
+                    **evidence.__dict__,
+                    "source_comment_ids": evidence.source_comment_ids[:2],
+                    "request_ids": evidence.request_ids[:2],
+                    "accepted_ref_shas": evidence.accepted_ref_shas[:2],
+                    "dolt_commits": evidence.dolt_commits[:2],
+                    "canonical_rows": evidence.canonical_rows[:2],
+                    "projection_urls": evidence.projection_urls[:2],
+                    "terminal_requests": evidence.terminal_requests[:2],
+                }
+            ).validate()
+
+        with self.assertRaisesRegex(AdversarialContractError, "SCENARIO_TERMINAL_RESULT_COUNT_MISMATCH"):
+            ScenarioEvidence(
+                **{**evidence.__dict__, "terminal_requests": evidence.terminal_requests[:2]}
+            ).validate()
+
+        second = evidence.terminal_requests[1]
+        duplicate_projection = TerminalRequestEvidence(
+            **{
+                **second.__dict__,
+                "projection_url": evidence.terminal_requests[0].projection_url,
+            }
+        )
+        with self.assertRaisesRegex(AdversarialContractError, "DUPLICATE_TERMINAL_PROJECTION"):
+            ScenarioEvidence(
+                **{
+                    **evidence.__dict__,
+                    "projection_urls": (
+                        evidence.projection_urls[0],
+                        evidence.projection_urls[0],
+                        evidence.projection_urls[2],
+                    ),
+                    "terminal_requests": (
+                        evidence.terminal_requests[0],
+                        duplicate_projection,
+                        evidence.terminal_requests[2],
+                    ),
+                }
+            ).validate()
 
     def test_every_client_contract_requires_clean_typed_transcript(self):
         evidence = evidence_for(14)
@@ -450,23 +603,89 @@ class EvidenceTests(unittest.TestCase):
             with self.assertRaisesRegex(AdversarialContractError, "DEPENDENCY_IDENTITY_SET_MISMATCH"):
                 ScenarioEvidence(**{**evidence.__dict__, "dependency_identities": dependencies}).validate()
 
-    def test_scenario_4_requires_exact_repeated_projection_and_nonmutation(self):
+    def test_scenario_4_requires_bound_repeated_projection_and_nonmutation(self):
         evidence = evidence_for(4)
         with self.assertRaisesRegex(AdversarialContractError, "MISSING_REPEATED_RESULT_EVIDENCE"):
             ScenarioEvidence(**{**evidence.__dict__, "repeated_result": None}).validate()
-        bad = RepeatedResultEvidence(
-            **{**evidence.repeated_result.__dict__, "repeated_projection_sha256": hashlib.sha256(b"different").hexdigest()}
+
+        bad_digest = RepeatedResultEvidence(
+            **{
+                **evidence.repeated_result.__dict__,
+                "repeated_projection_sha256": hashlib.sha256(b"different").hexdigest(),
+            }
         )
         with self.assertRaisesRegex(AdversarialContractError, "REPEATED_RESULT_PROJECTION_MISMATCH"):
-            ScenarioEvidence(**{**evidence.__dict__, "repeated_result": bad}).validate()
+            ScenarioEvidence(**{**evidence.__dict__, "repeated_result": bad_digest}).validate()
 
-    def test_scenario_6_requires_final_owner_to_match_winner_and_ref(self):
+        unrelated_ref = RepeatedResultEvidence(
+            **{
+                **evidence.repeated_result.__dict__,
+                "canonical_ref_before": "f" * 40,
+                "canonical_ref_after": "f" * 40,
+            }
+        )
+        with self.assertRaisesRegex(AdversarialContractError, "REPEATED_RESULT_REF_NOT_RETAINED"):
+            ScenarioEvidence(**{**evidence.__dict__, "repeated_result": unrelated_ref}).validate()
+
+        unrelated_row = RepeatedResultEvidence(
+            **{**evidence.repeated_result.__dict__, "canonical_request_row": "unrelated-row"}
+        )
+        with self.assertRaisesRegex(AdversarialContractError, "REPEATED_RESULT_ROW_NOT_RETAINED"):
+            ScenarioEvidence(**{**evidence.__dict__, "repeated_result": unrelated_row}).validate()
+
+        unrelated_request = RepeatedResultEvidence(
+            **{**evidence.repeated_result.__dict__, "request_id": "01KUNRELATEDREQUEST00000001"}
+        )
+        with self.assertRaisesRegex(AdversarialContractError, "REPEATED_RESULT_REQUEST_NOT_RETAINED"):
+            ScenarioEvidence(**{**evidence.__dict__, "repeated_result": unrelated_request}).validate()
+
+        unrelated_projection = RepeatedResultEvidence(
+            **{
+                **evidence.repeated_result.__dict__,
+                "repeated_projection_url": "https://github.example/projection/unrelated",
+            }
+        )
+        with self.assertRaisesRegex(AdversarialContractError, "REPEATED_RESULT_PROJECTION_NOT_RETAINED"):
+            ScenarioEvidence(**{**evidence.__dict__, "repeated_result": unrelated_projection}).validate()
+
+    def test_scenario_6_requires_winner_bound_to_retained_canonical_allocation_row(self):
         evidence = evidence_for(6)
         with self.assertRaisesRegex(AdversarialContractError, "MISSING_FINAL_OWNER_EVIDENCE"):
             ScenarioEvidence(**{**evidence.__dict__, "final_owner": None}).validate()
-        bad = FinalOwnerEvidence(**{**evidence.final_owner.__dict__, "final_owner_allocation_id": "allocation-stale"})
+
+        bad_owner = FinalOwnerEvidence(
+            **{**evidence.final_owner.__dict__, "final_owner_allocation_id": "allocation-stale"}
+        )
         with self.assertRaisesRegex(AdversarialContractError, "FINAL_OWNER_DOES_NOT_MATCH_WINNER"):
-            ScenarioEvidence(**{**evidence.__dict__, "final_owner": bad}).validate()
+            ScenarioEvidence(**{**evidence.__dict__, "final_owner": bad_owner}).validate()
+
+        with self.assertRaisesRegex(AdversarialContractError, "MISSING_FINAL_OWNER_ALLOCATION_ROW"):
+            ScenarioEvidence(**{**evidence.__dict__, "allocation_rows": ()}).validate()
+
+        row = evidence.allocation_rows[0]
+        unrelated_row = CanonicalAllocationEvidence(
+            **{**row.__dict__, "row_identity": "unrelated-allocation-row"}
+        )
+        with self.assertRaisesRegex(AdversarialContractError, "CANONICAL_ALLOCATION_ROW_NOT_RETAINED"):
+            ScenarioEvidence(
+                **{**evidence.__dict__, "allocation_rows": (unrelated_row,)}
+            ).validate()
+
+        stale_row = CanonicalAllocationEvidence(
+            allocation_id="allocation-stale",
+            row_identity="stale-row",
+            accepted_ref_sha=evidence.accepted_ref_shas[-1],
+            state="ACTIVE",
+            agent_id=AGENT,
+        )
+        with self.assertRaisesRegex(AdversarialContractError, "STALE_ALLOCATION_PRESENT_IN_CANONICAL_ROWS"):
+            ScenarioEvidence(
+                **{
+                    **evidence.__dict__,
+                    "canonical_rows": evidence.canonical_rows + ("stale-row",),
+                    "allocation_rows": evidence.allocation_rows + (stale_row,),
+                }
+            ).validate()
 
     def test_scenario_13_requires_exact_inventory_and_token_scope(self):
         evidence = evidence_for(13)
