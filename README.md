@@ -27,14 +27,16 @@ SQL store, but deliberately configures no live state target and accepts no
 credential by default. A caller must inject an already-authorised state-repository
 URL and connection factory through the Workstream A boundary. The adapter probes
 `refs/dolt/data` only as the Git CAS identity, performs a fresh `dolt clone`,
-verifies that the SQL connection is bound to that exact isolated clone, and
-publishes only with a normal `dolt push origin main` after an expected-old-SHA
-recheck. It never checks out or commits the Dolt data ref as an ordinary Git
-worktree and exposes no force option.
+reads the clone's Dolt head before opening the SQL connection, and fails closed
+unless that connection is bound to the exact cloned head and expected branch.
+It publishes only through that bound connection with normal
+`DOLT_PUSH('origin', 'main')` after an expected-old-SHA recheck. It never checks
+out or commits the Dolt data ref as an ordinary Git worktree and exposes no
+force option.
 
 Fast tests retain an in-memory canonical repository; focused adapter tests
 additionally exercise the real Beads `issues`/`dependencies`/`labels` contract
-and Dolt Git-remote no-force publication semantics. The implementation does not
+and Dolt Git-remote non-force publication semantics. The implementation does not
 post GitHub projections, authorise work to begin, mint credentials, dispatch
 intake or itself select/access live `refs/dolt/data`. Result projection and
 reconciliation remain separate governed work.
