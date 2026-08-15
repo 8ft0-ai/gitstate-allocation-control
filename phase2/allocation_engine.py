@@ -26,6 +26,14 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
+def _store(repository: CanonicalRepository, snapshot: object) -> AllocationStore:
+    """Open the repository-specific store without weakening local isolation."""
+    factory = getattr(repository, "store", None)
+    if callable(factory):
+        return factory(snapshot)
+    return AllocationStore(snapshot.connection)  # type: ignore[attr-defined]
+
+
 def _with_publish(
     result: AllocationResult,
     identity: CanonicalIdentity,
@@ -65,7 +73,7 @@ class AllocationService:
         while True:
             snapshot = self.repository.bootstrap()
             verify_canonical_identity(snapshot.identity)
-            store = AllocationStore(snapshot.connection)
+            store = _store(self.repository, snapshot)
             source = store.get_request_by_source(context)
             if source is not None and source["request_id"] != command.request_id:
                 try:
@@ -190,8 +198,6 @@ class AllocationService:
         eligible = [task for task in tasks if self._ineligible_reason(task, command) is None]
         if not eligible:
             return store.reject(command, context, "NO_ELIGIBLE_TASK", processed_at)
-        # SQL already uses the protocol ordering; repeat explicitly so adapters
-        # cannot weaken its priority/time/bytewise-ID total order.
         eligible.sort(key=lambda task: (task.priority, task.created_at, task.task_id.encode("utf-8")))
         return store.grant(command, context, eligible[0], processed_at)
 
@@ -222,7 +228,7 @@ class AllocationService:
         )
         while True:
             snapshot = self.repository.bootstrap()
-            store = AllocationStore(snapshot.connection)
+            store = _store(self.repository, snapshot)
             try:
                 store.begin()
                 changed = store.record_anchor(
@@ -236,8 +242,9 @@ class AllocationService:
             if not changed:
                 row = store.get_request(request_id)
                 result = store.result_from_request(row)  # type: ignore[arg-type]
+                identity = snapshot.identity
                 snapshot.close()
-                return _with_publish(result, snapshot.identity, advanced=False, retries=stale_retries)
+                return _with_publish(result, identity, advanced=False, retries=stale_retries)
             try:
                 accepted = self.repository.publish(snapshot.identity.git_ref_sha, snapshot)
             except StaleCanonicalBase:
@@ -264,7 +271,7 @@ class AllocationService:
 def seed_local_fixture(repository: CanonicalRepository, tasks: Iterable[Task]) -> CanonicalIdentity:
     """Create synthetic Beads fixtures in an isolated repository only."""
     snapshot = repository.bootstrap()
-    store = AllocationStore(snapshot.connection)
+    store = _store(repository, snapshot)
     store.begin()
     try:
         for task in tasks:
