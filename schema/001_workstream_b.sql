@@ -1,5 +1,6 @@
 -- Workstream B canonical allocation schema for Dolt/MySQL.
--- Apply inside the same Dolt database as the Beads graph.
+-- Apply inside the same Dolt database as the pinned Beads graph. The Beads
+-- `issues` table must already exist before this migration is applied.
 
 CREATE TABLE allocation_requests (
   request_id VARCHAR(160) NOT NULL,
@@ -84,6 +85,8 @@ CREATE TABLE allocations (
   UNIQUE KEY uq_allocations_identity_task (allocation_id, task_id),
   CONSTRAINT fk_allocations_request FOREIGN KEY (request_id)
     REFERENCES allocation_requests (request_id),
+  CONSTRAINT fk_allocations_task FOREIGN KEY (task_id)
+    REFERENCES issues (id),
   CONSTRAINT fk_allocations_release_request FOREIGN KEY (release_request_id)
     REFERENCES allocation_requests (request_id),
   CONSTRAINT ck_allocations_state CHECK (state IN ('ACTIVE', 'RELEASED')),
