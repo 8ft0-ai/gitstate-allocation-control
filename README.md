@@ -16,6 +16,35 @@ The static job validates the repository and current control-surface metadata, co
 
 The protected job receives the App key only after those request-side gates succeed. It then checks the live selected installation and current control-repository access before any reduced installation token can be requested.
 
-This Workstream A implementation does not allocate, release, mutate canonical state or authorise work to begin.
+Workstream A supplies the completed intake and credential boundary. Workstream B
+adds the canonical Dolt schema, deterministic allocation/release library and a
+no-force expected-old-SHA compare-and-swap implementation. The allocation row is
+the singular ownership authority; its active-task uniqueness entry and Beads
+status/assignee materialisation change in the same database transaction.
 
-Normal request-side writes and credentialed live checks remain fail-closed unless the separately reviewed activation variable `PHASE2_INTAKE_ENABLED` is exactly `true`. Workstream A does not create that variable. Manual `workflow_dispatch` defaults to operator reconciliation; the protected scope probe is a separate explicit manual operation and never mutates canonical state.
+Workstream B includes a concrete Git-backed Dolt repository adapter and Beads
+SQL store, but deliberately configures no live state target and accepts no
+credential by default. A caller must inject an already-authorised state-repository
+URL and connection factory through the Workstream A boundary. The adapter probes
+`refs/dolt/data` only as the Git CAS identity, performs a fresh `dolt clone`,
+reads the clone's Dolt head before opening the SQL connection, and fails closed
+unless that connection is bound to the exact cloned head and expected branch.
+It publishes only through that bound connection with normal
+`DOLT_PUSH('origin', 'main')` after an expected-old-SHA recheck. It never checks
+out or commits the Dolt data ref as an ordinary Git worktree and exposes no
+force option.
+
+The concrete store consumes Beads' maintained `issues.is_blocked` readiness
+materialisation and `capability:*` labels instead of reimplementing only part of
+Beads dependency, gate or wisp semantics. Fast tests retain an in-memory
+canonical repository; credential-free integration tests additionally use
+cryptographically pinned Beads v1.1.0 and its exact Dolt v2.1.4 dependency
+against an isolated local Git-backed Dolt remote. They apply the authoritative
+DDL and exercise database constraints, atomic grant/release mirroring,
+append-only history, canonical Beads readiness and non-force stale-writer CAS.
+
+The implementation does not post GitHub projections, authorise work to begin,
+mint credentials, dispatch intake or itself select/access live `refs/dolt/data`.
+Result projection and reconciliation remain separate governed work.
+
+Normal request-side writes and credentialed live checks remain fail-closed unless the separately reviewed activation variable `PHASE2_INTAKE_ENABLED` is exactly `true`. Neither Workstream A nor B creates that variable. Manual `workflow_dispatch` defaults to operator reconciliation; the protected scope probe is a separate explicit manual operation and never mutates canonical state.

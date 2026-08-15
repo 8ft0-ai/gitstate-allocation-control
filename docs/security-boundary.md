@@ -17,3 +17,35 @@ The owner-authenticated complete selected-repository inventory remains a separat
 The workflow security contract is checked structurally rather than by substring presence. The dependency-free validator parses the expected job graph, permissions, dependencies, conditions, checkout refs, action pins, environment placement and secret-bearing boundary, and negative tests prove that unsafe mutations are rejected.
 
 The request-side reporting, source-revalidation and credentialed live-check paths are inactive unless the explicit `PHASE2_INTAKE_ENABLED=true` activation variable is introduced through a later reviewed change. Manual `workflow_dispatch` defaults to operator-authorised reconciliation through the same deterministic complete scan. The protected scope probe is a separate explicit manual operation and is the only credentialed operation enabled by this slice.
+
+## Workstream B isolation
+
+The canonical mutation library is downstream of this completed Workstream A
+boundary and accepts only an injected, already-authorised request context. It
+does not mint an App token, call GitHub, dispatch the intake workflow or post a
+result projection. The concrete Git/Dolt adapter has no configured repository,
+credential or default live connection: the already-authorised caller must inject
+the state-repository URL and a connection factory for the isolated cloned
+database explicitly.
+
+The adapter does not check out `refs/dolt/data` as an ordinary Git worktree. It
+uses the ref only as an expected-old CAS identity, clones canonical state through
+Dolt's Git-remote transport, reads the clone's Dolt `HEAD` before opening the SQL
+connection, and then fails closed unless that connection is bound to the same
+Dolt head and expected branch. Publication is performed through that bound
+connection with normal `DOLT_PUSH('origin', 'main')`, matching pinned Beads'
+non-force path. The adapter rechecks the expected old ref before publication,
+has no force option and classifies a moved ref as a stale writer requiring a
+fresh clone.
+
+The runtime store consumes Beads' maintained `issues.is_blocked` value for
+canonical readiness and `capability:*` labels for capability filtering. It does
+not implement a competing dependency/gate/wisp readiness algorithm. Fast failure
+and concurrency tests use the isolated SQLite conformance fixture and in-memory
+CAS repository. Separate credential-free integration tests download only
+SHA-256-pinned public Beads v1.1.0 and Dolt v2.1.4 artefacts, use a hash-pinned
+PEP-249 client in a throwaway venv, and operate only on temporary local Git-backed
+Dolt repositories. They apply the Workstream B DDL and exercise real database
+constraints, grant/release atomicity, append-only events, Beads canonical
+readiness and non-force stale-writer CAS. No Workstream B test or candidate code
+selects the private state repository on its own.
