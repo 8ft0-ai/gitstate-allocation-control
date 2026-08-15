@@ -1,0 +1,112 @@
+name: Phase 2 Workstream D adversarial harness
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Bounded Workstream D operation
+        required: true
+        default: contract_check
+        type: choice
+        options:
+          - contract_check
+          - live_authority_gate
+      expected_control_sha:
+        description: Exact trusted control main SHA authorised for this run
+        required: true
+        type: string
+      expected_protocol_sha:
+        description: Exact authoritative gitstate-lab protocol SHA
+        required: true
+        type: string
+      attempt_nonce:
+        description: Lowercase alphanumeric 6-24 character attempt nonce
+        required: true
+        type: string
+
+concurrency:
+  group: beads-allocation-v0.2-${{ github.repository }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  contract-check:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout immutable dispatched commit without persisted credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Run credential-free Workstream D harness checks
+        run: python3 -m unittest discover -s tests -p 'test_workstream_d.py' -v
+
+  live-authority-gate:
+    needs: contract-check
+    if: ${{ inputs.operation == 'live_authority_gate' }}
+    runs-on: ubuntu-24.04
+    environment: phase-2-allocator
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout immutable protected-main content without persisted credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Fail closed unless the separate live-execution authority guard is exact
+        env:
+          ATTEMPT_NONCE: ${{ inputs.attempt_nonce }}
+          EXPECTED_CONTROL_SHA: ${{ inputs.expected_control_sha }}
+          EXPECTED_PROTOCOL_SHA: ${{ inputs.expected_protocol_sha }}
+          PHASE2_WORKSTREAM_D_EXECUTION_ENABLED: ${{ vars.PHASE2_WORKSTREAM_D_EXECUTION_ENABLED }}
+          PROTOCOL_AUTHORITY: 4ad2cebf6c37d21f44e5652a70f5fb4e77da74ae
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          RUN_ID: ${{ github.run_id }}
+          TRUSTED_REF: ${{ github.ref }}
+          TRUSTED_REPOSITORY: ${{ github.repository }}
+          TRUSTED_SHA: ${{ github.sha }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from phase2.adversarial import AttemptNamespace, validate_live_gate
+
+          run_id = int(os.environ['RUN_ID'])
+          run_attempt = int(os.environ['RUN_ATTEMPT'])
+          namespace = f"wd-{run_id}-{run_attempt}-{os.environ['ATTEMPT_NONCE']}"
+          AttemptNamespace.parse(namespace, run_id=run_id, run_attempt=run_attempt)
+
+          validate_live_gate(
+              repository=os.environ['TRUSTED_REPOSITORY'],
+              ref=os.environ['TRUSTED_REF'],
+              trusted_sha=os.environ['TRUSTED_SHA'],
+              protocol_sha=os.environ['EXPECTED_PROTOCOL_SHA'],
+              expected_trusted_sha=os.environ['EXPECTED_CONTROL_SHA'],
+              expected_protocol_sha=os.environ['PROTOCOL_AUTHORITY'],
+              run_attempt=run_attempt,
+              enabled=os.environ.get('PHASE2_WORKSTREAM_D_EXECUTION_ENABLED') == 'true',
+          )
+
+          print(json.dumps({
+              'attempt_namespace': namespace,
+              'credential_accessed': False,
+              'live_state_mutated': False,
+              'protocol_sha': os.environ['EXPECTED_PROTOCOL_SHA'],
+              'status': 'WORKSTREAM_D_LIVE_AUTHORITY_GATE_PASSED',
+              'trusted_sha': os.environ['TRUSTED_SHA'],
+          }, sort_keys=True, separators=(',', ':')))
+          PY
+
+      - name: Preserve the execution boundary
+        run: |
+          echo 'Workstream D live authority is validated, but this harness candidate does not itself execute scenarios 1-14.'
+          echo 'A separate owner-authorised post-merge execution session must revalidate App inventory/token scope immediately before credential use.'
