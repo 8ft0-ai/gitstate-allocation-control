@@ -5,7 +5,8 @@ import unittest
 
 from phase2.allocation_schema import initialise_sqlite_fixture
 from phase2.allocation_types import AllocationCommand, RequestContext, stable_ulid
-from phase2.dolt_repository import DoltCanonicalRepository
+from phase2.canonical import CanonicalIdentityMismatch
+from phase2.dolt_repository import DoltCanonicalRepository, _normalise_dolt_remote
 from phase2.dolt_store import DoltAllocationStore
 
 NOW = "2026-08-15T00:00:00Z"
@@ -65,6 +66,8 @@ class FakeDoltCursor:
         self.connection.statements.append(sql)
         if "DOLT_HASHOF" in sql:
             self.row = (self.connection.dolt_head,)
+        elif "ACTIVE_BRANCH" in sql:
+            self.row = (self.connection.active_branch,)
         elif "DOLT_COMMIT" in sql:
             self.connection.dolt_head = "dolt-2"
             self.row = None
@@ -82,6 +85,7 @@ class FakeDoltCursor:
 class FakeDoltConnection:
     def __init__(self):
         self.dolt_head = "dolt-1"
+        self.active_branch = "main"
         self.statements = []
         self.commits = 0
         self.closed = False
@@ -209,37 +213,101 @@ class DoltStoreTests(unittest.TestCase):
 
 
 class DoltRepositoryTests(unittest.TestCase):
-    def test_publication_is_expected_old_sha_guarded_and_never_force_pushes(self):
+    def test_git_remote_urls_are_normalised_like_pinned_beads(self):
+        self.assertEqual(
+            _normalise_dolt_remote("https://example.invalid/state.git"),
+            "git+https://example.invalid/state.git",
+        )
+        self.assertEqual(
+            _normalise_dolt_remote("git@example.invalid:org/state.git"),
+            "git+ssh://git@example.invalid/org/state.git",
+        )
+        self.assertEqual(
+            _normalise_dolt_remote("file:///tmp/state.git"),
+            "file:///tmp/state.git",
+        )
+
+    def test_publication_clones_and_pushes_through_dolt_without_force(self):
         commands = []
         old_sha = "a" * 40
         new_sha = "b" * 40
+        remote_sha = [old_sha]
+        connection = FakeDoltConnection()
+        factory_paths = []
+
+        def factory(database):
+            factory_paths.append(database)
+            return connection
 
         def runner(command, cwd):
-            commands.append(tuple(command))
-            if tuple(command[1:3]) == ("rev-parse", "refs/dolt/data"):
-                stdout = old_sha + "\n"
-            elif tuple(command[1:3]) == ("rev-parse", "HEAD"):
-                stdout = new_sha + "\n"
-            elif "ls-remote" in command:
-                stdout = f"{old_sha}\trefs/dolt/data\n"
+            command = tuple(command)
+            commands.append(command)
+            if command[:2] == ("git", "ls-remote"):
+                stdout = f"{remote_sha[0]}\trefs/dolt/data\n"
+            elif command[:2] == ("dolt", "sql"):
+                stdout = f"commit_hash\n{connection.dolt_head}\n"
+            elif command[:2] == ("dolt", "push"):
+                remote_sha[0] = new_sha
+                stdout = ""
             else:
                 stdout = ""
             return subprocess.CompletedProcess(command, 0, stdout, "")
 
-        connection = FakeDoltConnection()
         repository = DoltCanonicalRepository(
             "https://example.invalid/state.git",
-            lambda workspace: connection,
+            factory,
             run_command=runner,
         )
         snapshot = repository.bootstrap()
         accepted = repository.publish(old_sha, snapshot)
+
+        self.assertEqual(factory_paths, [snapshot.database])
+        self.assertEqual(snapshot.database.name, "canonical")
         self.assertEqual(accepted.git_ref_sha, new_sha)
         self.assertEqual(accepted.dolt_commit, "dolt-2")
-        push = next(command for command in commands if "push" in command)
-        self.assertEqual(push[-1], f"{new_sha}:refs/dolt/data")
+
+        clone = next(command for command in commands if command[:2] == ("dolt", "clone"))
+        self.assertEqual(clone[2], "git+https://example.invalid/state.git")
+        self.assertEqual(clone[3], "canonical")
+        push = next(command for command in commands if command[:2] == ("dolt", "push"))
+        self.assertEqual(push, ("dolt", "push", "origin", "main"))
         self.assertFalse(any("--force" in part or part == "-f" for command in commands for part in command))
+        self.assertFalse(
+            any(
+                command[:2]
+                in {
+                    ("git", "init"),
+                    ("git", "fetch"),
+                    ("git", "checkout"),
+                    ("git", "add"),
+                    ("git", "commit"),
+                    ("git", "push"),
+                }
+                for command in commands
+            )
+        )
         snapshot.close()
+
+    def test_bootstrap_rejects_connection_not_bound_to_cloned_dolt_head(self):
+        old_sha = "a" * 40
+        connection = FakeDoltConnection()
+
+        def runner(command, cwd):
+            command = tuple(command)
+            if command[:2] == ("git", "ls-remote"):
+                return subprocess.CompletedProcess(command, 0, f"{old_sha}\trefs/dolt/data\n", "")
+            if command[:2] == ("dolt", "sql"):
+                return subprocess.CompletedProcess(command, 0, "commit_hash\ndifferent-head\n", "")
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        repository = DoltCanonicalRepository(
+            "https://example.invalid/state.git",
+            lambda database: connection,
+            run_command=runner,
+        )
+        with self.assertRaisesRegex(CanonicalIdentityMismatch, "CANONICAL_DOLT_CONNECTION_MISMATCH"):
+            repository.bootstrap()
+        self.assertTrue(connection.closed)
 
 
 if __name__ == "__main__":
