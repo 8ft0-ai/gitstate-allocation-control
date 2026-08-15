@@ -24,10 +24,13 @@ The harness defines:
 - one typed clean-environment transcript digest for every required
   Git-capable/API-only client contract;
 - executable identities containing path, blob SHA and the exact trusted commit
-  SHA, plus the exact `git ls-tree <trusted-commit> -- <path>` entry and
-  `<trusted-commit>:<path>` object specification used to bind that blob to the
-  trusted commit tree; the complete reviewed pinned dependency set for checkout,
-  Beads, Dolt and PyMySQL is also retained;
+  SHA, plus the retained exact `git ls-tree <trusted-commit> -- <path>` entry and
+  `<trusted-commit>:<path>` object specification; validation independently reruns
+  read-only Git object queries against the locally available trusted commit and
+  requires both the actual tree entry and resolved blob object to match, so a
+  fabricated but self-consistent retained identity cannot pass;
+- the complete reviewed pinned dependency set for checkout, Beads, Dolt and
+  PyMySQL;
 - structured scenario-specific source, Git/Dolt, canonical-row and projection
   evidence;
 - exact evidence cardinality for the multi-request scenarios: scenarios 1 and 2
@@ -74,9 +77,10 @@ isolated `LocalCanonicalRepository` fixture. In particular it verifies:
 - scenario 6 exact winner/final-owner/ref evidence;
 - scenario 13 individual negative-fixture coverage plus exact inventory and token scopes;
 - scenario 14 complete GitHub durability and network inventory;
-- executable path/blob/trusted-commit binding through the retained exact Git tree
-  entry and object specification, plus an exact complete pinned dependency identity
-  set; and
+- executable path/blob/trusted-commit binding by reading the actual checked-out
+  Git object database for the trusted commit and rejecting a fabricated
+  self-consistent tree entry/blob pair, plus an exact complete pinned dependency
+  identity set; and
 - successful exit status and Workstream E exclusion.
 
 These PR tests are regression/contract checks. They are not scenario 1–14 live
@@ -123,9 +127,10 @@ failed; a required individual fault lacks its exact run/attempt-qualified identi
 records a failed fixture, or records an actual outcome different from its expected
 outcome; a client contract lacks a clean transcript digest; required
 source/ref/Dolt/row or projection evidence is absent or under-counted for scenarios
-1–3; an executable path/blob is not backed by a matching retained Git tree entry
-for the exact trusted commit and path; the pinned dependency set differs; the
-scenario exits non-zero; the run is a rerun; evidence crosses runs/attempts; or
+1–3; an executable path/blob is not independently resolved from the exact trusted
+commit's Git tree and matched to the retained tree entry/blob identity; the trusted
+commit object is unavailable to the verifier; the pinned dependency set differs;
+the scenario exits non-zero; the run is a rerun; evidence crosses runs/attempts; or
 durability relies on a service outside GitHub Issues, repositories, refs or Actions.
 
 Scenario 4 additionally requires proof that the repeated result envelope is
