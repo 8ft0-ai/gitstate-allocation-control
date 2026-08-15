@@ -15,18 +15,27 @@ The harness defines:
 
 - the exact scenario 1–14 catalogue and executable assertions;
 - unique run/attempt-bound namespaces (`wd-<run>-<attempt>-<nonce>`);
+- exact expected control/protocol SHAs supplied to the scenario driver, evidence
+  ledger and final summary rather than inferred from the first evidence record;
 - one-to-one assertion evidence bound to each exact protocol assertion;
-- one explicit, typed fault identity for every required fault control;
-- one typed transcript for every required Git-capable/API-only client contract;
-- immutable executable/dependency identities and exact scenario exit status;
-- scenario-specific source, Git/Dolt, canonical-row, projection and final-owner evidence;
-- structured scenario 13 installation-inventory, reduced-token request/returned-scope,
-  cross-repository denial and negative token-policy evidence;
-- fail-closed evidence validation, including rejection of failed or substituted
-  assertions, missing fault/client evidence, cross-attempt evidence and mixed authority;
-- scenario 14 GitHub-only durability plus explicit network-destination/dependency inventory;
+- one explicit typed fault identity and outcome for every required fault control;
+- one typed clean-environment transcript digest for every required
+  Git-capable/API-only client contract;
+- executable identities containing path, blob SHA and the exact trusted commit
+  SHA, plus the complete reviewed pinned dependency set for checkout, Beads,
+  Dolt and PyMySQL;
+- structured scenario-specific source, Git/Dolt, canonical-row and projection evidence;
+- scenario 4 repeated-result evidence that requires identical projection
+  digests, an unchanged canonical ref and unchanged request/allocation row counts;
+- scenario 6 winner/final-owner evidence that requires the final allocation and
+  final accepted ref to equal the winning publication and excludes the stale allocation;
+- scenario 13 evidence with each required attribution, bot, installation,
+  namespace/release, inventory and token-policy negative represented as its own
+  exact fault control rather than an umbrella result name;
+- scenario 14 GitHub-only durability plus explicit network-destination inventory;
 - cleanup decisions that retain canonical history;
-- a final ledger that cannot pass unless all fourteen scenario records validate;
+- a final ledger that cannot pass unless all fourteen records belong to the same
+  authorised run/attempt and exact trusted/protocol SHAs; and
 - an explicit result boundary that does not imply production approval or permit
   Workstream E.
 
@@ -44,21 +53,24 @@ isolated `LocalCanonicalRepository` fixture. In particular it verifies:
 - push failure before visibility;
 - history-preserving explicit release;
 - exact scenario coverage and run/attempt isolation;
+- exact-authority binding in the driver, ledger and final summary;
 - one-to-one assertion, fault and client evidence binding;
-- scenario 4 repeated-result projection evidence;
-- scenario 6 winner/final-owner evidence;
-- scenario 13 exact inventory, token-profile and negative-scope evidence;
-- scenario 14 complete GitHub durability and network/dependency inventory;
-- immutable executable/dependency identities, successful exit status and Workstream E exclusion.
+- scenario 4 exact repeated-result/non-mutation evidence;
+- scenario 6 exact winner/final-owner/ref evidence;
+- scenario 13 individual negative-fixture coverage plus exact inventory and token scopes;
+- scenario 14 complete GitHub durability and network inventory;
+- executable path/blob/trusted-commit binding and an exact complete pinned
+  dependency identity set; and
+- successful exit status and Workstream E exclusion.
 
 These PR tests are regression/contract checks. They are not scenario 1–14 live
 evidence and must never be cited as such.
 
 ## Trusted-main execution gate
 
-`.github/workflows/phase2-adversarial.yml` is manual-only. On an unmerged PR it
-can perform only credential-free contract validation. The protected live gate is
-fail-closed unless all of the following are true at execution time:
+`.github/workflows/phase2-adversarial.yml` remains manual-only. On an unmerged
+PR it can perform only credential-free contract validation. The protected live
+gate is fail-closed unless all of the following are true at execution time:
 
 - repository is exactly `8ft0-ai/gitstate-allocation-control`;
 - ref is exactly protected `main`;
@@ -67,7 +79,7 @@ fail-closed unless all of the following are true at execution time:
   values being authorised for that run;
 - `PHASE2_WORKSTREAM_D_EXECUTION_ENABLED=true` is present in repository Actions
   variables;
-- a run-bound attempt namespace matches the current run ID and attempt;
+- a run-bound attempt namespace matches the current run ID and attempt; and
 - protected `phase-2-allocator` environment approval succeeds.
 
 The live operation intentionally stops at the authority/evidence-plan boundary
@@ -85,21 +97,29 @@ authority.
 ## Evidence boundary
 
 A live Workstream D pass requires one validated `ScenarioEvidence` record for
-each scenario 1–14 under the same attempt namespace and authority identities.
-Evidence is not accepted if an assertion is missing, duplicated, substituted or
-failed; a required fault or client contract lacks its own typed evidence; a
-required source/ref/Dolt/row/projection/final-owner field is missing; executable
-or dependency identity is absent; the scenario exit status is non-zero; the run
-is a rerun; evidence crosses attempts; or a durable service outside GitHub
-Issues, repositories, refs or Actions is relied upon.
+each scenario 1–14 under the same attempt namespace and the exact authority
+identities supplied by the owner-authorised run. Neither the scenario driver,
+ledger nor final summary accepts a different but syntactically valid control or
+protocol SHA. A first record therefore cannot redefine the authority boundary.
 
-Scenario 13 additionally requires a current exact two-repository installation
-inventory, explicit single-repository reduced control/state token requests,
-validated returned repository/permission scopes, cross-repository denial and
-all required negative token-policy results. Scenario 14 requires the complete
-GitHub durability category inventory and a recorded network-destination inventory.
-The final summary derives the external-durability result from validated evidence;
-it does not assert that result independently of the records.
+Evidence is rejected if an assertion is missing, duplicated, substituted or
+failed; a required individual fault lacks its own identity and passing outcome;
+a client contract lacks a clean transcript digest; required source/ref/Dolt/row
+or projection evidence is absent; an executable path/blob is not tied to the
+trusted commit; the pinned dependency set differs; the scenario exits non-zero;
+the run is a rerun; evidence crosses runs/attempts; or durability relies on a
+service outside GitHub Issues, repositories, refs or Actions.
+
+Scenario 4 additionally requires proof that the repeated result envelope is
+identical and that neither the canonical ref nor request/allocation row counts
+change. Scenario 6 additionally requires a structured winner/final-owner record
+whose owner and final ref match the winning accepted publication. Scenario 13
+requires a current exact two-repository installation inventory, exact reduced
+control/state token request and returned scopes, cross-repository denial, and
+individual evidence for every required negative fixture. Scenario 14 requires
+the complete GitHub durability category inventory and a recorded network
+inventory. The final summary is derived only after the complete exact-authority
+ledger revalidates all fourteen records.
 
 ## Non-goals
 
@@ -113,5 +133,5 @@ This candidate does not:
 - alter deterministic selection, canonical ownership, release or no-force CAS semantics;
 - alter projection/reconciliation ownership rules;
 - add leases, expiry, completion orchestration or another protocol capability;
-- implement scenario 15 or Workstream E;
+- implement scenario 15 or Workstream E; or
 - approve production use.
