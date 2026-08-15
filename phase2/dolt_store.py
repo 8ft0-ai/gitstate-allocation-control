@@ -1,8 +1,8 @@
 """Dolt/MySQL allocation store bound to the pinned Beads SQL schema.
 
-The fast unit suite uses :mod:`phase2.allocation_store` with SQLite.  Runtime
+The fast unit suite uses :mod:`phase2.allocation_store` with SQLite. Runtime
 canonical mutation must instead operate on the Beads tables in the same Dolt
-database.  This adapter deliberately implements the same store surface while
+database. This adapter deliberately implements the same store surface while
 using PEP-249 MySQL parameter semantics and Beads' ``issues``, ``dependencies``
 and ``labels`` tables.
 """
@@ -84,7 +84,7 @@ class DoltAllocationStore(AllocationStore):
 
     The canonical allocation rows and the Beads issue status/assignee mirror are
     mutated through one database connection and therefore one Dolt SQL
-    transaction.  Beads ``in_progress`` is the protocol's assigned/non-open
+    transaction. Beads ``in_progress`` is the protocol's assigned/non-open
     materialisation; release restores ``open`` with no assignee.
     """
 
@@ -112,11 +112,16 @@ class DoltAllocationStore(AllocationStore):
             )
 
     def _blocked(self, task_id: str) -> bool:
+        # Beads v1.1.0 migration 0043 removes the compatibility/generated
+        # ``depends_on_id`` column. Durable issue-to-issue blockers use the
+        # concrete split target column ``depends_on_issue_id``.
         row = self.connection.execute(
             """SELECT COUNT(*) AS blocker_count
                FROM dependencies d
-               JOIN issues prerequisite ON prerequisite.id = d.depends_on_id
-               WHERE d.issue_id = ? AND d.type = 'blocks' AND prerequisite.status <> 'closed'""",
+               JOIN issues prerequisite ON prerequisite.id = d.depends_on_issue_id
+               WHERE d.issue_id = ? AND d.type = 'blocks'
+                 AND d.depends_on_issue_id IS NOT NULL
+                 AND prerequisite.status <> 'closed'""",
             (task_id,),
         ).fetchone()
         return bool(row and int(row["blocker_count"]) > 0)
@@ -185,7 +190,12 @@ class DoltAllocationStore(AllocationStore):
 
     def reconstruct(self) -> dict[str, list[dict[str, object]]]:
         def rows(table: str, order: str) -> list[dict[str, object]]:
-            return [dict(row) for row in self.connection.execute(f"SELECT * FROM {table} ORDER BY {order}").fetchall()]
+            return [
+                dict(row)
+                for row in self.connection.execute(
+                    f"SELECT * FROM {table} ORDER BY {order}"
+                ).fetchall()
+            ]
 
         return {
             "requests": rows("allocation_requests", "processed_at, request_id"),
