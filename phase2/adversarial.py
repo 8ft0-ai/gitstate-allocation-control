@@ -70,6 +70,7 @@ _ATTEMPT_RE = re.compile(
 )
 _FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_TREE_ENTRY = re.compile(r"^(100644|100755) blob (?P<sha>[0-9a-f]{40})\t(?P<path>.+)$")
 
 
 class AdversarialContractError(RuntimeError):
@@ -394,11 +395,16 @@ class FaultEvidence:
     expected_outcome: str
     actual_outcome: str
 
-    def validate(self) -> None:
+    def validate(self, *, attempt_namespace: str, scenario_id: int) -> None:
         if not all((self.control, self.identity, self.expected_outcome, self.actual_outcome)):
             raise AdversarialContractError("INCOMPLETE_FAULT_EVIDENCE")
+        expected_identity = f"{attempt_namespace}:{scenario_id}:{self.control}"
+        if self.identity != expected_identity:
+            raise AdversarialContractError(f"FAULT_IDENTITY_NOT_ATTEMPT_BOUND:{self.control}")
         if not self.passed:
             raise AdversarialContractError(f"FAULT_OUTCOME_FAILED:{self.control}")
+        if self.actual_outcome != self.expected_outcome:
+            raise AdversarialContractError(f"FAULT_OUTCOME_MISMATCH:{self.control}")
 
 
 @dataclass(frozen=True)
@@ -424,12 +430,21 @@ class ExecutableIdentity:
     path: str
     blob_sha: str
     commit_sha: str
+    trusted_tree_entry: str
+    tree_object_spec: str
 
     def validate(self, *, trusted_sha: str) -> None:
         if not self.path or not _FULL_SHA.fullmatch(self.blob_sha):
             raise AdversarialContractError("INVALID_EXECUTABLE_IDENTITY")
         if self.commit_sha != trusted_sha or not _FULL_SHA.fullmatch(self.commit_sha):
             raise AdversarialContractError("EXECUTABLE_NOT_BOUND_TO_TRUSTED_COMMIT")
+        if self.tree_object_spec != f"{trusted_sha}:{self.path}":
+            raise AdversarialContractError("EXECUTABLE_TREE_OBJECT_SPEC_MISMATCH")
+        match = _TREE_ENTRY.fullmatch(self.trusted_tree_entry)
+        if match is None:
+            raise AdversarialContractError("INVALID_TRUSTED_TREE_ENTRY")
+        if match.group("path") != self.path or match.group("sha") != self.blob_sha:
+            raise AdversarialContractError("EXECUTABLE_BLOB_NOT_IN_TRUSTED_TREE")
 
 
 @dataclass(frozen=True)
@@ -528,6 +543,16 @@ class TokenScopeEvidence:
             raise AdversarialContractError("CROSS_REPOSITORY_DENIAL_NOT_PROVEN")
 
 
+def _require_distinct(values: tuple[object, ...], *, code: str) -> None:
+    if len(set(values)) != len(values):
+        raise AdversarialContractError(code)
+
+
+def _require_at_least(values: tuple[object, ...], count: int, *, code: str) -> None:
+    if len(values) < count:
+        raise AdversarialContractError(code)
+
+
 @dataclass(frozen=True)
 class ScenarioEvidence:
     scenario_id: int
@@ -596,7 +621,10 @@ class ScenarioEvidence:
         if len({fault.identity for fault in self.fault_ids}) != len(self.fault_ids):
             raise AdversarialContractError("DUPLICATE_FAULT_IDENTITY")
         for fault in self.fault_ids:
-            fault.validate()
+            fault.validate(
+                attempt_namespace=self.attempt_namespace,
+                scenario_id=self.scenario_id,
+            )
 
         client_contracts = tuple(t.contract for t in self.client_transcripts)
         if client_contracts != spec.client_contracts:
@@ -627,16 +655,52 @@ class ScenarioEvidence:
 
         if self.scenario_id in {1, 2, 3, 8, 9, 11, 12, 13} and not self.source_comment_ids:
             raise AdversarialContractError("MISSING_SOURCE_COMMENT_EVIDENCE")
-        if self.scenario_id in {1, 2, 4, 5, 6, 7, 8, 9, 10, 12, 14}:
+        _require_distinct(self.source_comment_ids, code="DUPLICATE_SOURCE_COMMENT_EVIDENCE")
+
+        canonical_scenarios = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 14}
+        if self.scenario_id in canonical_scenarios:
             if not self.base_ref_shas or not self.accepted_ref_shas or not self.dolt_commits:
                 raise AdversarialContractError("MISSING_CANONICAL_IDENTITY_EVIDENCE")
             for sha in (*self.base_ref_shas, *self.accepted_ref_shas):
                 if not _FULL_SHA.fullmatch(sha):
                     raise AdversarialContractError("INVALID_CANONICAL_GIT_SHA")
-        if self.scenario_id in {1, 2, 4, 5, 6, 7, 8, 9, 10, 12, 14} and not self.canonical_rows:
+        if self.scenario_id in canonical_scenarios and not self.canonical_rows:
             raise AdversarialContractError("MISSING_CANONICAL_ROW_EVIDENCE")
         if self.scenario_id in {1, 2, 3, 4, 5, 8, 9, 11, 12, 14} and not self.projection_urls:
             raise AdversarialContractError("MISSING_PROJECTION_EVIDENCE")
+
+        if self.scenario_id in {1, 2}:
+            if len(self.source_comment_ids) != 2:
+                raise AdversarialContractError("SCENARIO_CONCURRENT_SOURCE_COUNT_MISMATCH")
+            _require_at_least(
+                self.accepted_ref_shas, 2, code="SCENARIO_CONCURRENT_ACCEPTED_REF_EVIDENCE_INCOMPLETE"
+            )
+            _require_at_least(
+                self.dolt_commits, 2, code="SCENARIO_CONCURRENT_DOLT_EVIDENCE_INCOMPLETE"
+            )
+            _require_at_least(
+                self.canonical_rows, 2, code="SCENARIO_CONCURRENT_CANONICAL_ROW_EVIDENCE_INCOMPLETE"
+            )
+            if len(self.projection_urls) != 2:
+                raise AdversarialContractError("SCENARIO_CONCURRENT_PROJECTION_COUNT_MISMATCH")
+
+        if self.scenario_id == 3:
+            _require_at_least(
+                self.source_comment_ids, 3, code="SCENARIO_3_SOURCE_EVIDENCE_INCOMPLETE"
+            )
+            required = len(self.source_comment_ids)
+            _require_at_least(
+                self.accepted_ref_shas, required, code="SCENARIO_3_ACCEPTED_REF_EVIDENCE_INCOMPLETE"
+            )
+            _require_at_least(
+                self.dolt_commits, required, code="SCENARIO_3_DOLT_EVIDENCE_INCOMPLETE"
+            )
+            _require_at_least(
+                self.canonical_rows, required, code="SCENARIO_3_CANONICAL_ROW_EVIDENCE_INCOMPLETE"
+            )
+            _require_at_least(
+                self.projection_urls, required, code="SCENARIO_3_PROJECTION_EVIDENCE_INCOMPLETE"
+            )
 
         if self.scenario_id == 4:
             if self.repeated_result is None:
@@ -661,9 +725,7 @@ class ScenarioEvidence:
                 not self.installation_inventory_current
                 or not self.installation_inventory_attestation
             ):
-                raise AdversarialContractError(
-                    "STALE_OR_MISSING_INSTALLATION_INVENTORY"
-                )
+                raise AdversarialContractError("STALE_OR_MISSING_INSTALLATION_INVENTORY")
             profiles = tuple(record.profile for record in self.token_scope_records)
             if profiles != ("control", "state"):
                 raise AdversarialContractError("TOKEN_SCOPE_EVIDENCE_BINDING_MISMATCH")
@@ -674,15 +736,11 @@ class ScenarioEvidence:
             if frozenset(self.durability_records) != _ALLOWED_DURABILITY or len(
                 self.durability_records
             ) != len(_ALLOWED_DURABILITY):
-                raise AdversarialContractError(
-                    "GITHUB_DURABILITY_INVENTORY_INCOMPLETE"
-                )
+                raise AdversarialContractError("GITHUB_DURABILITY_INVENTORY_INCOMPLETE")
             if not self.network_destinations or any(
                 not destination for destination in self.network_destinations
             ):
-                raise AdversarialContractError(
-                    "MISSING_NETWORK_DESTINATION_INVENTORY"
-                )
+                raise AdversarialContractError("MISSING_NETWORK_DESTINATION_INVENTORY")
 
     def to_json(self) -> str:
         self.validate()
@@ -703,72 +761,26 @@ class ScenarioEvidence:
                 "dolt_commits": list(self.dolt_commits),
                 "canonical_rows": list(self.canonical_rows),
                 "projection_urls": list(self.projection_urls),
-                "fault_ids": [
-                    {
-                        "control": f.control,
-                        "identity": f.identity,
-                        "passed": f.passed,
-                        "expected_outcome": f.expected_outcome,
-                        "actual_outcome": f.actual_outcome,
-                    }
-                    for f in self.fault_ids
-                ],
-                "assertions": [
-                    {
-                        "name": a.name,
-                        "passed": a.passed,
-                        "expected": a.expected,
-                        "actual": a.actual,
-                    }
-                    for a in self.assertions
-                ],
+                "fault_ids": [f.__dict__ for f in self.fault_ids],
+                "assertions": [a.__dict__ for a in self.assertions],
                 "client_transcripts": [
                     {
                         "contract": t.contract,
                         "transcript_sha256": t.transcript_sha256,
                         "clean_environment": t.clean_environment,
-                        "prohibited_capabilities_used": list(
-                            t.prohibited_capabilities_used
-                        ),
+                        "prohibited_capabilities_used": list(t.prohibited_capabilities_used),
                     }
                     for t in self.client_transcripts
                 ],
-                "executable_identities": [
-                    {
-                        "path": e.path,
-                        "blob_sha": e.blob_sha,
-                        "commit_sha": e.commit_sha,
-                    }
-                    for e in self.executable_identities
-                ],
+                "executable_identities": [e.__dict__ for e in self.executable_identities],
                 "dependency_identities": list(self.dependency_identities),
                 "durability_records": list(self.durability_records),
-                "repeated_result": (
-                    None
-                    if self.repeated_result is None
-                    else self.repeated_result.__dict__
-                ),
-                "final_owner": (
-                    None if self.final_owner is None else self.final_owner.__dict__
-                ),
-                "installation_inventory_repository_ids": list(
-                    self.installation_inventory_repository_ids
-                ),
+                "repeated_result": None if self.repeated_result is None else self.repeated_result.__dict__,
+                "final_owner": None if self.final_owner is None else self.final_owner.__dict__,
+                "installation_inventory_repository_ids": list(self.installation_inventory_repository_ids),
                 "installation_inventory_current": self.installation_inventory_current,
                 "installation_inventory_attestation": self.installation_inventory_attestation,
-                "token_scope_records": [
-                    {
-                        "profile": r.profile,
-                        "requested_repository_ids": list(r.requested_repository_ids),
-                        "returned_repository_ids": list(r.returned_repository_ids),
-                        "requested_permissions": list(r.requested_permissions),
-                        "returned_permissions": list(r.returned_permissions),
-                        "restrictions_explicit": r.restrictions_explicit,
-                        "returned_scope_validated": r.returned_scope_validated,
-                        "cross_repository_denied": r.cross_repository_denied,
-                    }
-                    for r in self.token_scope_records
-                ],
+                "token_scope_records": [r.__dict__ for r in self.token_scope_records],
                 "network_destinations": list(self.network_destinations),
                 "cleanup_decision": self.cleanup_decision,
                 "limitations": list(self.limitations),
@@ -779,9 +791,7 @@ class ScenarioEvidence:
 
 
 class ScenarioBackend(Protocol):
-    def execute(
-        self, spec: ScenarioSpec, namespace: AttemptNamespace
-    ) -> ScenarioEvidence: ...
+    def execute(self, spec: ScenarioSpec, namespace: AttemptNamespace) -> ScenarioEvidence: ...
 
 
 @dataclass
@@ -858,11 +868,7 @@ class EvidenceLedger:
         self.records[evidence.scenario_id] = evidence
 
     def finalise(self) -> tuple[ScenarioEvidence, ...]:
-        missing = [
-            scenario_id
-            for scenario_id in SCENARIO_IDS
-            if scenario_id not in self.records
-        ]
+        missing = [scenario_id for scenario_id in SCENARIO_IDS if scenario_id not in self.records]
         if missing:
             raise AdversarialContractError("INCOMPLETE_WORKSTREAM_D_EVIDENCE")
         ordered = tuple(self.records[scenario_id] for scenario_id in SCENARIO_IDS)
