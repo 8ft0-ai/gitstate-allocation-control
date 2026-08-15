@@ -35,6 +35,8 @@ class AllocationSchemaTests(unittest.TestCase):
             "CREATE TABLE allocations",
             "CREATE TABLE active_task_allocations",
             "CREATE TABLE allocation_events",
+            "fk_allocations_task",
+            "REFERENCES issues (id)",
             "fk_active_task_allocation_pair",
             "allocation_events_no_update",
             "allocation_events_no_delete",
