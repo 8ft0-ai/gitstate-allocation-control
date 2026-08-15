@@ -25,12 +25,19 @@ boundary and accepts only an injected, already-authorised request context. It
 does not mint an App token, call GitHub, dispatch the intake workflow or post a
 result projection. The concrete Git/Dolt adapter has no configured repository,
 credential or default live connection: the already-authorised caller must inject
-the state-repository URL and isolated database connection explicitly. It fetches
-only `refs/dolt/data` into a temporary workspace and publishes only through a
-normal expected-old-SHA fast-forward push with no force option.
+the state-repository URL and a connection factory for the isolated cloned
+database explicitly.
+
+The adapter does not check out `refs/dolt/data` as an ordinary Git worktree. It
+uses the ref only as an expected-old CAS identity, clones canonical state through
+Dolt's Git-remote transport, verifies that the injected SQL connection is bound
+to that exact clone by comparing Dolt `HEAD` independently through the CLI, and
+publishes only with a normal `dolt push origin main`. It rechecks the expected
+old ref before publication, has no force option and classifies a moved ref as a
+stale writer requiring a fresh clone.
 
 Fast failure and concurrency tests use the isolated SQLite conformance fixture
 and in-memory CAS repository. Separate runtime-adapter tests exercise the Beads
-`issues`, `dependencies` and `labels` shape and the concrete no-force Git/Dolt
-publication path without live state or credentials. No Workstream B test or
-candidate code selects the private state repository on its own.
+`issues`, `dependencies` and `labels` shape and the concrete no-force Dolt
+Git-remote publication path without live state or credentials. No Workstream B
+test or candidate code selects the private state repository on its own.
