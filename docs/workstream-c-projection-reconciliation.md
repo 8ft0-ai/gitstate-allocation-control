@@ -42,13 +42,22 @@ identity, task summary, grant timestamp and the protocol release instruction.
 view through an injected gateway and uses the same `CanonicalRepository`
 expected-old-SHA publication boundary as Workstream B for metadata changes. It:
 
-- retries a pending canonical anchor only when an injected durable-history
-  lookup supplies the exact allocation-creation Git/Dolt identity;
+- repairs a pending canonical anchor only from a complete ordered view of
+  accepted first-parent `refs/dolt/data` revisions; the reconciler selects the
+  first accepted revision in which the canonical request exists and uses that
+  revision's Git SHA and Dolt commit, rather than accepting a remembered anchor
+  tuple or runner/workspace state;
+- fails closed if the canonical history is incomplete, malformed, duplicated or
+  shows a canonical request disappearing after it first appears;
 - posts or repairs missing canonical projections;
 - canonically marks a failed projection as `MISSING/REQUIRED`;
 - records projection URLs/IDs in append-only projection events after a post;
 - invalidates projection-shaped comments that cannot be matched to canonical
-  state and records a null-request `PROJECTION_COMMENT` audit subject;
+  state and records a null-request `PROJECTION_COMMENT` audit subject containing
+  the control repository, issue number and projection comment ID;
+- records invalidation completion separately from orphan discovery, so a failed
+  invalidation post remains retryable on a later reconciliation run and a
+  successful invalidation becomes durably idempotent;
 - detects post-ingress source edits/deletion without changing terminal results;
 - handles same-payload duplicate delivery and payload-mismatch delivery without
   creating a second canonical request or allocation;
@@ -58,8 +67,9 @@ expected-old-SHA publication boundary as Workstream B for metadata changes. It:
 - emits a deterministic durable reconciliation summary.
 
 A fresh reconciler instance can recover a successful canonical push followed by
-projection failure using only the canonical repository and current control-issue
-comments; no prior runner state is required.
+projection or anchor-recording failure using only accepted canonical Git/Dolt
+history, the current canonical repository and current control-issue comments;
+no prior runner state is required.
 
 ## GitHub adapter
 
@@ -79,11 +89,17 @@ is no automatic expiry or inferred abandonment.
 ## Candidate validation
 
 `tests/test_workstream_c.py` uses only `LocalCanonicalRepository`, synthetic
-request/task records and mocked GitHub APIs. It covers:
+request/task records, a synthetic accepted-history reader and mocked GitHub
+APIs. It covers:
 
 - complete exact-anchor API-only projection consumption;
+- pending-anchor reconstruction from complete accepted history after loss of
+  transient service state, plus fail-closed incomplete-history handling;
 - projection failure followed by fresh-session repair;
 - orphan invalidation without manufacturing request/allocation state;
+- retry of orphan invalidation after a failed GitHub post and durable suppression
+  after invalidation completion is recorded;
+- repository/issue/comment-qualified orphan audit identity;
 - fail-closed allocation/Beads disagreement;
 - edited-source audit with immutable ownership;
 - duplicate and payload-mismatch delivery without ownership advance;

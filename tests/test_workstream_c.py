@@ -9,6 +9,7 @@ from phase2.parser import parse_request
 from phase2.projection import CanonicalProjection, ProjectionError, parse_projection, render_projection
 from phase2.projection_github import GitHubIssueGateway
 from phase2.reconciliation import (
+    CanonicalHistoryRevision,
     DurableComment,
     OperatorRecovery,
     PostedComment,
@@ -67,11 +68,28 @@ def rows(repository, query, params=()):
         connection.close()
 
 
+class FakeCanonicalHistory:
+    """Fixture for durable accepted first-parent Git/Dolt history."""
+
+    def __init__(self, revisions, *, complete=True):
+        self._revisions = tuple(revisions)
+        self._complete = complete
+
+    @property
+    def complete(self):
+        return self._complete
+
+    def accepted_revisions(self):
+        return self._revisions
+
+
 class FakeGateway:
     def __init__(self, comments=()):
         self.comments = list(comments)
         self.next_id = 1000
         self.fail_projection_posts = 0
+        self.fail_invalidation_posts = 0
+        self.invalidation_attempts = 0
         self.invalidated = []
         self.summaries = []
 
@@ -104,12 +122,17 @@ class FakeGateway:
 
     def invalidate_projection(self, issue_number, comment, reason_code):
         self.assert_issue(issue_number)
+        self.invalidation_attempts += 1
+        if self.fail_invalidation_posts:
+            self.fail_invalidation_posts -= 1
+            raise RuntimeError("injected invalidation failure")
         self.invalidated.append((comment.comment_id, reason_code))
         return self._append(
             json.dumps(
                 {
                     "execution_may_begin": False,
                     "projection_comment_id": comment.comment_id,
+                    "projection_url": comment.html_url,
                     "protocol": "beads-allocation/v0.2",
                     "reason_code": reason_code,
                     "type": "PROJECTION_INVALIDATED",
@@ -129,6 +152,7 @@ class Fixture:
     def __init__(self, *, clock=NOW):
         self.repository = LocalCanonicalRepository()
         seed_local_fixture(self.repository, [task()])
+        self.before_request_identity = self.repository.identity
         self.body = request_body()
         parsed = parse_request(self.body.encode())
         self.command = AllocationCommand.from_parsed(parsed)
@@ -137,24 +161,30 @@ class Fixture:
             self.command, self.context
         )
         assert self.result.status == "ALLOCATED"
-        self.anchors = (
-            self.result.canonical_git_ref_sha,
-            self.result.canonical_dolt_commit,
+        assert self.result.canonical_git_ref_sha and self.result.canonical_dolt_commit
+        self.creation_identity = self.repository.identity
+        self.history = FakeCanonicalHistory(
+            [
+                CanonicalHistoryRevision(self.before_request_identity, frozenset()),
+                CanonicalHistoryRevision(
+                    self.creation_identity, frozenset({self.command.request_id})
+                ),
+            ]
         )
-        assert self.anchors[0] and self.anchors[1]
         self.source = DurableComment(
             101,
             self.body,
             f"https://github.example/{CONTROL_REPOSITORY}/issues/{ISSUE}#issuecomment-101",
         )
 
-    def reconciler(self, gateway, *, now=NOW, handler=None):
+    def reconciler(self, gateway, *, now=NOW, handler=None, history=None):
         return ReconciliationService(
             self.repository,
             gateway,
+            control_repository=CONTROL_REPOSITORY,
             issue_number=ISSUE,
             task_summary_lookup=lambda task_id: f"Summary for {task_id}",
-            anchor_lookup=lambda request_id: self.anchors if request_id == self.command.request_id else None,
+            canonical_history=history or self.history,
             unprocessed_handler=handler,
             clock=lambda: now,
             stale_after_seconds=24 * 60 * 60,
@@ -208,6 +238,56 @@ class ProjectionTests(unittest.TestCase):
 
 
 class ReconciliationTests(unittest.TestCase):
+    def test_pending_anchor_is_reconstructed_from_complete_durable_history_after_service_loss(self):
+        fixture = Fixture()
+        before = rows(
+            fixture.repository,
+            "SELECT * FROM allocation_requests WHERE request_id = ?",
+            (fixture.command.request_id,),
+        )[0]
+        self.assertEqual(before["anchor_status"], "PENDING")
+        self.assertIsNone(before["canonical_git_ref_sha"])
+        self.assertIsNone(before["canonical_dolt_commit"])
+
+        # The fresh service receives no remembered result/anchor tuple. It scans
+        # the complete accepted canonical history and chooses the first revision
+        # in which the durable request exists.
+        fresh_history = FakeCanonicalHistory(fixture.history.accepted_revisions())
+        gateway = FakeGateway([fixture.source])
+        fixture.reconciler(gateway, history=fresh_history).reconcile("run-anchor-repair")
+
+        after = rows(
+            fixture.repository,
+            "SELECT * FROM allocation_requests WHERE request_id = ?",
+            (fixture.command.request_id,),
+        )[0]
+        self.assertEqual(after["anchor_status"], "RECORDED")
+        self.assertEqual(after["canonical_git_ref_sha"], fixture.creation_identity.git_ref_sha)
+        self.assertEqual(after["canonical_dolt_commit"], fixture.creation_identity.dolt_commit)
+        anchors = rows(
+            fixture.repository,
+            """SELECT canonical_git_ref_sha, canonical_dolt_commit FROM allocation_events
+               WHERE request_id = ? AND event_type = 'ANCHOR_RECORDED'""",
+            (fixture.command.request_id,),
+        )
+        self.assertEqual(len(anchors), 1)
+        self.assertEqual(anchors[0]["canonical_git_ref_sha"], fixture.creation_identity.git_ref_sha)
+        self.assertEqual(anchors[0]["canonical_dolt_commit"], fixture.creation_identity.dolt_commit)
+
+    def test_incomplete_history_fails_closed_and_does_not_manufacture_anchor(self):
+        fixture = Fixture()
+        history = FakeCanonicalHistory(fixture.history.accepted_revisions(), complete=False)
+        gateway = FakeGateway([fixture.source])
+        summary = fixture.reconciler(gateway, history=history).reconcile("run-incomplete-history")
+        self.assertTrue(any("CANONICAL_HISTORY_INCOMPLETE" in error for error in summary.errors))
+        request = rows(
+            fixture.repository,
+            "SELECT * FROM allocation_requests WHERE request_id = ?",
+            (fixture.command.request_id,),
+        )[0]
+        self.assertEqual(request["anchor_status"], "PENDING")
+        self.assertFalse(any(parse_projection(comment.body) for comment in gateway.comments))
+
     def test_projection_failure_is_canonically_marked_and_fresh_reconciler_repairs_it(self):
         fixture = Fixture()
         gateway = FakeGateway([fixture.source])
@@ -224,8 +304,8 @@ class ReconciliationTests(unittest.TestCase):
         self.assertTrue(any("PROJECTION_POST_FAILED" in error for error in first.errors))
         self.assertFalse(any(parse_projection(comment.body) for comment in gateway.comments))
 
-        # A new service instance has no prior runner/workspace state.  It uses
-        # only the durable canonical repository and current issue comments.
+        # A new service instance has no prior runner/workspace state. It uses
+        # only the durable canonical repository, accepted history and comments.
         second = fixture.reconciler(gateway).reconcile("run-2")
         request = rows(
             fixture.repository,
@@ -239,8 +319,8 @@ class ReconciliationTests(unittest.TestCase):
         visible = [payload for payload in visible if payload]
         self.assertEqual(len(visible), 1)
         self.assertTrue(visible[0]["execution_may_begin"])
-        self.assertEqual(visible[0]["canonical_git_ref_sha"], fixture.anchors[0])
-        self.assertEqual(visible[0]["canonical_dolt_commit"], fixture.anchors[1])
+        self.assertEqual(visible[0]["canonical_git_ref_sha"], fixture.creation_identity.git_ref_sha)
+        self.assertEqual(visible[0]["canonical_dolt_commit"], fixture.creation_identity.dolt_commit)
 
     def test_orphan_projection_is_invalidated_and_audited_without_request_or_ownership(self):
         fixture = Fixture()
@@ -276,14 +356,77 @@ class ReconciliationTests(unittest.TestCase):
         audit = rows(
             fixture.repository,
             """SELECT * FROM allocation_events WHERE event_type = 'AUDIT_FINDING'
-               AND request_id IS NULL AND audit_subject_type = 'PROJECTION_COMMENT'""",
+               AND request_id IS NULL AND audit_subject_type = 'PROJECTION_COMMENT'
+               AND reason_code = 'ORPHAN_PROJECTION'""",
         )
         self.assertEqual(len(audit), 1)
-        self.assertEqual(audit[0]["reason_code"], "ORPHAN_PROJECTION")
-        self.assertIn(str(9090), audit[0]["audit_subject_id"])
+        subject = audit[0]["audit_subject_id"]
+        self.assertIn(CONTROL_REPOSITORY, subject)
+        self.assertIn(f"issue:{ISSUE}", subject)
+        self.assertIn("projection_comment:9090", subject)
+        invalidation = rows(
+            fixture.repository,
+            """SELECT * FROM allocation_events WHERE event_type = 'AUDIT_FINDING'
+               AND request_id IS NULL AND audit_subject_type = 'PROJECTION_COMMENT'
+               AND reason_code = 'ORPHAN_PROJECTION_INVALIDATED'""",
+        )
+        self.assertEqual(len(invalidation), 1)
+        self.assertEqual(invalidation[0]["audit_subject_id"], subject)
+        details = json.loads(invalidation[0]["details_json"])
+        self.assertEqual(details["projection_comment_id"], 9090)
         active = rows(fixture.repository, "SELECT * FROM allocations WHERE state = 'ACTIVE'")
         self.assertEqual(len(active), 1)
         self.assertEqual(active[0]["allocation_id"], fixture.result.allocation_id)
+
+    def test_orphan_invalidation_retries_after_post_failure_even_when_audit_already_exists(self):
+        fixture = Fixture()
+        orphan = CanonicalProjection(
+            request_id=stable_ulid("request:orphan-retry"),
+            result_status="REJECTED",
+            reason_code="NO_ELIGIBLE_TASK",
+            agent_id=AGENT,
+            source_repository=CONTROL_REPOSITORY,
+            source_issue_number=ISSUE,
+            source_comment_id=919,
+            canonical_git_ref_sha="d" * 40,
+            canonical_dolt_commit="orphan-retry-dolt",
+        )
+        orphan_comment = DurableComment(
+            9190,
+            render_projection(orphan),
+            f"https://github.example/{CONTROL_REPOSITORY}/issues/{ISSUE}#issuecomment-9190",
+        )
+        gateway = FakeGateway([fixture.source, orphan_comment])
+        gateway.fail_invalidation_posts = 1
+
+        first = fixture.reconciler(gateway).reconcile("run-orphan-fail")
+        self.assertTrue(any("INVALIDATION_POST_FAILED" in error for error in first.errors))
+        self.assertEqual(gateway.invalidation_attempts, 1)
+        initial = rows(
+            fixture.repository,
+            """SELECT * FROM allocation_events WHERE event_type = 'AUDIT_FINDING'
+               AND request_id IS NULL AND reason_code = 'ORPHAN_PROJECTION'""",
+        )
+        self.assertEqual(len(initial), 1)
+        completed = rows(
+            fixture.repository,
+            """SELECT * FROM allocation_events WHERE event_type = 'AUDIT_FINDING'
+               AND request_id IS NULL AND reason_code = 'ORPHAN_PROJECTION_INVALIDATED'""",
+        )
+        self.assertEqual(completed, [])
+
+        second = fixture.reconciler(gateway).reconcile("run-orphan-retry")
+        self.assertIn(9190, second.orphan_projections_invalidated)
+        self.assertEqual(gateway.invalidation_attempts, 2)
+        completed = rows(
+            fixture.repository,
+            """SELECT * FROM allocation_events WHERE event_type = 'AUDIT_FINDING'
+               AND request_id IS NULL AND reason_code = 'ORPHAN_PROJECTION_INVALIDATED'""",
+        )
+        self.assertEqual(len(completed), 1)
+
+        fixture.reconciler(gateway).reconcile("run-orphan-idempotent")
+        self.assertEqual(gateway.invalidation_attempts, 2)
 
     def test_allocation_beads_mismatch_fails_closed_without_repair_or_projection(self):
         fixture = Fixture()
@@ -383,9 +526,9 @@ class ReconciliationTests(unittest.TestCase):
         )
         seen = []
         gateway = FakeGateway([fixture.source, unprocessed])
-        summary = fixture.reconciler(gateway, handler=lambda comment: seen.append(comment.comment_id)).reconcile(
-            "run-unprocessed"
-        )
+        summary = fixture.reconciler(
+            gateway, handler=lambda comment: seen.append(comment.comment_id)
+        ).reconcile("run-unprocessed")
         self.assertIn(404, summary.unprocessed_comments)
         self.assertEqual(seen, [404])
         self.assertEqual(

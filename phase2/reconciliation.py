@@ -1,25 +1,40 @@
 """Workstream C projection, reconciliation and operator-recovery logic.
 
-All GitHub I/O and allocation-state persistence are injected.  The reconciler
+All GitHub I/O and allocation-state persistence are injected. The reconciler
 never treats comments as ownership authority: canonical allocation rows and the
 Beads ownership mirror are checked before an ALLOCATED projection can be
-rendered.  Metadata repairs use the same canonical repository CAS boundary as
+rendered. Metadata repairs use the same canonical repository CAS boundary as
 Workstream B.
 """
 
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field, replace
+import re
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable, Protocol, Sequence
 
 from .allocation_engine import AllocationService
 from .allocation_store import AllocationStore, CanonicalOwnershipMismatch
 from .allocation_types import AllocationCommand, AllocationResult, RequestContext
-from .canonical import CanonicalPushFailed, CanonicalRepository, StaleCanonicalBase
+from .canonical import (
+    CanonicalIdentity,
+    CanonicalPushFailed,
+    CanonicalRepository,
+    StaleCanonicalBase,
+    verify_canonical_identity,
+)
 from .parser import RequestError, parse_request
-from .projection import CanonicalProjection, ProjectionError, parse_projection, projection_matches, render_projection
+from .projection import (
+    CanonicalProjection,
+    ProjectionError,
+    parse_projection,
+    projection_matches,
+    render_projection,
+)
+
+CONTROL_REPOSITORY_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 
 class ProjectionDeliveryError(RuntimeError):
@@ -41,6 +56,29 @@ class DurableComment:
 class PostedComment:
     comment_id: int
     html_url: str
+
+
+@dataclass(frozen=True)
+class CanonicalHistoryRevision:
+    """One accepted first-parent canonical revision reconstructed from Git/Dolt.
+
+    ``request_ids`` is the complete set of canonical request IDs visible in that
+    accepted revision. A production history reader must obtain these facts from
+    durable ``refs/dolt/data`` history, never from runner memory or a remembered
+    result tuple.
+    """
+
+    identity: CanonicalIdentity
+    request_ids: frozenset[str]
+
+
+class CanonicalHistoryReader(Protocol):
+    """Complete accepted first-parent history for ``refs/dolt/data``."""
+
+    @property
+    def complete(self) -> bool: ...
+
+    def accepted_revisions(self) -> Sequence[CanonicalHistoryRevision]: ...
 
 
 class ReconciliationGateway(Protocol):
@@ -106,14 +144,17 @@ class ReconciliationService:
         repository: CanonicalRepository,
         gateway: ReconciliationGateway,
         *,
+        control_repository: str,
         issue_number: int,
         task_summary_lookup: Callable[[str], str],
-        anchor_lookup: Callable[[str], tuple[str, str] | None],
+        canonical_history: CanonicalHistoryReader,
         unprocessed_handler: Callable[[DurableComment], None] | None = None,
         clock: Callable[[], str] = utc_now,
         stale_after_seconds: int = 24 * 60 * 60,
         max_stale_retries: int = 3,
     ) -> None:
+        if not CONTROL_REPOSITORY_RE.fullmatch(control_repository):
+            raise ValueError("invalid control_repository")
         if issue_number <= 0:
             raise ValueError("issue_number must be positive")
         if stale_after_seconds <= 0:
@@ -122,9 +163,10 @@ class ReconciliationService:
             raise ValueError("max_stale_retries must be non-negative")
         self.repository = repository
         self.gateway = gateway
+        self.control_repository = control_repository
         self.issue_number = issue_number
         self.task_summary_lookup = task_summary_lookup
-        self.anchor_lookup = anchor_lookup
+        self.canonical_history = canonical_history
         self.unprocessed_handler = unprocessed_handler
         self.clock = clock
         self.stale_after_seconds = stale_after_seconds
@@ -189,11 +231,6 @@ class ReconciliationService:
             snapshot.close()
             return
 
-    @staticmethod
-    def _allocation_id(row: object) -> str | None:
-        request = row  # row-like mapping
-        return request["allocation_id"] or request["release_allocation_id"]  # type: ignore[index]
-
     def _canonical_projection(
         self,
         request_id: str,
@@ -219,7 +256,6 @@ class ReconciliationService:
             task_id = None
             task_summary = None
             grant_timestamp = None
-            ownership_valid = True
             if status in {"ALLOCATED", "RELEASED"} and allocation_id is not None:
                 allocation = store.connection.execute(
                     "SELECT * FROM allocations WHERE allocation_id = ?", (allocation_id,)
@@ -255,7 +291,7 @@ class ReconciliationService:
                 task_id=task_id if status in {"ALLOCATED", "RELEASED"} else None,
                 task_summary=task_summary,
                 grant_timestamp=grant_timestamp,
-                ownership_valid=ownership_valid,
+                ownership_valid=True,
             )
         finally:
             snapshot.close()
@@ -331,17 +367,21 @@ class ReconciliationService:
         self._mutate(mutation)
         return repaired
 
-    def _record_orphan(self, comment: DurableComment, reason_code: str) -> bool:
-        subject = f"{self.issue_number}:{comment.comment_id}"
-        changed = False
+    def _orphan_subject(self, comment: DurableComment) -> str:
+        return (
+            f"{self.control_repository}:issue:{self.issue_number}:"
+            f"projection_comment:{comment.comment_id}"
+        )
+
+    def _ensure_orphan_audit(self, comment: DurableComment, reason_code: str) -> None:
+        subject = self._orphan_subject(comment)
 
         def mutation(store: AllocationStore) -> bool:
-            nonlocal changed
             existing = store.connection.execute(
                 """SELECT event_id FROM allocation_events WHERE event_type = 'AUDIT_FINDING'
                    AND request_id IS NULL AND audit_subject_type = 'PROJECTION_COMMENT'
-                   AND audit_subject_id = ? LIMIT 1""",
-                (subject,),
+                   AND audit_subject_id = ? AND reason_code = ? LIMIT 1""",
+                (subject, reason_code),
             ).fetchone()
             if existing is not None:
                 return False
@@ -357,15 +397,94 @@ class ReconciliationService:
                 details={
                     "comment_id": comment.comment_id,
                     "comment_url": comment.html_url,
+                    "control_repository": self.control_repository,
+                    "issue_number": self.issue_number,
                     "version": 1,
                 },
-                discriminator=subject,
+                discriminator=f"orphan:{subject}",
             )
-            changed = True
             return True
 
         self._mutate(mutation)
-        return changed
+
+    def _orphan_invalidation_recorded(self, comment: DurableComment) -> bool:
+        subject = self._orphan_subject(comment)
+        snapshot = self.repository.bootstrap()
+        try:
+            store = self._store(snapshot)
+            row = store.connection.execute(
+                """SELECT event_id FROM allocation_events WHERE event_type = 'AUDIT_FINDING'
+                   AND request_id IS NULL AND audit_subject_type = 'PROJECTION_COMMENT'
+                   AND audit_subject_id = ?
+                   AND reason_code = 'ORPHAN_PROJECTION_INVALIDATED' LIMIT 1""",
+                (subject,),
+            ).fetchone()
+            return row is not None
+        finally:
+            snapshot.close()
+
+    def _record_orphan_invalidation(
+        self, comment: DurableComment, posted: PostedComment
+    ) -> None:
+        subject = self._orphan_subject(comment)
+
+        def mutation(store: AllocationStore) -> bool:
+            existing = store.connection.execute(
+                """SELECT event_id FROM allocation_events WHERE event_type = 'AUDIT_FINDING'
+                   AND request_id IS NULL AND audit_subject_type = 'PROJECTION_COMMENT'
+                   AND audit_subject_id = ?
+                   AND reason_code = 'ORPHAN_PROJECTION_INVALIDATED' LIMIT 1""",
+                (subject,),
+            ).fetchone()
+            if existing is not None:
+                return False
+            store.insert_event(
+                request_id=None,
+                allocation_id=None,
+                event_type="AUDIT_FINDING",
+                actor="allocator://phase2/v0.2",
+                event_at=self.clock(),
+                reason_code="ORPHAN_PROJECTION_INVALIDATED",
+                audit_subject_type="PROJECTION_COMMENT",
+                audit_subject_id=subject,
+                details={
+                    "invalidation_comment_id": posted.comment_id,
+                    "invalidation_url": posted.html_url,
+                    "projection_comment_id": comment.comment_id,
+                    "projection_url": comment.html_url,
+                    "version": 1,
+                },
+                discriminator=f"invalidation:{subject}",
+            )
+            return True
+
+        self._mutate(mutation)
+
+    def _invalidate_orphan(
+        self, comment: DurableComment, summary: ReconciliationSummary
+    ) -> None:
+        try:
+            self._ensure_orphan_audit(comment, "ORPHAN_PROJECTION")
+        except ReconciliationError as exc:
+            summary.errors.append(f"ORPHAN:{comment.comment_id}:AUDIT:{exc}")
+            return
+        if self._orphan_invalidation_recorded(comment):
+            return
+        try:
+            posted = self.gateway.invalidate_projection(
+                self.issue_number, comment, "ORPHAN_PROJECTION"
+            )
+        except Exception as exc:
+            summary.errors.append(
+                f"ORPHAN:{comment.comment_id}:INVALIDATION_POST_FAILED:{type(exc).__name__}"
+            )
+            return
+        try:
+            self._record_orphan_invalidation(comment, posted)
+        except ReconciliationError as exc:
+            summary.errors.append(f"ORPHAN:{comment.comment_id}:INVALIDATION_AUDIT:{exc}")
+            return
+        summary.orphan_projections_invalidated.append(comment.comment_id)
 
     def _record_request_audit(self, request_id: str, reason_code: str) -> None:
         def mutation(store: AllocationStore) -> bool:
@@ -399,13 +518,39 @@ class ReconciliationService:
 
         self._mutate(mutation)
 
+    def _allocation_creation_anchor(self, request_id: str) -> CanonicalIdentity | None:
+        if not self.canonical_history.complete:
+            raise ReconciliationError("CANONICAL_HISTORY_INCOMPLETE")
+        revisions = tuple(self.canonical_history.accepted_revisions())
+        if not revisions:
+            raise ReconciliationError("CANONICAL_HISTORY_EMPTY")
+
+        first: CanonicalIdentity | None = None
+        seen_request = False
+        seen_git_shas: set[str] = set()
+        for revision in revisions:
+            try:
+                verify_canonical_identity(revision.identity)
+            except Exception as exc:
+                raise ReconciliationError("CANONICAL_HISTORY_IDENTITY_INVALID") from exc
+            if revision.identity.git_ref_sha in seen_git_shas:
+                raise ReconciliationError("CANONICAL_HISTORY_DUPLICATE_REVISION")
+            seen_git_shas.add(revision.identity.git_ref_sha)
+            contains = request_id in revision.request_ids
+            if contains and not seen_request:
+                first = revision.identity
+                seen_request = True
+            elif seen_request and not contains:
+                raise ReconciliationError("CANONICAL_HISTORY_REQUEST_REGRESSION")
+        return first
+
     def _repair_anchor(self, request_id: str) -> bool:
-        anchors = self.anchor_lookup(request_id)
-        if anchors is None:
+        identity = self._allocation_creation_anchor(request_id)
+        if identity is None:
             return False
         result = AllocationService(
             self.repository, clock=self.clock, max_stale_retries=self.max_stale_retries
-        ).record_anchor(request_id, anchors[0], anchors[1])
+        ).record_anchor(request_id, identity.git_ref_sha, identity.dolt_commit)
         if result.reason_code in {"CANONICAL_PUSH_FAILED", "STALE_ALLOCATOR_RETRY_EXHAUSTED"}:
             raise ReconciliationError(result.reason_code)
         return True
@@ -496,9 +641,7 @@ class ReconciliationService:
                     handled_projection_ids.add(comment.comment_id)
                     break
                 handled_projection_ids.add(comment.comment_id)
-                if self._record_orphan(comment, "ORPHAN_PROJECTION"):
-                    self.gateway.invalidate_projection(self.issue_number, comment, "ORPHAN_PROJECTION")
-                    summary.orphan_projections_invalidated.append(comment.comment_id)
+                self._invalidate_orphan(comment, summary)
 
             if exact is not None:
                 repaired = self._record_projection_posted(
@@ -510,7 +653,7 @@ class ReconciliationService:
 
             try:
                 posted = self.gateway.post_projection(self.issue_number, render_projection(expected))
-            except Exception as exc:  # injected gateways surface transport faults here
+            except Exception as exc:
                 try:
                     self._record_projection_missing(request_id)
                 except ReconciliationError as metadata_exc:
@@ -524,7 +667,7 @@ class ReconciliationService:
 
         # Reconcile protocol comments that are not the canonical source comment.
         # They may be unprocessed intake, same-payload duplicate delivery or a
-        # payload-mismatch reuse of an existing request ID.  None can create
+        # payload-mismatch reuse of an existing request ID. None can create
         # ownership from GitHub visibility.
         for comment in comments:
             if comment.comment_id in canonical_source_ids:
@@ -579,9 +722,7 @@ class ReconciliationService:
                 continue
             request_id = str(payload.get("request_id", ""))
             if request_id not in canonical_ids:
-                if self._record_orphan(comment, "ORPHAN_PROJECTION"):
-                    self.gateway.invalidate_projection(self.issue_number, comment, "ORPHAN_PROJECTION")
-                    summary.orphan_projections_invalidated.append(comment.comment_id)
+                self._invalidate_orphan(comment, summary)
                 continue
             try:
                 expected = self._canonical_projection(
@@ -590,9 +731,7 @@ class ReconciliationService:
             except (ProjectionError, TypeError, ValueError, KeyError):
                 expected = None
             if expected is None or not projection_matches(payload, expected):
-                if self._record_orphan(comment, "ORPHAN_PROJECTION"):
-                    self.gateway.invalidate_projection(self.issue_number, comment, "ORPHAN_PROJECTION")
-                    summary.orphan_projections_invalidated.append(comment.comment_id)
+                self._invalidate_orphan(comment, summary)
 
         summary.stale_allocations.extend(self._stale_allocations())
         try:
