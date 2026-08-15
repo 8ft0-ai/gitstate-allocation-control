@@ -22,15 +22,21 @@ no-force expected-old-SHA compare-and-swap implementation. The allocation row is
 the singular ownership authority; its active-task uniqueness entry and Beads
 status/assignee materialisation change in the same database transaction.
 
-Workstream B includes a concrete Git/Dolt repository adapter and Beads SQL store,
-but deliberately configures no live state target and accepts no credential by
-default. A caller must inject an already-authorised state-repository URL and
-isolated database connection through the Workstream A boundary. Fast tests retain
-an in-memory canonical repository; focused adapter tests additionally exercise
-the real Beads `issues`/`dependencies`/`labels` contract and no-force publication
-semantics. The implementation does not post GitHub projections, authorise work
-to begin, mint credentials, dispatch intake or itself select/access live
-`refs/dolt/data`. Result projection and reconciliation remain separate governed
-work.
+Workstream B includes a concrete Git-backed Dolt repository adapter and Beads
+SQL store, but deliberately configures no live state target and accepts no
+credential by default. A caller must inject an already-authorised state-repository
+URL and connection factory through the Workstream A boundary. The adapter probes
+`refs/dolt/data` only as the Git CAS identity, performs a fresh `dolt clone`,
+verifies that the SQL connection is bound to that exact isolated clone, and
+publishes only with a normal `dolt push origin main` after an expected-old-SHA
+recheck. It never checks out or commits the Dolt data ref as an ordinary Git
+worktree and exposes no force option.
+
+Fast tests retain an in-memory canonical repository; focused adapter tests
+additionally exercise the real Beads `issues`/`dependencies`/`labels` contract
+and Dolt Git-remote no-force publication semantics. The implementation does not
+post GitHub projections, authorise work to begin, mint credentials, dispatch
+intake or itself select/access live `refs/dolt/data`. Result projection and
+reconciliation remain separate governed work.
 
 Normal request-side writes and credentialed live checks remain fail-closed unless the separately reviewed activation variable `PHASE2_INTAKE_ENABLED` is exactly `true`. Neither Workstream A nor B creates that variable. Manual `workflow_dispatch` defaults to operator reconciliation; the protected scope probe is a separate explicit manual operation and never mutates canonical state.
