@@ -134,10 +134,12 @@ class DoltStoreTests(unittest.TestCase):
               created_by TEXT NOT NULL
             );
             CREATE TABLE dependencies (
+              id TEXT PRIMARY KEY,
               issue_id TEXT NOT NULL,
-              depends_on_id TEXT NOT NULL,
-              type TEXT NOT NULL DEFAULT 'blocks',
-              PRIMARY KEY (issue_id, depends_on_id)
+              depends_on_issue_id TEXT,
+              depends_on_wisp_id TEXT,
+              depends_on_external TEXT,
+              type TEXT NOT NULL DEFAULT 'blocks'
             );
             CREATE TABLE labels (
               issue_id TEXT NOT NULL,
@@ -216,7 +218,9 @@ class DoltStoreTests(unittest.TestCase):
             (NOW,),
         )
         self.inner.execute(
-            "INSERT INTO dependencies (issue_id, depends_on_id, type) VALUES ('task-1', 'blocker', 'blocks')"
+            """INSERT INTO dependencies
+               (id, issue_id, depends_on_issue_id, type)
+               VALUES ('dep-1', 'task-1', 'blocker', 'blocks')"""
         )
         task = self.store.task("task-1")
         self.assertTrue(task.blocked)
