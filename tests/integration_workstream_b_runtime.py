@@ -259,12 +259,15 @@ def initialise_pinned_beads_remote(root: Path, bd_bin: str) -> tuple[Path, str]:
     )
 
     run(["git", "init", "--bare", str(remote)], cwd=root)
+    git_remote = "file://" + str(remote)
+    run(["git", "remote", "add", "canonical-fixture", git_remote], cwd=source)
+    run(["git", "push", "canonical-fixture", "main:main"], cwd=source)
+
     dolt_remote = "git+file://" + str(remote)
     run([bd_bin, "dolt", "remote", "add", "origin", dolt_remote], cwd=source, env=env)
     run([bd_bin, "dolt", "commit", "-m", "pinned Beads v1.1.0 baseline"], cwd=source, env=env)
     run([bd_bin, "dolt", "push"], cwd=source, env=env)
 
-    git_remote = "file://" + str(remote)
     ref = run(["git", "ls-remote", "--refs", git_remote, "refs/dolt/data"], cwd=root)
     fields = ref.split()
     if len(fields) != 2 or fields[1] != "refs/dolt/data" or len(fields[0]) != 40:
