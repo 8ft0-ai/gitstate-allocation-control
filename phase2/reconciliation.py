@@ -200,6 +200,20 @@ class ReconciliationService:
         finally:
             snapshot.close()
 
+    def _allocation_state(self, request_id: str) -> str | None:
+        snapshot = self.repository.bootstrap()
+        try:
+            store = self._store(snapshot)
+            row = store.get_request(request_id)
+            if row is None or row["allocation_id"] is None:
+                return None
+            allocation = store.connection.execute(
+                "SELECT state FROM allocations WHERE allocation_id = ?", (row["allocation_id"],)
+            ).fetchone()
+            return None if allocation is None else str(allocation["state"])
+        finally:
+            snapshot.close()
+
     def _mutate(self, mutation: Callable[[AllocationStore], bool]) -> None:
         stale_retries = 0
         while True:
@@ -239,6 +253,7 @@ class ReconciliationService:
         override_status: str | None = None,
         override_reason: str | None = None,
         override_agent: str | None = None,
+        allow_released_allocation: bool = False,
     ) -> CanonicalProjection:
         snapshot = self.repository.bootstrap()
         try:
@@ -270,8 +285,12 @@ class ReconciliationService:
                     store.assert_ownership_invariant(task)
                 except CanonicalOwnershipMismatch as exc:
                     raise ProjectionError("CANONICAL_OWNERSHIP_MISMATCH") from exc
-                if status == "ALLOCATED" and allocation["state"] != "ACTIVE":
-                    raise ProjectionError("CANONICAL_OWNERSHIP_MISMATCH")
+                if status == "ALLOCATED":
+                    allocation_state = str(allocation["state"])
+                    if allocation_state != "ACTIVE" and not (
+                        allow_released_allocation and allocation_state == "RELEASED"
+                    ):
+                        raise ProjectionError("CANONICAL_OWNERSHIP_MISMATCH")
                 if status == "RELEASED" and allocation["state"] != "RELEASED":
                     raise ProjectionError("CANONICAL_OWNERSHIP_MISMATCH")
                 if status == "ALLOCATED":
@@ -330,6 +349,27 @@ class ReconciliationService:
 
         self._mutate(mutation)
 
+    @staticmethod
+    def _projection_event_recorded(
+        store: AllocationStore, request_id: str, posted: PostedComment
+    ) -> bool:
+        rows = store.connection.execute(
+            """SELECT details_json FROM allocation_events
+               WHERE request_id = ? AND event_type IN ('PROJECTION_POSTED', 'PROJECTION_REPAIRED')""",
+            (request_id,),
+        ).fetchall()
+        for event in rows:
+            try:
+                details = json.loads(event["details_json"])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if (
+                details.get("comment_id") == posted.comment_id
+                and details.get("projection_url") == posted.html_url
+            ):
+                return True
+        return False
+
     def _record_projection_posted(self, request_id: str, posted: PostedComment) -> bool:
         repaired = False
 
@@ -338,30 +378,35 @@ class ReconciliationService:
             row = store.get_request(request_id)
             if row is None:
                 return False
-            if row["projection_status"] == "POSTED":
+            event_recorded = self._projection_event_recorded(store, request_id, posted)
+            if row["projection_status"] == "POSTED" and event_recorded:
                 return False
-            repaired = row["projection_status"] == "MISSING" or row["reconciliation_status"] == "REQUIRED"
+            repaired = (
+                row["projection_status"] in {"MISSING", "POSTED"}
+                or row["reconciliation_status"] == "REQUIRED"
+            )
             store.connection.execute(
                 """UPDATE allocation_requests SET projection_status = 'POSTED',
                    reconciliation_status = ? WHERE request_id = ?""",
                 ("REPAIRED" if repaired else "NONE", request_id),
             )
-            store.insert_event(
-                request_id=request_id,
-                allocation_id=row["allocation_id"] or row["release_allocation_id"],
-                event_type="PROJECTION_REPAIRED" if repaired else "PROJECTION_POSTED",
-                actor="allocator://phase2/v0.2",
-                event_at=self.clock(),
-                reason_code=row["result_code"],
-                canonical_git_ref_sha=row["canonical_git_ref_sha"],
-                canonical_dolt_commit=row["canonical_dolt_commit"],
-                details={
-                    "comment_id": posted.comment_id,
-                    "projection_url": posted.html_url,
-                    "version": 1,
-                },
-                discriminator=str(posted.comment_id),
-            )
+            if not event_recorded:
+                store.insert_event(
+                    request_id=request_id,
+                    allocation_id=row["allocation_id"] or row["release_allocation_id"],
+                    event_type="PROJECTION_REPAIRED" if repaired else "PROJECTION_POSTED",
+                    actor="allocator://phase2/v0.2",
+                    event_at=self.clock(),
+                    reason_code=row["result_code"],
+                    canonical_git_ref_sha=row["canonical_git_ref_sha"],
+                    canonical_dolt_commit=row["canonical_dolt_commit"],
+                    details={
+                        "comment_id": posted.comment_id,
+                        "projection_url": posted.html_url,
+                        "version": 1,
+                    },
+                    discriminator=str(posted.comment_id),
+                )
             return True
 
         self._mutate(mutation)
@@ -485,6 +530,82 @@ class ReconciliationService:
             summary.errors.append(f"ORPHAN:{comment.comment_id}:INVALIDATION_AUDIT:{exc}")
             return
         summary.orphan_projections_invalidated.append(comment.comment_id)
+
+    @staticmethod
+    def _superseded_invalidation_recorded(
+        store: AllocationStore, request_id: str, comment: DurableComment
+    ) -> bool:
+        rows = store.connection.execute(
+            """SELECT details_json FROM allocation_events WHERE request_id = ?
+               AND event_type = 'AUDIT_FINDING'
+               AND reason_code = 'PROJECTION_SUPERSEDED_BY_RELEASE'""",
+            (request_id,),
+        ).fetchall()
+        for event in rows:
+            try:
+                details = json.loads(event["details_json"])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if details.get("projection_comment_id") == comment.comment_id:
+                return True
+        return False
+
+    def _superseded_recorded(self, request_id: str, comment: DurableComment) -> bool:
+        snapshot = self.repository.bootstrap()
+        try:
+            return self._superseded_invalidation_recorded(
+                self._store(snapshot), request_id, comment
+            )
+        finally:
+            snapshot.close()
+
+    def _record_superseded_invalidation(
+        self, request_id: str, comment: DurableComment, posted: PostedComment
+    ) -> None:
+        def mutation(store: AllocationStore) -> bool:
+            row = store.get_request(request_id)
+            if row is None:
+                return False
+            if self._superseded_invalidation_recorded(store, request_id, comment):
+                return False
+            store.insert_event(
+                request_id=request_id,
+                allocation_id=row["allocation_id"],
+                event_type="AUDIT_FINDING",
+                actor="allocator://phase2/v0.2",
+                event_at=self.clock(),
+                reason_code="PROJECTION_SUPERSEDED_BY_RELEASE",
+                details={
+                    "invalidation_comment_id": posted.comment_id,
+                    "invalidation_url": posted.html_url,
+                    "projection_comment_id": comment.comment_id,
+                    "projection_url": comment.html_url,
+                    "version": 1,
+                },
+                discriminator=f"superseded:{comment.comment_id}",
+            )
+            return True
+
+        self._mutate(mutation)
+
+    def _invalidate_superseded(
+        self, request_id: str, comment: DurableComment, summary: ReconciliationSummary
+    ) -> None:
+        if self._superseded_recorded(request_id, comment):
+            return
+        try:
+            posted = self.gateway.invalidate_projection(
+                self.issue_number, comment, "RELEASED"
+            )
+        except Exception as exc:
+            summary.errors.append(
+                f"{request_id}:SUPERSEDED_INVALIDATION_POST_FAILED:{type(exc).__name__}"
+            )
+            return
+        try:
+            self._record_superseded_invalidation(request_id, comment, posted)
+        except ReconciliationError as exc:
+            summary.errors.append(f"{request_id}:SUPERSEDED_INVALIDATION_AUDIT:{exc}")
 
     def _record_request_audit(self, request_id: str, reason_code: str) -> None:
         def mutation(store: AllocationStore) -> bool:
@@ -620,6 +741,34 @@ class ReconciliationService:
                     summary.pending_anchors.append(request_id)
                     continue
 
+            released_grant = (
+                current_row["status"] == "ALLOCATED"
+                and self._allocation_state(request_id) == "RELEASED"
+            )
+            if released_grant:
+                try:
+                    historical = self._canonical_projection(
+                        request_id, allow_released_allocation=True
+                    )
+                except ProjectionError as exc:
+                    if exc.code == "CANONICAL_OWNERSHIP_MISMATCH":
+                        self._record_request_audit(request_id, exc.code)
+                        summary.ownership_mismatches.append(request_id)
+                    else:
+                        summary.errors.append(f"{request_id}:{exc.code}")
+                    continue
+                for comment, payload in parsed_projections:
+                    if payload.get("request_id") != request_id:
+                        continue
+                    if payload.get("source_comment_id") != source_comment_id:
+                        continue
+                    handled_projection_ids.add(comment.comment_id)
+                    if projection_matches(payload, historical):
+                        self._invalidate_superseded(request_id, comment, summary)
+                    else:
+                        self._invalidate_orphan(comment, summary)
+                continue
+
             try:
                 expected = self._canonical_projection(request_id)
             except ProjectionError as exc:
@@ -687,6 +836,8 @@ class ReconciliationService:
                 continue
             try:
                 if parsed.payload_hash == row["payload_sha256"]:
+                    if row["status"] == "ALLOCATED" and self._allocation_state(request_id) == "RELEASED":
+                        continue
                     delivery = self._canonical_projection(
                         request_id,
                         source_comment_id=comment.comment_id,
@@ -723,6 +874,25 @@ class ReconciliationService:
             request_id = str(payload.get("request_id", ""))
             if request_id not in canonical_ids:
                 self._invalidate_orphan(comment, summary)
+                continue
+            row = self._request(request_id)
+            if (
+                row is not None
+                and row["status"] == "ALLOCATED"
+                and self._allocation_state(request_id) == "RELEASED"
+            ):
+                try:
+                    historical = self._canonical_projection(
+                        request_id,
+                        source_comment_id=int(payload["source_comment_id"]),
+                        allow_released_allocation=True,
+                    )
+                except (ProjectionError, TypeError, ValueError, KeyError):
+                    historical = None
+                if historical is not None and projection_matches(payload, historical):
+                    self._invalidate_superseded(request_id, comment, summary)
+                else:
+                    self._invalidate_orphan(comment, summary)
                 continue
             try:
                 expected = self._canonical_projection(
