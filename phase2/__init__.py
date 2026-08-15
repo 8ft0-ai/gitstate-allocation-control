@@ -7,6 +7,8 @@ __all__ = [
     "allocation_store",
     "allocation_types",
     "canonical",
+    "dolt_repository",
+    "dolt_store",
     "control_surface",
     "credentials",
     "discovery",
