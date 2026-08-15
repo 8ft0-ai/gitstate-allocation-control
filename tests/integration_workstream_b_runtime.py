@@ -138,6 +138,8 @@ def execute_ddl(connection, ddl: str) -> None:
     try:
         for line in ddl.splitlines():
             stripped = line.strip()
+            if not buffered and (not stripped or stripped.startswith("--")):
+                continue
             if stripped.upper().startswith("DELIMITER "):
                 if "\n".join(buffered).strip():
                     raise AssertionError("unexpected buffered SQL before DELIMITER")
