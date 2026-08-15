@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 from dataclasses import dataclass, field
 from typing import Iterable, Protocol, Sequence
 
@@ -75,6 +76,23 @@ _TREE_ENTRY = re.compile(r"^(100644|100755) blob (?P<sha>[0-9a-f]{40})\t(?P<path
 
 class AdversarialContractError(RuntimeError):
     pass
+
+
+def _git_stdout(*args: str, failure_code: str) -> str:
+    """Run a bounded read-only Git object query and fail closed on any error."""
+    try:
+        completed = subprocess.run(
+            ("git", *args),
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except OSError as exc:
+        raise AdversarialContractError("GIT_TREE_VERIFIER_UNAVAILABLE") from exc
+    if completed.returncode != 0:
+        raise AdversarialContractError(failure_code)
+    return completed.stdout.rstrip("\n")
 
 
 @dataclass(frozen=True)
@@ -445,6 +463,32 @@ class ExecutableIdentity:
             raise AdversarialContractError("INVALID_TRUSTED_TREE_ENTRY")
         if match.group("path") != self.path or match.group("sha") != self.blob_sha:
             raise AdversarialContractError("EXECUTABLE_BLOB_NOT_IN_TRUSTED_TREE")
+
+        _git_stdout(
+            "cat-file",
+            "-e",
+            f"{trusted_sha}^{{commit}}",
+            failure_code="TRUSTED_COMMIT_NOT_AVAILABLE",
+        )
+        actual_tree_entry = _git_stdout(
+            "ls-tree",
+            trusted_sha,
+            "--",
+            self.path,
+            failure_code="EXECUTABLE_TREE_LOOKUP_FAILED",
+        )
+        if not actual_tree_entry or "\n" in actual_tree_entry:
+            raise AdversarialContractError("EXECUTABLE_NOT_IN_TRUSTED_TREE")
+        if actual_tree_entry != self.trusted_tree_entry:
+            raise AdversarialContractError("EXECUTABLE_TREE_ENTRY_NOT_FROM_TRUSTED_COMMIT")
+        actual_blob = _git_stdout(
+            "rev-parse",
+            "--verify",
+            f"{trusted_sha}:{self.path}",
+            failure_code="EXECUTABLE_OBJECT_LOOKUP_FAILED",
+        )
+        if actual_blob != self.blob_sha:
+            raise AdversarialContractError("EXECUTABLE_OBJECT_NOT_FROM_TRUSTED_COMMIT")
 
 
 @dataclass(frozen=True)
@@ -851,7 +895,6 @@ class EvidenceLedger:
             raise AdversarialContractError("INVALID_EXPECTED_AUTHORITY_SHA")
 
     def append(self, evidence: ScenarioEvidence) -> None:
-        evidence.validate()
         if (
             evidence.attempt_namespace != self.attempt_namespace.value
             or evidence.workflow_run_id != self.attempt_namespace.run_id
@@ -863,6 +906,7 @@ class EvidenceLedger:
             or evidence.protocol_sha != self.expected_protocol_sha
         ):
             raise AdversarialContractError("UNAUTHORISED_EVIDENCE_AUTHORITY")
+        evidence.validate()
         if evidence.scenario_id in self.records:
             raise AdversarialContractError("DUPLICATE_SCENARIO_EVIDENCE")
         self.records[evidence.scenario_id] = evidence
@@ -877,7 +921,6 @@ class EvidenceLedger:
         return ordered
 
     def _validate_final_record(self, evidence: ScenarioEvidence) -> None:
-        evidence.validate()
         if (
             evidence.attempt_namespace != self.attempt_namespace.value
             or evidence.workflow_run_id != self.attempt_namespace.run_id
@@ -886,6 +929,7 @@ class EvidenceLedger:
             or evidence.protocol_sha != self.expected_protocol_sha
         ):
             raise AdversarialContractError("MIXED_OR_UNAUTHORISED_FINAL_EVIDENCE")
+        evidence.validate()
 
 
 def validate_live_gate(
