@@ -15,12 +15,16 @@ The harness defines:
 
 - the exact scenario 1–14 catalogue and executable assertions;
 - unique run/attempt-bound namespaces (`wd-<run>-<attempt>-<nonce>`);
-- explicit fault identities instead of unlabelled observation;
-- Git-capable and GitHub-API-only client transcript requirements;
-- scenario-specific evidence requirements for source comments, base/accepted Git
-  refs, Dolt commits, canonical rows and projection URLs;
-- fail-closed evidence validation, including rejection of failed assertions,
-  cross-attempt evidence and non-GitHub durable services;
+- one-to-one assertion evidence bound to each exact protocol assertion;
+- one explicit, typed fault identity for every required fault control;
+- one typed transcript for every required Git-capable/API-only client contract;
+- immutable executable/dependency identities and exact scenario exit status;
+- scenario-specific source, Git/Dolt, canonical-row, projection and final-owner evidence;
+- structured scenario 13 installation-inventory, reduced-token request/returned-scope,
+  cross-repository denial and negative token-policy evidence;
+- fail-closed evidence validation, including rejection of failed or substituted
+  assertions, missing fault/client evidence, cross-attempt evidence and mixed authority;
+- scenario 14 GitHub-only durability plus explicit network-destination/dependency inventory;
 - cleanup decisions that retain canonical history;
 - a final ledger that cannot pass unless all fourteen scenario records validate;
 - an explicit result boundary that does not imply production approval or permit
@@ -39,8 +43,13 @@ isolated `LocalCanonicalRepository` fixture. In particular it verifies:
 - expected-old-SHA stale-writer rejection with no force path;
 - push failure before visibility;
 - history-preserving explicit release;
-- exact scenario coverage, attempt isolation, executable-evidence requirements,
-  GitHub-only durability and Workstream E exclusion.
+- exact scenario coverage and run/attempt isolation;
+- one-to-one assertion, fault and client evidence binding;
+- scenario 4 repeated-result projection evidence;
+- scenario 6 winner/final-owner evidence;
+- scenario 13 exact inventory, token-profile and negative-scope evidence;
+- scenario 14 complete GitHub durability and network/dependency inventory;
+- immutable executable/dependency identities, successful exit status and Workstream E exclusion.
 
 These PR tests are regression/contract checks. They are not scenario 1–14 live
 evidence and must never be cited as such.
@@ -76,14 +85,21 @@ authority.
 ## Evidence boundary
 
 A live Workstream D pass requires one validated `ScenarioEvidence` record for
-each scenario 1–14 under the same attempt namespace. Evidence is not accepted if
-an assertion failed, a required source/ref/Dolt/row/projection/client/fault field
-is missing, the run is a rerun, evidence crosses attempts, or a durable service
-outside GitHub Issues, repositories, refs or Actions is relied upon.
+each scenario 1–14 under the same attempt namespace and authority identities.
+Evidence is not accepted if an assertion is missing, duplicated, substituted or
+failed; a required fault or client contract lacks its own typed evidence; a
+required source/ref/Dolt/row/projection/final-owner field is missing; executable
+or dependency identity is absent; the scenario exit status is non-zero; the run
+is a rerun; evidence crosses attempts; or a durable service outside GitHub
+Issues, repositories, refs or Actions is relied upon.
 
-Scenario 14 finalisation additionally requires the complete fourteen-record
-ledger and records that the result is a bounded GitHub-only proof, not a
-production isolation, availability, security or performance claim.
+Scenario 13 additionally requires a current exact two-repository installation
+inventory, explicit single-repository reduced control/state token requests,
+validated returned repository/permission scopes, cross-repository denial and
+all required negative token-policy results. Scenario 14 requires the complete
+GitHub durability category inventory and a recorded network-destination inventory.
+The final summary derives the external-durability result from validated evidence;
+it does not assert that result independently of the records.
 
 ## Non-goals
 
@@ -94,8 +110,7 @@ This candidate does not:
 - bootstrap or mutate live canonical state;
 - alter the accepted intake parser or actor policy;
 - alter token profiles or cross-repository scope controls;
-- alter deterministic selection, canonical ownership, release or no-force CAS
-  semantics;
+- alter deterministic selection, canonical ownership, release or no-force CAS semantics;
 - alter projection/reconciliation ownership rules;
 - add leases, expiry, completion orchestration or another protocol capability;
 - implement scenario 15 or Workstream E;

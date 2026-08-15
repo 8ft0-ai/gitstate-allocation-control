@@ -1,9 +1,9 @@
 """Workstream D adversarial integration contract and evidence machinery.
 
-This module is credential-free by default.  It defines the immutable scenario
+This module is credential-free by default. It defines the immutable scenario
 catalogue, attempt isolation rules, fault controls, evidence schema and the
-fail-closed driver used by both PR validation and the later trusted-main live
-execution gate.  It does not mint credentials or mutate GitHub/canonical state.
+fail-closed driver used by PR validation and the later trusted-main execution
+gate. It does not mint credentials or mutate GitHub/canonical state.
 """
 
 from __future__ import annotations
@@ -17,7 +17,21 @@ PROTOCOL = "beads-allocation/v0.2"
 CANONICAL_REF = "refs/dolt/data"
 WORKSTREAM = "D"
 SCENARIO_IDS = tuple(range(1, 15))
+CONTROL_REPOSITORY_ID = 1321106380
+STATE_REPOSITORY_ID = 1317964582
 _ALLOWED_DURABILITY = frozenset({"github_issue", "github_repository", "github_ref", "github_actions"})
+_APPROVED_TOKEN_PROFILES = {
+    "control": (CONTROL_REPOSITORY_ID, frozenset({"metadata:read", "contents:read", "issues:write"})),
+    "state": (STATE_REPOSITORY_ID, frozenset({"metadata:read", "contents:write"})),
+}
+_REQUIRED_TOKEN_NEGATIVES = frozenset({
+    "unscoped_token_rejected",
+    "default_token_rejected",
+    "multi_repository_token_rejected",
+    "unapproved_permission_rejected",
+    "returned_scope_mismatch_rejected",
+    "inventory_drift_blocked",
+})
 _ATTEMPT_RE = re.compile(r"^wd-(?P<run>[1-9][0-9]*)-(?P<attempt>[1-9][0-9]*)-(?P<nonce>[a-z0-9]{6,24})$")
 _FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
 
@@ -47,6 +61,8 @@ class ScenarioSpec:
             raise AdversarialContractError("INCOMPLETE_SCENARIO")
         if not self.assertions:
             raise AdversarialContractError("OBSERVATION_ONLY_SCENARIO")
+        if len(set(self.assertions)) != len(self.assertions):
+            raise AdversarialContractError("DUPLICATE_SCENARIO_ASSERTION")
         for assertion in self.assertions:
             text = assertion.strip().lower()
             if not text or text.startswith(("observe ", "print ", "inspect only")):
@@ -54,6 +70,10 @@ class ScenarioSpec:
         allowed_clients = {"git-capable", "github-api-only"}
         if any(client not in allowed_clients for client in self.client_contracts):
             raise AdversarialContractError("UNKNOWN_CLIENT_CONTRACT")
+        if len(set(self.client_contracts)) != len(self.client_contracts):
+            raise AdversarialContractError("DUPLICATE_CLIENT_CONTRACT")
+        if len(set(self.fault_controls)) != len(self.fault_controls):
+            raise AdversarialContractError("DUPLICATE_FAULT_CONTROL")
 
 
 SCENARIOS: tuple[ScenarioSpec, ...] = (
@@ -295,6 +315,61 @@ class AssertionEvidence:
 
 
 @dataclass(frozen=True)
+class FaultEvidence:
+    control: str
+    identity: str
+
+    def validate(self) -> None:
+        if not self.control or not self.identity:
+            raise AdversarialContractError("INCOMPLETE_FAULT_EVIDENCE")
+
+
+@dataclass(frozen=True)
+class ClientTranscript:
+    contract: str
+    transcript: str
+
+    def validate(self) -> None:
+        if self.contract not in {"git-capable", "github-api-only"} or not self.transcript:
+            raise AdversarialContractError("INCOMPLETE_CLIENT_TRANSCRIPT")
+
+
+@dataclass(frozen=True)
+class TokenScopeEvidence:
+    profile: str
+    requested_repository_ids: tuple[int, ...]
+    returned_repository_ids: tuple[int, ...]
+    requested_permissions: tuple[str, ...]
+    returned_permissions: tuple[str, ...]
+    restrictions_explicit: bool
+    returned_scope_validated: bool
+    cross_repository_denied: bool
+
+    def validate(self) -> None:
+        if self.profile not in _APPROVED_TOKEN_PROFILES:
+            raise AdversarialContractError("UNAPPROVED_TOKEN_PROFILE")
+        repository_id, permissions = _APPROVED_TOKEN_PROFILES[self.profile]
+        if self.requested_repository_ids != (repository_id,):
+            raise AdversarialContractError("TOKEN_REQUEST_REPOSITORY_SCOPE_MISMATCH")
+        if self.returned_repository_ids != (repository_id,):
+            raise AdversarialContractError("TOKEN_RETURNED_REPOSITORY_SCOPE_MISMATCH")
+        if len(set(self.requested_permissions)) != len(self.requested_permissions):
+            raise AdversarialContractError("DUPLICATE_REQUESTED_PERMISSION")
+        if len(set(self.returned_permissions)) != len(self.returned_permissions):
+            raise AdversarialContractError("DUPLICATE_RETURNED_PERMISSION")
+        if frozenset(self.requested_permissions) != permissions:
+            raise AdversarialContractError("TOKEN_REQUEST_PERMISSION_SCOPE_MISMATCH")
+        if frozenset(self.returned_permissions) != permissions:
+            raise AdversarialContractError("TOKEN_RETURNED_PERMISSION_SCOPE_MISMATCH")
+        if not self.restrictions_explicit:
+            raise AdversarialContractError("TOKEN_RESTRICTIONS_NOT_EXPLICIT")
+        if not self.returned_scope_validated:
+            raise AdversarialContractError("TOKEN_RETURNED_SCOPE_NOT_VALIDATED")
+        if not self.cross_repository_denied:
+            raise AdversarialContractError("CROSS_REPOSITORY_DENIAL_NOT_PROVEN")
+
+
+@dataclass(frozen=True)
 class ScenarioEvidence:
     scenario_id: int
     attempt_namespace: str
@@ -302,16 +377,28 @@ class ScenarioEvidence:
     protocol_sha: str
     workflow_run_id: int
     workflow_run_attempt: int
+    control_repository_id: int
+    state_repository_id: int
+    exit_status: int
     source_comment_ids: tuple[int, ...] = ()
     base_ref_shas: tuple[str, ...] = ()
     accepted_ref_shas: tuple[str, ...] = ()
     dolt_commits: tuple[str, ...] = ()
     canonical_rows: tuple[str, ...] = ()
     projection_urls: tuple[str, ...] = ()
-    fault_ids: tuple[str, ...] = ()
+    fault_ids: tuple[FaultEvidence, ...] = ()
     assertions: tuple[AssertionEvidence, ...] = ()
-    client_transcripts: tuple[str, ...] = ()
+    client_transcripts: tuple[ClientTranscript, ...] = ()
+    executable_blob_shas: tuple[str, ...] = ()
+    dependency_identities: tuple[str, ...] = ()
     durability_records: tuple[str, ...] = ()
+    final_owner_evidence: tuple[str, ...] = ()
+    installation_inventory_repository_ids: tuple[int, ...] = ()
+    installation_inventory_current: bool = False
+    installation_inventory_attestation: str = ""
+    token_scope_records: tuple[TokenScopeEvidence, ...] = ()
+    token_policy_negative_results: tuple[str, ...] = ()
+    network_destinations: tuple[str, ...] = ()
     cleanup_decision: str = "retain"
     limitations: tuple[str, ...] = ()
 
@@ -326,28 +413,76 @@ class ScenarioEvidence:
             raise AdversarialContractError("INVALID_AUTHORITY_SHA")
         if self.workflow_run_id <= 0 or self.workflow_run_attempt != 1:
             raise AdversarialContractError("INVALID_WORKFLOW_ATTEMPT")
+        if self.control_repository_id != CONTROL_REPOSITORY_ID or self.state_repository_id != STATE_REPOSITORY_ID:
+            raise AdversarialContractError("REPOSITORY_IDENTITY_MISMATCH")
+        if self.exit_status != 0:
+            raise AdversarialContractError("SCENARIO_EXIT_STATUS_FAILED")
         if self.cleanup_decision not in {"retain", "released", "closed"}:
             raise AdversarialContractError("INVALID_CLEANUP_DECISION")
-        if len(self.assertions) < len(spec.assertions):
-            raise AdversarialContractError("MISSING_EXECUTABLE_ASSERTIONS")
+
+        assertion_names = tuple(assertion.name for assertion in self.assertions)
+        if assertion_names != spec.assertions:
+            raise AdversarialContractError("ASSERTION_BINDING_MISMATCH")
         for assertion in self.assertions:
             assertion.validate()
-        if spec.fault_controls and not self.fault_ids:
-            raise AdversarialContractError("MISSING_FAULT_IDENTITY")
-        if spec.client_contracts and not self.client_transcripts:
-            raise AdversarialContractError("MISSING_CLIENT_TRANSCRIPT")
-        if self.scenario_id in {1, 2, 3, 8, 9, 11, 12} and not self.source_comment_ids:
+
+        fault_controls = tuple(fault.control for fault in self.fault_ids)
+        if fault_controls != spec.fault_controls:
+            raise AdversarialContractError("FAULT_EVIDENCE_BINDING_MISMATCH")
+        for fault in self.fault_ids:
+            fault.validate()
+        if len({fault.identity for fault in self.fault_ids}) != len(self.fault_ids):
+            raise AdversarialContractError("DUPLICATE_FAULT_IDENTITY")
+
+        client_contracts = tuple(transcript.contract for transcript in self.client_transcripts)
+        if client_contracts != spec.client_contracts:
+            raise AdversarialContractError("CLIENT_TRANSCRIPT_BINDING_MISMATCH")
+        for transcript in self.client_transcripts:
+            transcript.validate()
+
+        if not self.executable_blob_shas or any(not _FULL_SHA.fullmatch(sha) for sha in self.executable_blob_shas):
+            raise AdversarialContractError("MISSING_EXECUTABLE_IDENTITY")
+        if not self.dependency_identities or any(not identity for identity in self.dependency_identities):
+            raise AdversarialContractError("MISSING_DEPENDENCY_IDENTITY")
+        if not self.durability_records:
+            raise AdversarialContractError("MISSING_DURABILITY_EVIDENCE")
+        if len(set(self.durability_records)) != len(self.durability_records):
+            raise AdversarialContractError("DUPLICATE_DURABILITY_RECORD")
+        for record in self.durability_records:
+            if record not in _ALLOWED_DURABILITY:
+                raise AdversarialContractError("EXTERNAL_DURABLE_SERVICE_PRESENT")
+
+        if self.scenario_id in {1, 2, 3, 8, 9, 11, 12, 13} and not self.source_comment_ids:
             raise AdversarialContractError("MISSING_SOURCE_COMMENT_EVIDENCE")
         if self.scenario_id in {1, 2, 4, 5, 6, 7, 8, 9, 10, 12, 14}:
             if not self.base_ref_shas or not self.accepted_ref_shas or not self.dolt_commits:
                 raise AdversarialContractError("MISSING_CANONICAL_IDENTITY_EVIDENCE")
-        if self.scenario_id in {1, 2, 4, 5, 7, 8, 9, 10, 12, 14} and not self.canonical_rows:
+        if self.scenario_id in {1, 2, 4, 5, 6, 7, 8, 9, 10, 12, 14} and not self.canonical_rows:
             raise AdversarialContractError("MISSING_CANONICAL_ROW_EVIDENCE")
-        if self.scenario_id in {1, 2, 3, 5, 8, 9, 11, 12, 14} and not self.projection_urls:
+        if self.scenario_id in {1, 2, 3, 4, 5, 8, 9, 11, 12, 14} and not self.projection_urls:
             raise AdversarialContractError("MISSING_PROJECTION_EVIDENCE")
-        for record in self.durability_records:
-            if record not in _ALLOWED_DURABILITY:
-                raise AdversarialContractError("EXTERNAL_DURABLE_SERVICE_PRESENT")
+        if self.scenario_id == 6 and not self.final_owner_evidence:
+            raise AdversarialContractError("MISSING_FINAL_OWNER_EVIDENCE")
+
+        if self.scenario_id == 13:
+            if tuple(sorted(self.installation_inventory_repository_ids)) != tuple(sorted((CONTROL_REPOSITORY_ID, STATE_REPOSITORY_ID))):
+                raise AdversarialContractError("INSTALLATION_INVENTORY_MISMATCH")
+            if not self.installation_inventory_current or not self.installation_inventory_attestation:
+                raise AdversarialContractError("STALE_OR_MISSING_INSTALLATION_INVENTORY")
+            profiles = tuple(record.profile for record in self.token_scope_records)
+            if profiles != ("control", "state"):
+                raise AdversarialContractError("TOKEN_SCOPE_EVIDENCE_BINDING_MISMATCH")
+            for record in self.token_scope_records:
+                record.validate()
+            negatives = frozenset(self.token_policy_negative_results)
+            if negatives != _REQUIRED_TOKEN_NEGATIVES or len(self.token_policy_negative_results) != len(_REQUIRED_TOKEN_NEGATIVES):
+                raise AdversarialContractError("TOKEN_NEGATIVE_EVIDENCE_INCOMPLETE")
+
+        if self.scenario_id == 14:
+            if frozenset(self.durability_records) != _ALLOWED_DURABILITY or len(self.durability_records) != len(_ALLOWED_DURABILITY):
+                raise AdversarialContractError("GITHUB_DURABILITY_INVENTORY_INCOMPLETE")
+            if not self.network_destinations or any(not destination for destination in self.network_destinations):
+                raise AdversarialContractError("MISSING_NETWORK_DESTINATION_INVENTORY")
 
     def to_json(self) -> str:
         self.validate()
@@ -359,24 +494,54 @@ class ScenarioEvidence:
                 "protocol_sha": self.protocol_sha,
                 "workflow_run_id": self.workflow_run_id,
                 "workflow_run_attempt": self.workflow_run_attempt,
+                "control_repository_id": self.control_repository_id,
+                "state_repository_id": self.state_repository_id,
+                "exit_status": self.exit_status,
                 "source_comment_ids": list(self.source_comment_ids),
                 "base_ref_shas": list(self.base_ref_shas),
                 "accepted_ref_shas": list(self.accepted_ref_shas),
                 "dolt_commits": list(self.dolt_commits),
                 "canonical_rows": list(self.canonical_rows),
                 "projection_urls": list(self.projection_urls),
-                "fault_ids": list(self.fault_ids),
+                "fault_ids": [
+                    {"control": fault.control, "identity": fault.identity}
+                    for fault in self.fault_ids
+                ],
                 "assertions": [
                     {
-                        "name": a.name,
-                        "passed": a.passed,
-                        "expected": a.expected,
-                        "actual": a.actual,
+                        "name": assertion.name,
+                        "passed": assertion.passed,
+                        "expected": assertion.expected,
+                        "actual": assertion.actual,
                     }
-                    for a in self.assertions
+                    for assertion in self.assertions
                 ],
-                "client_transcripts": list(self.client_transcripts),
+                "client_transcripts": [
+                    {"contract": transcript.contract, "transcript": transcript.transcript}
+                    for transcript in self.client_transcripts
+                ],
+                "executable_blob_shas": list(self.executable_blob_shas),
+                "dependency_identities": list(self.dependency_identities),
                 "durability_records": list(self.durability_records),
+                "final_owner_evidence": list(self.final_owner_evidence),
+                "installation_inventory_repository_ids": list(self.installation_inventory_repository_ids),
+                "installation_inventory_current": self.installation_inventory_current,
+                "installation_inventory_attestation": self.installation_inventory_attestation,
+                "token_scope_records": [
+                    {
+                        "profile": record.profile,
+                        "requested_repository_ids": list(record.requested_repository_ids),
+                        "returned_repository_ids": list(record.returned_repository_ids),
+                        "requested_permissions": list(record.requested_permissions),
+                        "returned_permissions": list(record.returned_permissions),
+                        "restrictions_explicit": record.restrictions_explicit,
+                        "returned_scope_validated": record.returned_scope_validated,
+                        "cross_repository_denied": record.cross_repository_denied,
+                    }
+                    for record in self.token_scope_records
+                ],
+                "token_policy_negative_results": list(self.token_policy_negative_results),
+                "network_destinations": list(self.network_destinations),
                 "cleanup_decision": self.cleanup_decision,
                 "limitations": list(self.limitations),
             },
@@ -411,6 +576,12 @@ class ScenarioDriver:
             result = self.backend.execute(spec, namespace)
             if result.scenario_id != scenario_id:
                 raise AdversarialContractError("SCENARIO_EVIDENCE_MISMATCH")
+            if (
+                result.attempt_namespace != namespace.value
+                or result.workflow_run_id != namespace.run_id
+                or result.workflow_run_attempt != namespace.run_attempt
+            ):
+                raise AdversarialContractError("CROSS_ATTEMPT_EVIDENCE")
             result.validate()
             evidence.append(result)
         return tuple(evidence)
@@ -423,10 +594,23 @@ class EvidenceLedger:
 
     def append(self, evidence: ScenarioEvidence) -> None:
         evidence.validate()
-        if evidence.attempt_namespace != self.attempt_namespace.value:
+        if (
+            evidence.attempt_namespace != self.attempt_namespace.value
+            or evidence.workflow_run_id != self.attempt_namespace.run_id
+            or evidence.workflow_run_attempt != self.attempt_namespace.run_attempt
+        ):
             raise AdversarialContractError("CROSS_ATTEMPT_EVIDENCE")
         if evidence.scenario_id in self.records:
             raise AdversarialContractError("DUPLICATE_SCENARIO_EVIDENCE")
+        if self.records:
+            first = next(iter(self.records.values()))
+            if (
+                evidence.trusted_sha != first.trusted_sha
+                or evidence.protocol_sha != first.protocol_sha
+                or evidence.control_repository_id != first.control_repository_id
+                or evidence.state_repository_id != first.state_repository_id
+            ):
+                raise AdversarialContractError("MIXED_AUTHORITY_EVIDENCE")
         self.records[evidence.scenario_id] = evidence
 
     def finalise(self) -> tuple[ScenarioEvidence, ...]:
@@ -471,12 +655,20 @@ def evidence_summary(records: Sequence[ScenarioEvidence]) -> dict[str, object]:
         raise AdversarialContractError("INCOMPLETE_WORKSTREAM_D_EVIDENCE")
     for record in records:
         record.validate()
+    durability = {
+        durable_record
+        for record in records
+        for durable_record in record.durability_records
+    }
+    external_durable_service_present = any(
+        record not in _ALLOWED_DURABILITY for record in durability
+    )
     return {
         "protocol": PROTOCOL,
         "workstream": WORKSTREAM,
         "scenarios": len(records),
         "all_assertions_passed": True,
-        "external_durable_service_present": False,
+        "external_durable_service_present": external_durable_service_present,
         "production_approval": False,
         "workstream_e_authorised": False,
     }

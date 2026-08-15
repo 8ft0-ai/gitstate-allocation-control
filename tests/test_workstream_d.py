@@ -5,10 +5,15 @@ from phase2.adversarial import (
     AdversarialContractError,
     AssertionEvidence,
     AttemptNamespace,
+    ClientTranscript,
+    CONTROL_REPOSITORY_ID,
     EvidenceLedger,
+    FaultEvidence,
     SCENARIO_IDS,
+    STATE_REPOSITORY_ID,
     ScenarioDriver,
     ScenarioEvidence,
+    TokenScopeEvidence,
     evidence_summary,
     scenario_by_id,
     scenario_catalogue,
@@ -21,10 +26,20 @@ from phase2.canonical import LocalCanonicalRepository, StaleCanonicalBase
 
 TRUSTED_SHA = "a" * 40
 PROTOCOL_SHA = "b" * 40
+EXECUTABLE_SHA = "c" * 40
 RUN_ID = 31880000000
 RUN_ATTEMPT = 1
 NAMESPACE = f"wd-{RUN_ID}-{RUN_ATTEMPT}-abc123"
 AGENT = "agent://human/8ft0-ai/session/workstream-d"
+DURABILITY = ("github_issue", "github_repository", "github_ref", "github_actions")
+TOKEN_NEGATIVES = (
+    "unscoped_token_rejected",
+    "default_token_rejected",
+    "multi_repository_token_rejected",
+    "unapproved_permission_rejected",
+    "returned_scope_mismatch_rejected",
+    "inventory_drift_blocked",
+)
 
 
 def task(task_id: str, priority: int = 1) -> Task:
@@ -79,16 +94,35 @@ def row_count(repository: LocalCanonicalRepository, table: str) -> int:
         connection.close()
 
 
+def token_scope(profile: str) -> TokenScopeEvidence:
+    if profile == "control":
+        repository_id = CONTROL_REPOSITORY_ID
+        permissions = ("metadata:read", "contents:read", "issues:write")
+    else:
+        repository_id = STATE_REPOSITORY_ID
+        permissions = ("metadata:read", "contents:write")
+    return TokenScopeEvidence(
+        profile=profile,
+        requested_repository_ids=(repository_id,),
+        returned_repository_ids=(repository_id,),
+        requested_permissions=permissions,
+        returned_permissions=permissions,
+        restrictions_explicit=True,
+        returned_scope_validated=True,
+        cross_repository_denied=True,
+    )
+
+
 def evidence_for(scenario_id: int, *, passed: bool = True, namespace: str = NAMESPACE) -> ScenarioEvidence:
     spec = scenario_by_id(scenario_id)
     assertions = tuple(
         AssertionEvidence(assertion, passed, "protocol expectation", "matched")
         for assertion in spec.assertions
     )
-    source_comments = (1000 + scenario_id,) if scenario_id in {1, 2, 3, 8, 9, 11, 12} else ()
+    source_comments = (1000 + scenario_id,) if scenario_id in {1, 2, 3, 8, 9, 11, 12, 13} else ()
     canonical = scenario_id in {1, 2, 4, 5, 6, 7, 8, 9, 10, 12, 14}
-    rows = scenario_id in {1, 2, 4, 5, 7, 8, 9, 10, 12, 14}
-    projections = scenario_id in {1, 2, 3, 5, 8, 9, 11, 12, 14}
+    rows = scenario_id in {1, 2, 4, 5, 6, 7, 8, 9, 10, 12, 14}
+    projections = scenario_id in {1, 2, 3, 4, 5, 8, 9, 11, 12, 14}
     return ScenarioEvidence(
         scenario_id=scenario_id,
         attempt_namespace=namespace,
@@ -96,16 +130,34 @@ def evidence_for(scenario_id: int, *, passed: bool = True, namespace: str = NAME
         protocol_sha=PROTOCOL_SHA,
         workflow_run_id=RUN_ID,
         workflow_run_attempt=RUN_ATTEMPT,
+        control_repository_id=CONTROL_REPOSITORY_ID,
+        state_repository_id=STATE_REPOSITORY_ID,
+        exit_status=0,
         source_comment_ids=source_comments,
         base_ref_shas=("1" * 40,) if canonical else (),
         accepted_ref_shas=("2" * 40,) if canonical else (),
         dolt_commits=("dolt-accepted",) if canonical else (),
         canonical_rows=("row-digest",) if rows else (),
         projection_urls=("https://github.example/projection",) if projections else (),
-        fault_ids=(f"fault:{scenario_id}",) if spec.fault_controls else (),
+        fault_ids=tuple(
+            FaultEvidence(control, f"{control}:fault:{scenario_id}")
+            for control in spec.fault_controls
+        ),
         assertions=assertions,
-        client_transcripts=("clean-client-transcript",) if spec.client_contracts else (),
-        durability_records=("github_issue", "github_repository", "github_ref", "github_actions"),
+        client_transcripts=tuple(
+            ClientTranscript(contract, f"{contract}:clean-client-transcript")
+            for contract in spec.client_contracts
+        ),
+        executable_blob_shas=(EXECUTABLE_SHA,),
+        dependency_identities=("actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",),
+        durability_records=DURABILITY,
+        final_owner_evidence=("winner=allocation-a;loser=stale",) if scenario_id == 6 else (),
+        installation_inventory_repository_ids=(CONTROL_REPOSITORY_ID, STATE_REPOSITORY_ID) if scenario_id == 13 else (),
+        installation_inventory_current=scenario_id == 13,
+        installation_inventory_attestation="owner-audit:2026-08-15T08:00:00Z" if scenario_id == 13 else "",
+        token_scope_records=(token_scope("control"), token_scope("state")) if scenario_id == 13 else (),
+        token_policy_negative_results=TOKEN_NEGATIVES if scenario_id == 13 else (),
+        network_destinations=("api.github.com", "github.com") if scenario_id == 14 else (),
         cleanup_decision="retain",
         limitations=("bounded proof only",),
     )
@@ -170,6 +222,96 @@ class EvidenceTests(unittest.TestCase):
         with self.assertRaisesRegex(AdversarialContractError, "SCENARIO_ASSERTION_FAILED"):
             evidence_for(4, passed=False).validate()
 
+    def test_assertions_are_bound_one_to_one_to_protocol_requirements(self):
+        evidence = evidence_for(4)
+        duplicate = AssertionEvidence(
+            evidence.assertions[0].name,
+            True,
+            "protocol expectation",
+            "matched",
+        )
+        mutated = ScenarioEvidence(**{**evidence.__dict__, "assertions": (duplicate, duplicate)})
+        with self.assertRaisesRegex(AdversarialContractError, "ASSERTION_BINDING_MISMATCH"):
+            mutated.validate()
+
+    def test_every_fault_control_requires_its_own_identity(self):
+        evidence = evidence_for(9)
+        mutated = ScenarioEvidence(**{**evidence.__dict__, "fault_ids": evidence.fault_ids[:-1]})
+        with self.assertRaisesRegex(AdversarialContractError, "FAULT_EVIDENCE_BINDING_MISMATCH"):
+            mutated.validate()
+
+    def test_every_client_contract_requires_its_own_typed_transcript(self):
+        evidence = evidence_for(14)
+        mutated = ScenarioEvidence(**{**evidence.__dict__, "client_transcripts": evidence.client_transcripts[:1]})
+        with self.assertRaisesRegex(AdversarialContractError, "CLIENT_TRANSCRIPT_BINDING_MISMATCH"):
+            mutated.validate()
+
+    def test_executable_dependency_and_exit_status_are_required(self):
+        evidence = evidence_for(1)
+        for override, code in (
+            ({"executable_blob_shas": ()}, "MISSING_EXECUTABLE_IDENTITY"),
+            ({"dependency_identities": ()}, "MISSING_DEPENDENCY_IDENTITY"),
+            ({"exit_status": 1}, "SCENARIO_EXIT_STATUS_FAILED"),
+        ):
+            mutated = ScenarioEvidence(**{**evidence.__dict__, **override})
+            with self.assertRaisesRegex(AdversarialContractError, code):
+                mutated.validate()
+
+    def test_scenario_4_requires_repeated_projection_evidence(self):
+        evidence = evidence_for(4)
+        mutated = ScenarioEvidence(**{**evidence.__dict__, "projection_urls": ()})
+        with self.assertRaisesRegex(AdversarialContractError, "MISSING_PROJECTION_EVIDENCE"):
+            mutated.validate()
+
+    def test_scenario_6_requires_winner_canonical_and_final_owner_evidence(self):
+        evidence = evidence_for(6)
+        for override, code in (
+            ({"canonical_rows": ()}, "MISSING_CANONICAL_ROW_EVIDENCE"),
+            ({"final_owner_evidence": ()}, "MISSING_FINAL_OWNER_EVIDENCE"),
+        ):
+            mutated = ScenarioEvidence(**{**evidence.__dict__, **override})
+            with self.assertRaisesRegex(AdversarialContractError, code):
+                mutated.validate()
+
+    def test_scenario_13_requires_exact_inventory_and_token_scope_evidence(self):
+        evidence = evidence_for(13)
+        for override, code in (
+            ({"installation_inventory_repository_ids": (CONTROL_REPOSITORY_ID,)}, "INSTALLATION_INVENTORY_MISMATCH"),
+            ({"installation_inventory_current": False}, "STALE_OR_MISSING_INSTALLATION_INVENTORY"),
+            ({"token_scope_records": evidence.token_scope_records[:1]}, "TOKEN_SCOPE_EVIDENCE_BINDING_MISMATCH"),
+            ({"token_policy_negative_results": TOKEN_NEGATIVES[:-1]}, "TOKEN_NEGATIVE_EVIDENCE_INCOMPLETE"),
+        ):
+            mutated = ScenarioEvidence(**{**evidence.__dict__, **override})
+            with self.assertRaisesRegex(AdversarialContractError, code):
+                mutated.validate()
+
+    def test_token_scope_evidence_rejects_broader_or_cross_repository_access(self):
+        evidence = evidence_for(13)
+        bad_state = TokenScopeEvidence(
+            profile="state",
+            requested_repository_ids=(STATE_REPOSITORY_ID, CONTROL_REPOSITORY_ID),
+            returned_repository_ids=(STATE_REPOSITORY_ID,),
+            requested_permissions=("metadata:read", "contents:write"),
+            returned_permissions=("metadata:read", "contents:write"),
+            restrictions_explicit=True,
+            returned_scope_validated=True,
+            cross_repository_denied=True,
+        )
+        mutated = ScenarioEvidence(**{**evidence.__dict__, "token_scope_records": (token_scope("control"), bad_state)})
+        with self.assertRaisesRegex(AdversarialContractError, "TOKEN_REQUEST_REPOSITORY_SCOPE_MISMATCH"):
+            mutated.validate()
+
+    def test_scenario_14_requires_complete_github_durability_and_network_inventory(self):
+        evidence = evidence_for(14)
+        for override, code in (
+            ({"durability_records": ()}, "MISSING_DURABILITY_EVIDENCE"),
+            ({"durability_records": DURABILITY[:-1]}, "GITHUB_DURABILITY_INVENTORY_INCOMPLETE"),
+            ({"network_destinations": ()}, "MISSING_NETWORK_DESTINATION_INVENTORY"),
+        ):
+            mutated = ScenarioEvidence(**{**evidence.__dict__, **override})
+            with self.assertRaisesRegex(AdversarialContractError, code):
+                mutated.validate()
+
     def test_external_durable_service_is_rejected(self):
         evidence = evidence_for(14)
         mutated = ScenarioEvidence(
@@ -184,6 +326,26 @@ class EvidenceTests(unittest.TestCase):
         evidence = evidence_for(1, namespace=other)
         with self.assertRaises(AdversarialContractError):
             ledger.append(evidence)
+
+    def test_driver_rejects_cross_attempt_backend_evidence(self):
+        namespace = AttemptNamespace.parse(NAMESPACE, run_id=RUN_ID, run_attempt=1)
+
+        class Backend:
+            def execute(self, spec, attempt):
+                other = f"wd-{RUN_ID + 1}-1-def456"
+                return evidence_for(spec.scenario_id, namespace=other)
+
+        with self.assertRaisesRegex(AdversarialContractError, "CROSS_ATTEMPT_EVIDENCE"):
+            ScenarioDriver(Backend()).run((1,), namespace)
+
+    def test_ledger_rejects_mixed_authority(self):
+        namespace = AttemptNamespace.parse(NAMESPACE, run_id=RUN_ID, run_attempt=1)
+        ledger = EvidenceLedger(namespace)
+        ledger.append(evidence_for(1))
+        second = evidence_for(2)
+        mutated = ScenarioEvidence(**{**second.__dict__, "protocol_sha": "d" * 40})
+        with self.assertRaisesRegex(AdversarialContractError, "MIXED_AUTHORITY_EVIDENCE"):
+            ledger.append(mutated)
 
     def test_final_evidence_requires_all_fourteen_scenarios(self):
         namespace = AttemptNamespace.parse(NAMESPACE, run_id=RUN_ID, run_attempt=1)
