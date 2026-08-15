@@ -1,4 +1,5 @@
 import hashlib
+import subprocess
 import unittest
 
 from phase2.adversarial import (
@@ -30,7 +31,11 @@ from phase2.allocation_types import AllocationCommand, RequestContext, Task, sta
 from phase2.canonical import LocalCanonicalRepository, StaleCanonicalBase
 
 
-TRUSTED_SHA = "a" * 40
+def git_stdout(*args: str) -> str:
+    return subprocess.check_output(("git", *args), text=True).strip()
+
+
+TRUSTED_SHA = git_stdout("rev-parse", "HEAD")
 PROTOCOL_SHA = "b" * 40
 RUN_ID = 31880000000
 RUN_ATTEMPT = 1
@@ -108,13 +113,14 @@ def token_scope(profile: str) -> TokenScopeEvidence:
 def executable_identities(trusted_sha: str = TRUSTED_SHA) -> tuple[ExecutableIdentity, ...]:
     identities = []
     for path in sorted(REQUIRED_EXECUTABLE_PATHS):
-        blob = hashlib.sha1(path.encode()).hexdigest()
+        tree_entry = git_stdout("ls-tree", TRUSTED_SHA, "--", path)
+        blob = git_stdout("rev-parse", "--verify", f"{TRUSTED_SHA}:{path}")
         identities.append(
             ExecutableIdentity(
                 path=path,
                 blob_sha=blob,
                 commit_sha=trusted_sha,
-                trusted_tree_entry=f"100644 blob {blob}\t{path}",
+                trusted_tree_entry=tree_entry,
                 tree_object_spec=f"{trusted_sha}:{path}",
             )
         )
@@ -406,6 +412,22 @@ class EvidenceTests(unittest.TestCase):
         with self.assertRaisesRegex(AdversarialContractError, "EXECUTABLE_BLOB_NOT_IN_TRUSTED_TREE"):
             ScenarioEvidence(**{**evidence.__dict__, "executable_identities": (wrong_tree_blob,) + remaining}).validate()
 
+        fabricated_blob = "c" * 40
+        fabricated_consistent = ExecutableIdentity(
+            path=original.path,
+            blob_sha=fabricated_blob,
+            commit_sha=TRUSTED_SHA,
+            trusted_tree_entry=f"100644 blob {fabricated_blob}\t{original.path}",
+            tree_object_spec=f"{TRUSTED_SHA}:{original.path}",
+        )
+        with self.assertRaisesRegex(AdversarialContractError, "EXECUTABLE_TREE_ENTRY_NOT_FROM_TRUSTED_COMMIT"):
+            ScenarioEvidence(
+                **{
+                    **evidence.__dict__,
+                    "executable_identities": (fabricated_consistent,) + remaining,
+                }
+            ).validate()
+
         wrong_object_spec = ExecutableIdentity(
             path=original.path,
             blob_sha=original.blob_sha,
@@ -492,6 +514,7 @@ class EvidenceTests(unittest.TestCase):
         class Backend:
             def __init__(self, evidence):
                 self.evidence = evidence
+
             def execute(self, spec, attempt):
                 return self.evidence
 
