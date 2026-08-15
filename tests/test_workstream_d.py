@@ -8,9 +8,15 @@ from phase2.adversarial import (
     ClientTranscript,
     CONTROL_REPOSITORY_ID,
     EvidenceLedger,
+    ExecutableIdentity,
     FaultEvidence,
+    FinalOwnerEvidence,
+    REQUIRED_DEPENDENCY_IDENTITIES,
+    REQUIRED_EXECUTABLE_PATHS,
+    SCENARIO_13_FAULT_CONTROLS,
     SCENARIO_IDS,
     STATE_REPOSITORY_ID,
+    RepeatedResultEvidence,
     ScenarioDriver,
     ScenarioEvidence,
     TokenScopeEvidence,
@@ -26,20 +32,13 @@ from phase2.canonical import LocalCanonicalRepository, StaleCanonicalBase
 
 TRUSTED_SHA = "a" * 40
 PROTOCOL_SHA = "b" * 40
-EXECUTABLE_SHA = "c" * 40
 RUN_ID = 31880000000
 RUN_ATTEMPT = 1
 NAMESPACE = f"wd-{RUN_ID}-{RUN_ATTEMPT}-abc123"
 AGENT = "agent://human/8ft0-ai/session/workstream-d"
 DURABILITY = ("github_issue", "github_repository", "github_ref", "github_actions")
-TOKEN_NEGATIVES = (
-    "unscoped_token_rejected",
-    "default_token_rejected",
-    "multi_repository_token_rejected",
-    "unapproved_permission_rejected",
-    "returned_scope_mismatch_rejected",
-    "inventory_drift_blocked",
-)
+PROJECTION_DIGEST = hashlib.sha256(b"canonical-projection").hexdigest()
+CLIENT_DIGEST = hashlib.sha256(b"clean-client-transcript").hexdigest()
 
 
 def task(task_id: str, priority: int = 1) -> Task:
@@ -113,21 +112,62 @@ def token_scope(profile: str) -> TokenScopeEvidence:
     )
 
 
-def evidence_for(scenario_id: int, *, passed: bool = True, namespace: str = NAMESPACE) -> ScenarioEvidence:
+def executable_identities(trusted_sha: str = TRUSTED_SHA) -> tuple[ExecutableIdentity, ...]:
+    return tuple(
+        ExecutableIdentity(path, hashlib.sha1(path.encode()).hexdigest(), trusted_sha)
+        for path in sorted(REQUIRED_EXECUTABLE_PATHS)
+    )
+
+
+def evidence_for(
+    scenario_id: int,
+    *,
+    passed: bool = True,
+    namespace: str = NAMESPACE,
+    trusted_sha: str = TRUSTED_SHA,
+    protocol_sha: str = PROTOCOL_SHA,
+) -> ScenarioEvidence:
     spec = scenario_by_id(scenario_id)
     assertions = tuple(
         AssertionEvidence(assertion, passed, "protocol expectation", "matched")
         for assertion in spec.assertions
     )
-    source_comments = (1000 + scenario_id,) if scenario_id in {1, 2, 3, 8, 9, 11, 12, 13} else ()
+    source_comments = (
+        (1000 + scenario_id,)
+        if scenario_id in {1, 2, 3, 8, 9, 11, 12, 13}
+        else ()
+    )
     canonical = scenario_id in {1, 2, 4, 5, 6, 7, 8, 9, 10, 12, 14}
     rows = scenario_id in {1, 2, 4, 5, 6, 7, 8, 9, 10, 12, 14}
     projections = scenario_id in {1, 2, 3, 4, 5, 8, 9, 11, 12, 14}
+    accepted_ref = "2" * 40
+    repeated_result = None
+    if scenario_id == 4:
+        repeated_result = RepeatedResultEvidence(
+            request_id="01KWORKSTREAMDREPEATED0001",
+            original_projection_sha256=PROJECTION_DIGEST,
+            repeated_projection_sha256=PROJECTION_DIGEST,
+            canonical_ref_before=accepted_ref,
+            canonical_ref_after=accepted_ref,
+            request_rows_before=1,
+            request_rows_after=1,
+            allocation_rows_before=1,
+            allocation_rows_after=1,
+        )
+    final_owner = None
+    if scenario_id == 6:
+        final_owner = FinalOwnerEvidence(
+            winning_allocation_id="allocation-winner",
+            final_owner_allocation_id="allocation-winner",
+            stale_allocation_id="allocation-stale",
+            winning_ref_sha=accepted_ref,
+            final_ref_sha=accepted_ref,
+        )
     return ScenarioEvidence(
         scenario_id=scenario_id,
         attempt_namespace=namespace,
-        trusted_sha=TRUSTED_SHA,
-        protocol_sha=PROTOCOL_SHA,
+        trusted_sha=trusted_sha,
+        protocol_sha=protocol_sha,
         workflow_run_id=RUN_ID,
         workflow_run_attempt=RUN_ATTEMPT,
         control_repository_id=CONTROL_REPOSITORY_ID,
@@ -135,28 +175,46 @@ def evidence_for(scenario_id: int, *, passed: bool = True, namespace: str = NAME
         exit_status=0,
         source_comment_ids=source_comments,
         base_ref_shas=("1" * 40,) if canonical else (),
-        accepted_ref_shas=("2" * 40,) if canonical else (),
+        accepted_ref_shas=(accepted_ref,) if canonical else (),
         dolt_commits=("dolt-accepted",) if canonical else (),
         canonical_rows=("row-digest",) if rows else (),
         projection_urls=("https://github.example/projection",) if projections else (),
         fault_ids=tuple(
-            FaultEvidence(control, f"{control}:fault:{scenario_id}")
+            FaultEvidence(
+                control=control,
+                identity=f"{NAMESPACE}:{scenario_id}:{control}",
+                passed=True,
+                expected_outcome=f"{control}:blocked-or-injected",
+                actual_outcome=f"{control}:blocked-or-injected",
+            )
             for control in spec.fault_controls
         ),
         assertions=assertions,
         client_transcripts=tuple(
-            ClientTranscript(contract, f"{contract}:clean-client-transcript")
+            ClientTranscript(
+                contract=contract,
+                transcript_sha256=CLIENT_DIGEST,
+                clean_environment=True,
+            )
             for contract in spec.client_contracts
         ),
-        executable_blob_shas=(EXECUTABLE_SHA,),
-        dependency_identities=("actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",),
+        executable_identities=executable_identities(trusted_sha),
+        dependency_identities=REQUIRED_DEPENDENCY_IDENTITIES,
         durability_records=DURABILITY,
-        final_owner_evidence=("winner=allocation-a;loser=stale",) if scenario_id == 6 else (),
-        installation_inventory_repository_ids=(CONTROL_REPOSITORY_ID, STATE_REPOSITORY_ID) if scenario_id == 13 else (),
+        repeated_result=repeated_result,
+        final_owner=final_owner,
+        installation_inventory_repository_ids=(
+            (CONTROL_REPOSITORY_ID, STATE_REPOSITORY_ID)
+            if scenario_id == 13
+            else ()
+        ),
         installation_inventory_current=scenario_id == 13,
-        installation_inventory_attestation="owner-audit:2026-08-15T08:00:00Z" if scenario_id == 13 else "",
-        token_scope_records=(token_scope("control"), token_scope("state")) if scenario_id == 13 else (),
-        token_policy_negative_results=TOKEN_NEGATIVES if scenario_id == 13 else (),
+        installation_inventory_attestation=(
+            "owner-audit:2026-08-15T08:00:00Z" if scenario_id == 13 else ""
+        ),
+        token_scope_records=(
+            (token_scope("control"), token_scope("state")) if scenario_id == 13 else ()
+        ),
         network_destinations=("api.github.com", "github.com") if scenario_id == 14 else (),
         cleanup_decision="retain",
         limitations=("bounded proof only",),
@@ -174,10 +232,19 @@ class CatalogueTests(unittest.TestCase):
         with self.assertRaisesRegex(AdversarialContractError, "UNAPPROVED_SCENARIO"):
             scenario_by_id(15)
 
+    def test_scenario_13_fault_controls_are_individual_not_umbrella(self):
+        spec = scenario_by_id(13)
+        self.assertEqual(spec.fault_controls, SCENARIO_13_FAULT_CONTROLS)
+        self.assertGreaterEqual(len(spec.fault_controls), 20)
+        self.assertNotIn("static_identity_negative", spec.fault_controls)
+        self.assertNotIn("token_scope_negative", spec.fault_controls)
+
     def test_attempt_namespace_is_bound_to_run_and_first_attempt(self):
         parsed = AttemptNamespace.parse(NAMESPACE, run_id=RUN_ID, run_attempt=1)
         self.assertEqual(parsed.qualify("task-a"), f"{NAMESPACE}:task-a")
-        with self.assertRaisesRegex(AdversarialContractError, "ATTEMPT_NAMESPACE_MISMATCH"):
+        with self.assertRaisesRegex(
+            AdversarialContractError, "ATTEMPT_NAMESPACE_MISMATCH"
+        ):
             AttemptNamespace.parse(NAMESPACE, run_id=RUN_ID + 1, run_attempt=1)
 
     def test_live_gate_is_manual_trusted_main_first_attempt_and_explicitly_enabled(self):
@@ -219,67 +286,168 @@ class EvidenceTests(unittest.TestCase):
                 evidence_for(scenario_id).validate()
 
     def test_failed_assertion_fails_closed(self):
-        with self.assertRaisesRegex(AdversarialContractError, "SCENARIO_ASSERTION_FAILED"):
+        with self.assertRaisesRegex(
+            AdversarialContractError, "SCENARIO_ASSERTION_FAILED"
+        ):
             evidence_for(4, passed=False).validate()
 
     def test_assertions_are_bound_one_to_one_to_protocol_requirements(self):
         evidence = evidence_for(4)
-        duplicate = AssertionEvidence(
-            evidence.assertions[0].name,
-            True,
-            "protocol expectation",
-            "matched",
+        mutated = ScenarioEvidence(
+            **{**evidence.__dict__, "assertions": evidence.assertions[:-1]}
         )
-        mutated = ScenarioEvidence(**{**evidence.__dict__, "assertions": (duplicate, duplicate)})
-        with self.assertRaisesRegex(AdversarialContractError, "ASSERTION_BINDING_MISMATCH"):
+        with self.assertRaisesRegex(
+            AdversarialContractError, "ASSERTION_BINDING_MISMATCH"
+        ):
             mutated.validate()
 
-    def test_every_fault_control_requires_its_own_identity(self):
-        evidence = evidence_for(9)
-        mutated = ScenarioEvidence(**{**evidence.__dict__, "fault_ids": evidence.fault_ids[:-1]})
-        with self.assertRaisesRegex(AdversarialContractError, "FAULT_EVIDENCE_BINDING_MISMATCH"):
+    def test_every_fault_control_requires_its_own_passing_identity(self):
+        evidence = evidence_for(13)
+        mutated = ScenarioEvidence(
+            **{**evidence.__dict__, "fault_ids": evidence.fault_ids[:-1]}
+        )
+        with self.assertRaisesRegex(
+            AdversarialContractError, "FAULT_EVIDENCE_BINDING_MISMATCH"
+        ):
+            mutated.validate()
+        failed = FaultEvidence(
+            control=evidence.fault_ids[0].control,
+            identity=evidence.fault_ids[0].identity,
+            passed=False,
+            expected_outcome="blocked",
+            actual_outcome="unexpectedly passed",
+        )
+        mutated = ScenarioEvidence(
+            **{
+                **evidence.__dict__,
+                "fault_ids": (failed,) + evidence.fault_ids[1:],
+            }
+        )
+        with self.assertRaisesRegex(AdversarialContractError, "FAULT_OUTCOME_FAILED"):
             mutated.validate()
 
-    def test_every_client_contract_requires_its_own_typed_transcript(self):
+    def test_every_client_contract_requires_clean_typed_transcript(self):
         evidence = evidence_for(14)
-        mutated = ScenarioEvidence(**{**evidence.__dict__, "client_transcripts": evidence.client_transcripts[:1]})
-        with self.assertRaisesRegex(AdversarialContractError, "CLIENT_TRANSCRIPT_BINDING_MISMATCH"):
+        mutated = ScenarioEvidence(
+            **{
+                **evidence.__dict__,
+                "client_transcripts": evidence.client_transcripts[:1],
+            }
+        )
+        with self.assertRaisesRegex(
+            AdversarialContractError, "CLIENT_TRANSCRIPT_BINDING_MISMATCH"
+        ):
             mutated.validate()
 
-    def test_executable_dependency_and_exit_status_are_required(self):
+    def test_executable_identities_are_bound_to_trusted_commit_and_baseline_paths(self):
         evidence = evidence_for(1)
-        for override, code in (
-            ({"executable_blob_shas": ()}, "MISSING_EXECUTABLE_IDENTITY"),
-            ({"dependency_identities": ()}, "MISSING_DEPENDENCY_IDENTITY"),
-            ({"exit_status": 1}, "SCENARIO_EXIT_STATUS_FAILED"),
+        wrong = ExecutableIdentity(
+            path="phase2/adversarial.py",
+            blob_sha="c" * 40,
+            commit_sha="d" * 40,
+        )
+        remaining = tuple(
+            identity
+            for identity in evidence.executable_identities
+            if identity.path != "phase2/adversarial.py"
+        )
+        mutated = ScenarioEvidence(
+            **{
+                **evidence.__dict__,
+                "executable_identities": (wrong,) + remaining,
+            }
+        )
+        with self.assertRaisesRegex(
+            AdversarialContractError, "EXECUTABLE_NOT_BOUND_TO_TRUSTED_COMMIT"
         ):
-            mutated = ScenarioEvidence(**{**evidence.__dict__, **override})
-            with self.assertRaisesRegex(AdversarialContractError, code):
-                mutated.validate()
-
-    def test_scenario_4_requires_repeated_projection_evidence(self):
-        evidence = evidence_for(4)
-        mutated = ScenarioEvidence(**{**evidence.__dict__, "projection_urls": ()})
-        with self.assertRaisesRegex(AdversarialContractError, "MISSING_PROJECTION_EVIDENCE"):
+            mutated.validate()
+        mutated = ScenarioEvidence(
+            **{
+                **evidence.__dict__,
+                "executable_identities": evidence.executable_identities[:1],
+            }
+        )
+        with self.assertRaisesRegex(
+            AdversarialContractError, "INCOMPLETE_EXECUTABLE_INVENTORY"
+        ):
             mutated.validate()
 
-    def test_scenario_6_requires_winner_canonical_and_final_owner_evidence(self):
-        evidence = evidence_for(6)
-        for override, code in (
-            ({"canonical_rows": ()}, "MISSING_CANONICAL_ROW_EVIDENCE"),
-            ({"final_owner_evidence": ()}, "MISSING_FINAL_OWNER_EVIDENCE"),
+    def test_dependency_identity_set_is_exact_and_complete(self):
+        evidence = evidence_for(1)
+        mutated = ScenarioEvidence(
+            **{
+                **evidence.__dict__,
+                "dependency_identities": REQUIRED_DEPENDENCY_IDENTITIES[:-1],
+            }
+        )
+        with self.assertRaisesRegex(
+            AdversarialContractError, "DEPENDENCY_IDENTITY_SET_MISMATCH"
         ):
-            mutated = ScenarioEvidence(**{**evidence.__dict__, **override})
-            with self.assertRaisesRegex(AdversarialContractError, code):
-                mutated.validate()
+            mutated.validate()
+        mutated = ScenarioEvidence(
+            **{
+                **evidence.__dict__,
+                "dependency_identities": REQUIRED_DEPENDENCY_IDENTITIES + ("unpinned",),
+            }
+        )
+        with self.assertRaisesRegex(
+            AdversarialContractError, "DEPENDENCY_IDENTITY_SET_MISMATCH"
+        ):
+            mutated.validate()
 
-    def test_scenario_13_requires_exact_inventory_and_token_scope_evidence(self):
+    def test_scenario_4_requires_exact_repeated_projection_and_nonmutation(self):
+        evidence = evidence_for(4)
+        missing = ScenarioEvidence(**{**evidence.__dict__, "repeated_result": None})
+        with self.assertRaisesRegex(
+            AdversarialContractError, "MISSING_REPEATED_RESULT_EVIDENCE"
+        ):
+            missing.validate()
+        bad = RepeatedResultEvidence(
+            **{
+                **evidence.repeated_result.__dict__,
+                "repeated_projection_sha256": hashlib.sha256(b"different").hexdigest(),
+            }
+        )
+        mutated = ScenarioEvidence(**{**evidence.__dict__, "repeated_result": bad})
+        with self.assertRaisesRegex(
+            AdversarialContractError, "REPEATED_RESULT_PROJECTION_MISMATCH"
+        ):
+            mutated.validate()
+
+    def test_scenario_6_requires_final_owner_to_match_winner_and_ref(self):
+        evidence = evidence_for(6)
+        missing = ScenarioEvidence(**{**evidence.__dict__, "final_owner": None})
+        with self.assertRaisesRegex(
+            AdversarialContractError, "MISSING_FINAL_OWNER_EVIDENCE"
+        ):
+            missing.validate()
+        bad = FinalOwnerEvidence(
+            **{
+                **evidence.final_owner.__dict__,
+                "final_owner_allocation_id": "allocation-stale",
+            }
+        )
+        mutated = ScenarioEvidence(**{**evidence.__dict__, "final_owner": bad})
+        with self.assertRaisesRegex(
+            AdversarialContractError, "FINAL_OWNER_DOES_NOT_MATCH_WINNER"
+        ):
+            mutated.validate()
+
+    def test_scenario_13_requires_exact_inventory_and_token_scope(self):
         evidence = evidence_for(13)
         for override, code in (
-            ({"installation_inventory_repository_ids": (CONTROL_REPOSITORY_ID,)}, "INSTALLATION_INVENTORY_MISMATCH"),
-            ({"installation_inventory_current": False}, "STALE_OR_MISSING_INSTALLATION_INVENTORY"),
-            ({"token_scope_records": evidence.token_scope_records[:1]}, "TOKEN_SCOPE_EVIDENCE_BINDING_MISMATCH"),
-            ({"token_policy_negative_results": TOKEN_NEGATIVES[:-1]}, "TOKEN_NEGATIVE_EVIDENCE_INCOMPLETE"),
+            (
+                {"installation_inventory_repository_ids": (CONTROL_REPOSITORY_ID,)},
+                "INSTALLATION_INVENTORY_MISMATCH",
+            ),
+            (
+                {"installation_inventory_current": False},
+                "STALE_OR_MISSING_INSTALLATION_INVENTORY",
+            ),
+            (
+                {"token_scope_records": evidence.token_scope_records[:1]},
+                "TOKEN_SCOPE_EVIDENCE_BINDING_MISMATCH",
+            ),
         ):
             mutated = ScenarioEvidence(**{**evidence.__dict__, **override})
             with self.assertRaisesRegex(AdversarialContractError, code):
@@ -297,16 +465,29 @@ class EvidenceTests(unittest.TestCase):
             returned_scope_validated=True,
             cross_repository_denied=True,
         )
-        mutated = ScenarioEvidence(**{**evidence.__dict__, "token_scope_records": (token_scope("control"), bad_state)})
-        with self.assertRaisesRegex(AdversarialContractError, "TOKEN_REQUEST_REPOSITORY_SCOPE_MISMATCH"):
+        mutated = ScenarioEvidence(
+            **{
+                **evidence.__dict__,
+                "token_scope_records": (token_scope("control"), bad_state),
+            }
+        )
+        with self.assertRaisesRegex(
+            AdversarialContractError, "TOKEN_REQUEST_REPOSITORY_SCOPE_MISMATCH"
+        ):
             mutated.validate()
 
     def test_scenario_14_requires_complete_github_durability_and_network_inventory(self):
         evidence = evidence_for(14)
         for override, code in (
             ({"durability_records": ()}, "MISSING_DURABILITY_EVIDENCE"),
-            ({"durability_records": DURABILITY[:-1]}, "GITHUB_DURABILITY_INVENTORY_INCOMPLETE"),
-            ({"network_destinations": ()}, "MISSING_NETWORK_DESTINATION_INVENTORY"),
+            (
+                {"durability_records": DURABILITY[:-1]},
+                "GITHUB_DURABILITY_INVENTORY_INCOMPLETE",
+            ),
+            (
+                {"network_destinations": ()},
+                "MISSING_NETWORK_DESTINATION_INVENTORY",
+            ),
         ):
             mutated = ScenarioEvidence(**{**evidence.__dict__, **override})
             with self.assertRaisesRegex(AdversarialContractError, code):
@@ -315,52 +496,99 @@ class EvidenceTests(unittest.TestCase):
     def test_external_durable_service_is_rejected(self):
         evidence = evidence_for(14)
         mutated = ScenarioEvidence(
-            **{**evidence.__dict__, "durability_records": evidence.durability_records + ("external_database",)}
+            **{
+                **evidence.__dict__,
+                "durability_records": evidence.durability_records
+                + ("external_database",),
+            }
         )
-        with self.assertRaisesRegex(AdversarialContractError, "EXTERNAL_DURABLE_SERVICE_PRESENT"):
+        with self.assertRaisesRegex(
+            AdversarialContractError, "EXTERNAL_DURABLE_SERVICE_PRESENT"
+        ):
             mutated.validate()
 
-    def test_cross_attempt_evidence_is_rejected(self):
-        ledger = EvidenceLedger(AttemptNamespace.parse(NAMESPACE, run_id=RUN_ID, run_attempt=1))
-        other = f"wd-{RUN_ID + 1}-1-def456"
-        evidence = evidence_for(1, namespace=other)
-        with self.assertRaises(AdversarialContractError):
-            ledger.append(evidence)
-
-    def test_driver_rejects_cross_attempt_backend_evidence(self):
+    def test_driver_binds_backend_evidence_to_attempt_and_authorised_shas(self):
         namespace = AttemptNamespace.parse(NAMESPACE, run_id=RUN_ID, run_attempt=1)
 
         class Backend:
+            def __init__(self, evidence):
+                self.evidence = evidence
+
             def execute(self, spec, attempt):
-                other = f"wd-{RUN_ID + 1}-1-def456"
-                return evidence_for(spec.scenario_id, namespace=other)
+                return self.evidence
 
+        with self.assertRaisesRegex(
+            AdversarialContractError, "UNAUTHORISED_EVIDENCE_AUTHORITY"
+        ):
+            ScenarioDriver(
+                Backend(evidence_for(1, trusted_sha="d" * 40))
+            ).run(
+                (1,),
+                namespace,
+                expected_trusted_sha=TRUSTED_SHA,
+                expected_protocol_sha=PROTOCOL_SHA,
+            )
+
+        other = f"wd-{RUN_ID + 1}-1-def456"
         with self.assertRaisesRegex(AdversarialContractError, "CROSS_ATTEMPT_EVIDENCE"):
-            ScenarioDriver(Backend()).run((1,), namespace)
+            ScenarioDriver(
+                Backend(evidence_for(1, namespace=other))
+            ).run(
+                (1,),
+                namespace,
+                expected_trusted_sha=TRUSTED_SHA,
+                expected_protocol_sha=PROTOCOL_SHA,
+            )
 
-    def test_ledger_rejects_mixed_authority(self):
+    def test_ledger_rejects_first_record_with_arbitrary_well_formed_authority(self):
         namespace = AttemptNamespace.parse(NAMESPACE, run_id=RUN_ID, run_attempt=1)
-        ledger = EvidenceLedger(namespace)
-        ledger.append(evidence_for(1))
-        second = evidence_for(2)
-        mutated = ScenarioEvidence(**{**second.__dict__, "protocol_sha": "d" * 40})
-        with self.assertRaisesRegex(AdversarialContractError, "MIXED_AUTHORITY_EVIDENCE"):
-            ledger.append(mutated)
+        ledger = EvidenceLedger(
+            namespace,
+            expected_trusted_sha=TRUSTED_SHA,
+            expected_protocol_sha=PROTOCOL_SHA,
+        )
+        with self.assertRaisesRegex(
+            AdversarialContractError, "UNAUTHORISED_EVIDENCE_AUTHORITY"
+        ):
+            ledger.append(evidence_for(1, trusted_sha="d" * 40))
 
-    def test_final_evidence_requires_all_fourteen_scenarios(self):
+    def test_final_summary_revalidates_same_attempt_and_exact_authority(self):
         namespace = AttemptNamespace.parse(NAMESPACE, run_id=RUN_ID, run_attempt=1)
-        ledger = EvidenceLedger(namespace)
-        for scenario_id in SCENARIO_IDS[:-1]:
-            ledger.append(evidence_for(scenario_id))
-        with self.assertRaisesRegex(AdversarialContractError, "INCOMPLETE_WORKSTREAM_D_EVIDENCE"):
-            ledger.finalise()
-        ledger.append(evidence_for(14))
-        records = ledger.finalise()
-        summary = evidence_summary(records)
+        records = [evidence_for(scenario_id) for scenario_id in SCENARIO_IDS]
+        summary = evidence_summary(
+            records,
+            attempt_namespace=namespace,
+            expected_trusted_sha=TRUSTED_SHA,
+            expected_protocol_sha=PROTOCOL_SHA,
+        )
         self.assertTrue(summary["all_assertions_passed"])
         self.assertFalse(summary["external_durable_service_present"])
         self.assertFalse(summary["production_approval"])
         self.assertFalse(summary["workstream_e_authorised"])
+
+        records[5] = evidence_for(6, protocol_sha="d" * 40)
+        with self.assertRaisesRegex(
+            AdversarialContractError, "UNAUTHORISED_EVIDENCE_AUTHORITY"
+        ):
+            evidence_summary(
+                records,
+                attempt_namespace=namespace,
+                expected_trusted_sha=TRUSTED_SHA,
+                expected_protocol_sha=PROTOCOL_SHA,
+            )
+
+    def test_final_evidence_requires_all_fourteen_scenarios(self):
+        namespace = AttemptNamespace.parse(NAMESPACE, run_id=RUN_ID, run_attempt=1)
+        records = [evidence_for(scenario_id) for scenario_id in SCENARIO_IDS[:-1]]
+        with self.assertRaisesRegex(
+            AdversarialContractError, "INCOMPLETE_WORKSTREAM_D_EVIDENCE"
+        ):
+            evidence_summary(
+                records,
+                attempt_namespace=namespace,
+                expected_trusted_sha=TRUSTED_SHA,
+                expected_protocol_sha=PROTOCOL_SHA,
+            )
 
     def test_driver_rejects_duplicate_scenario_and_backend_mismatch(self):
         namespace = AttemptNamespace.parse(NAMESPACE, run_id=RUN_ID, run_attempt=1)
@@ -371,9 +599,21 @@ class EvidenceTests(unittest.TestCase):
 
         driver = ScenarioDriver(Backend())
         with self.assertRaisesRegex(AdversarialContractError, "DUPLICATE_SCENARIO"):
-            driver.run((1, 1), namespace)
-        with self.assertRaisesRegex(AdversarialContractError, "SCENARIO_EVIDENCE_MISMATCH"):
-            driver.run((2,), namespace)
+            driver.run(
+                (1, 1),
+                namespace,
+                expected_trusted_sha=TRUSTED_SHA,
+                expected_protocol_sha=PROTOCOL_SHA,
+            )
+        with self.assertRaisesRegex(
+            AdversarialContractError, "SCENARIO_EVIDENCE_MISMATCH"
+        ):
+            driver.run(
+                (2,),
+                namespace,
+                expected_trusted_sha=TRUSTED_SHA,
+                expected_protocol_sha=PROTOCOL_SHA,
+            )
 
 
 class AcceptedSemanticsRegressionTests(unittest.TestCase):
@@ -382,7 +622,9 @@ class AcceptedSemanticsRegressionTests(unittest.TestCase):
     def test_scenario_1_distinct_allocate_next_results_are_deterministic(self):
         repository = LocalCanonicalRepository()
         seed_local_fixture(repository, [task("task-a", 1), task("task-b", 2)])
-        service = AllocationService(repository, clock=lambda: "2026-08-15T00:00:00Z")
+        service = AllocationService(
+            repository, clock=lambda: "2026-08-15T00:00:00Z"
+        )
         first = service.process(command("s1-a", "ALLOCATE_NEXT"), context(101))
         second = service.process(command("s1-b", "ALLOCATE_NEXT"), context(102))
         self.assertEqual((first.status, second.status), ("ALLOCATED", "ALLOCATED"))
@@ -393,17 +635,28 @@ class AcceptedSemanticsRegressionTests(unittest.TestCase):
     def test_scenario_2_same_task_cannot_have_two_active_owners(self):
         repository = LocalCanonicalRepository()
         seed_local_fixture(repository, [task("task-only")])
-        service = AllocationService(repository, clock=lambda: "2026-08-15T00:00:00Z")
-        first = service.process(command("s2-a", "ALLOCATE_TASK", task_id="task-only"), context(201))
-        second = service.process(command("s2-b", "ALLOCATE_TASK", task_id="task-only"), context(202))
+        service = AllocationService(
+            repository, clock=lambda: "2026-08-15T00:00:00Z"
+        )
+        first = service.process(
+            command("s2-a", "ALLOCATE_TASK", task_id="task-only"), context(201)
+        )
+        second = service.process(
+            command("s2-b", "ALLOCATE_TASK", task_id="task-only"), context(202)
+        )
         self.assertEqual(first.status, "ALLOCATED")
-        self.assertEqual((second.status, second.reason_code), ("REJECTED", "TASK_ALREADY_ALLOCATED"))
+        self.assertEqual(
+            (second.status, second.reason_code),
+            ("REJECTED", "TASK_ALREADY_ALLOCATED"),
+        )
         self.assertEqual(row_count(repository, "active_task_allocations"), 1)
 
     def test_scenario_4_duplicate_delivery_does_not_advance_canonical_ref(self):
         repository = LocalCanonicalRepository()
         seed_local_fixture(repository, [task("task-idempotent")])
-        service = AllocationService(repository, clock=lambda: "2026-08-15T00:00:00Z")
+        service = AllocationService(
+            repository, clock=lambda: "2026-08-15T00:00:00Z"
+        )
         request = command("s4", "ALLOCATE_TASK", task_id="task-idempotent")
         first = service.process(request, context(401))
         accepted = repository.identity
@@ -415,7 +668,9 @@ class AcceptedSemanticsRegressionTests(unittest.TestCase):
     def test_scenario_5_payload_mismatch_is_non_mutating(self):
         repository = LocalCanonicalRepository()
         seed_local_fixture(repository, [task("task-payload")])
-        service = AllocationService(repository, clock=lambda: "2026-08-15T00:00:00Z")
+        service = AllocationService(
+            repository, clock=lambda: "2026-08-15T00:00:00Z"
+        )
         original = command("s5", "ALLOCATE_TASK", task_id="task-payload")
         granted = service.process(original, context(501))
         accepted = repository.identity
@@ -428,7 +683,10 @@ class AcceptedSemanticsRegressionTests(unittest.TestCase):
         )
         rejected = service.process(mismatch, context(502))
         self.assertEqual(granted.status, "ALLOCATED")
-        self.assertEqual((rejected.status, rejected.reason_code), ("REJECTED", "REQUEST_ID_PAYLOAD_MISMATCH"))
+        self.assertEqual(
+            (rejected.status, rejected.reason_code),
+            ("REJECTED", "REQUEST_ID_PAYLOAD_MISMATCH"),
+        )
         self.assertEqual(repository.identity, accepted)
         self.assertEqual(row_count(repository, "allocations"), 1)
 
@@ -437,7 +695,9 @@ class AcceptedSemanticsRegressionTests(unittest.TestCase):
         writer_a = repository.bootstrap()
         writer_b = repository.bootstrap()
         try:
-            self.assertEqual(writer_a.identity.git_ref_sha, writer_b.identity.git_ref_sha)
+            self.assertEqual(
+                writer_a.identity.git_ref_sha, writer_b.identity.git_ref_sha
+            )
             writer_a.connection.execute(
                 "INSERT INTO beads_tasks(task_id, task_type, status, assignee, priority, created_at, ready, blocked, labels_json) "
                 "VALUES ('writer-a','task','open',NULL,1,'2026-08-15T00:00:00Z',1,0,'[]')"
@@ -459,17 +719,30 @@ class AcceptedSemanticsRegressionTests(unittest.TestCase):
         seed_local_fixture(repository, [task("task-fail-push")])
         before = repository.identity
         repository.fail_next_pushes(1)
-        service = AllocationService(repository, clock=lambda: "2026-08-15T00:00:00Z")
-        result = service.process(command("s7", "ALLOCATE_TASK", task_id="task-fail-push"), context(701))
-        self.assertEqual((result.status, result.reason_code), ("REJECTED", "CANONICAL_PUSH_FAILED"))
+        service = AllocationService(
+            repository, clock=lambda: "2026-08-15T00:00:00Z"
+        )
+        result = service.process(
+            command("s7", "ALLOCATE_TASK", task_id="task-fail-push"),
+            context(701),
+        )
+        self.assertEqual(
+            (result.status, result.reason_code),
+            ("REJECTED", "CANONICAL_PUSH_FAILED"),
+        )
         self.assertEqual(repository.identity, before)
         self.assertEqual(row_count(repository, "allocations"), 0)
 
     def test_scenario_12_release_preserves_history_and_clears_active_uniqueness(self):
         repository = LocalCanonicalRepository()
         seed_local_fixture(repository, [task("task-release")])
-        service = AllocationService(repository, clock=lambda: "2026-08-15T00:00:00Z")
-        granted = service.process(command("s12-grant", "ALLOCATE_TASK", task_id="task-release"), context(1201))
+        service = AllocationService(
+            repository, clock=lambda: "2026-08-15T00:00:00Z"
+        )
+        granted = service.process(
+            command("s12-grant", "ALLOCATE_TASK", task_id="task-release"),
+            context(1201),
+        )
         self.assertEqual(granted.status, "ALLOCATED")
         release = service.process(
             command(
