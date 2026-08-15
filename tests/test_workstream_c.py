@@ -348,21 +348,44 @@ class ReconciliationTests(unittest.TestCase):
 
     def test_posted_state_with_missing_durable_projection_event_is_repaired(self):
         fixture = Fixture()
-        gateway = FakeGateway([fixture.source])
-        fixture.reconciler(gateway).reconcile("run-event-initial")
-        projection = next(
-            comment for comment in gateway.comments if parse_projection(comment.body) is not None
+        anchored = AllocationService(fixture.repository, clock=lambda: NOW).record_anchor(
+            fixture.command.request_id,
+            fixture.creation_identity.git_ref_sha,
+            fixture.creation_identity.dolt_commit,
         )
+        self.assertEqual(anchored.status, "ALLOCATED")
         snapshot = fixture.repository.bootstrap()
         snapshot.connection.execute(
-            "DELETE FROM allocation_events WHERE request_id = ? AND event_type = 'PROJECTION_POSTED'",
+            """UPDATE allocation_requests SET projection_status = 'POSTED',
+               reconciliation_status = 'NONE' WHERE request_id = ?""",
             (fixture.command.request_id,),
         )
         fixture.repository.publish(snapshot.identity.git_ref_sha, snapshot)
         snapshot.close()
+        visible_projection = CanonicalProjection(
+            request_id=fixture.command.request_id,
+            result_status="ALLOCATED",
+            reason_code="ALLOCATED",
+            agent_id=AGENT,
+            source_repository=CONTROL_REPOSITORY,
+            source_issue_number=ISSUE,
+            source_comment_id=fixture.source.comment_id,
+            canonical_git_ref_sha=fixture.creation_identity.git_ref_sha,
+            canonical_dolt_commit=fixture.creation_identity.dolt_commit,
+            allocation_id=fixture.result.allocation_id,
+            task_id=fixture.result.task_id,
+            task_summary="Summary for task-a",
+            grant_timestamp=NOW,
+        )
+        projection_comment = DurableComment(
+            1000,
+            render_projection(visible_projection),
+            f"https://github.example/{CONTROL_REPOSITORY}/issues/{ISSUE}#issuecomment-1000",
+        )
+        gateway = FakeGateway([fixture.source, projection_comment])
 
         summary = fixture.reconciler(gateway).reconcile("run-event-repair")
-        self.assertIn(projection.comment_id, summary.projections_repaired)
+        self.assertIn(projection_comment.comment_id, summary.projections_repaired)
         repaired_events = rows(
             fixture.repository,
             """SELECT details_json FROM allocation_events WHERE request_id = ?
@@ -371,7 +394,7 @@ class ReconciliationTests(unittest.TestCase):
         )
         self.assertTrue(
             any(
-                json.loads(event["details_json"])["comment_id"] == projection.comment_id
+                json.loads(event["details_json"])["comment_id"] == projection_comment.comment_id
                 for event in repaired_events
             )
         )
