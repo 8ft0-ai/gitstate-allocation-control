@@ -76,4 +76,4 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          "$RUNTIME_PYTHON" tests/integration_workstream_b_runtime.py
+          PYTHONPATH=. "$RUNTIME_PYTHON" tests/integration_workstream_b_runtime.py
