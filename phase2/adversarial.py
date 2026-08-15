@@ -1,7 +1,7 @@
 """Workstream D adversarial integration contract and evidence machinery.
 
 This module is credential-free by default. It defines the immutable scenario
-catalogue, attempt isolation rules, fault controls, evidence schema and the
+catalogue, attempt isolation rules, exact fault controls, evidence schema and
 fail-closed driver used by PR validation and the later trusted-main execution
 gate. It does not mint credentials or mutate GitHub/canonical state.
 """
@@ -19,21 +19,57 @@ WORKSTREAM = "D"
 SCENARIO_IDS = tuple(range(1, 15))
 CONTROL_REPOSITORY_ID = 1321106380
 STATE_REPOSITORY_ID = 1317964582
-_ALLOWED_DURABILITY = frozenset({"github_issue", "github_repository", "github_ref", "github_actions"})
+
+_ALLOWED_DURABILITY = frozenset(
+    {"github_issue", "github_repository", "github_ref", "github_actions"}
+)
 _APPROVED_TOKEN_PROFILES = {
-    "control": (CONTROL_REPOSITORY_ID, frozenset({"metadata:read", "contents:read", "issues:write"})),
-    "state": (STATE_REPOSITORY_ID, frozenset({"metadata:read", "contents:write"})),
+    "control": (
+        CONTROL_REPOSITORY_ID,
+        frozenset({"metadata:read", "contents:read", "issues:write"}),
+    ),
+    "state": (
+        STATE_REPOSITORY_ID,
+        frozenset({"metadata:read", "contents:write"}),
+    ),
 }
-_REQUIRED_TOKEN_NEGATIVES = frozenset({
-    "unscoped_token_rejected",
-    "default_token_rejected",
-    "multi_repository_token_rejected",
-    "unapproved_permission_rejected",
-    "returned_scope_mismatch_rejected",
-    "inventory_drift_blocked",
-})
-_ATTEMPT_RE = re.compile(r"^wd-(?P<run>[1-9][0-9]*)-(?P<attempt>[1-9][0-9]*)-(?P<nonce>[a-z0-9]{6,24})$")
+REQUIRED_DEPENDENCY_IDENTITIES = (
+    "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+    "beads@v1.1.0#sha256=b0f3dd607c3fb989ee08d0a6854fba80d0402971eb108f9af6170bc14d491a34",
+    "dolt@v2.1.4#sha256=f3bd2329fc469d9d557af377dc36280da2c4ed13315cc2e4a82fe2b5ae682929",
+    "PyMySQL==1.1.2#sha256=e6b1d89711dd51f8f74b1631fe08f039e7d76cf67a42a323d3178f0f25762ed9",
+)
+REQUIRED_EXECUTABLE_PATHS = frozenset(
+    {".github/workflows/phase2-adversarial.yml", "phase2/adversarial.py"}
+)
+SCENARIO_13_FAULT_CONTROLS = (
+    "missing_comment_app_attribution",
+    "wrong_comment_app_id",
+    "wrong_comment_app_slug",
+    "wrong_bot_id",
+    "wrong_bot_login",
+    "wrong_installation_mapping",
+    "lost_control_repository_access",
+    "misleading_event_installation",
+    "human_namespace_impersonation",
+    "unauthorised_release",
+    "inventory_additional_repository",
+    "inventory_missing_repository",
+    "inventory_stale_after_settings_change",
+    "token_repository_restriction_omitted",
+    "token_permission_restriction_omitted",
+    "default_token_request",
+    "multi_repository_token_request",
+    "unapproved_permission_request",
+    "returned_scope_mismatch",
+    "control_token_cross_repository_access",
+    "state_token_cross_repository_access",
+)
+_ATTEMPT_RE = re.compile(
+    r"^wd-(?P<run>[1-9][0-9]*)-(?P<attempt>[1-9][0-9]*)-(?P<nonce>[a-z0-9]{6,24})$"
+)
 _FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 class AdversarialContractError(RuntimeError):
@@ -56,8 +92,15 @@ class ScenarioSpec:
     def validate(self) -> None:
         if self.scenario_id not in SCENARIO_IDS:
             raise AdversarialContractError("UNAPPROVED_SCENARIO")
-        if not all((self.name, self.initial_state, self.event_or_fault,
-                    self.canonical_expectation, self.projection_expectation)):
+        if not all(
+            (
+                self.name,
+                self.initial_state,
+                self.event_or_fault,
+                self.canonical_expectation,
+                self.projection_expectation,
+            )
+        ):
             raise AdversarialContractError("INCOMPLETE_SCENARIO")
         if not self.assertions:
             raise AdversarialContractError("OBSERVATION_ONLY_SCENARIO")
@@ -78,7 +121,8 @@ class ScenarioSpec:
 
 SCENARIOS: tuple[ScenarioSpec, ...] = (
     ScenarioSpec(
-        1, "simultaneous allocate-next",
+        1,
+        "simultaneous allocate-next",
         "two ready tasks; no allocations",
         "two close-timed ALLOCATE_NEXT requests",
         "two terminal requests and two ACTIVE allocations on distinct tasks with matching uniqueness and Beads mirrors",
@@ -93,7 +137,8 @@ SCENARIOS: tuple[ScenarioSpec, ...] = (
         live_only=True,
     ),
     ScenarioSpec(
-        2, "simultaneous nominated-task exclusion",
+        2,
+        "simultaneous nominated-task exclusion",
         "one ready nominated task; no allocation",
         "two close-timed ALLOCATE_TASK requests for the same task",
         "one ACTIVE allocation and one terminal TASK_ALREADY_ALLOCATED rejection",
@@ -107,7 +152,8 @@ SCENARIOS: tuple[ScenarioSpec, ...] = (
         live_only=True,
     ),
     ScenarioSpec(
-        3, "retained-comment durability",
+        3,
+        "retained-comment durability",
         "at least three ready tasks and retained unedited request comments",
         "three close-timed requests with one queued attempt cancelled",
         "every retained request comment eventually has one terminal canonical request",
@@ -121,18 +167,21 @@ SCENARIOS: tuple[ScenarioSpec, ...] = (
         live_only=True,
     ),
     ScenarioSpec(
-        4, "idempotent redelivery",
+        4,
+        "idempotent redelivery",
         "one completed request",
         "redeliver the same request ID and semantic payload",
         "no new request, allocation or ownership mutation",
-        "the existing result is reproducibly consumable",
+        "the existing result is exactly repeated",
         (
             "canonical ref identity is unchanged by the duplicate path",
             "allocation and request row counts do not increase",
+            "the repeated projection is byte-equivalent to the original canonical result envelope",
         ),
     ),
     ScenarioSpec(
-        5, "payload binding",
+        5,
+        "payload binding",
         "one completed request",
         "reuse the request ID with a changed payload",
         "original canonical result remains unchanged",
@@ -144,7 +193,8 @@ SCENARIOS: tuple[ScenarioSpec, ...] = (
         ),
     ),
     ScenarioSpec(
-        6, "stale-writer compare-and-swap",
+        6,
+        "stale-writer compare-and-swap",
         "two writers bootstrapped from the same accepted base",
         "delay one publication until the other succeeds",
         "only the first expected-old-SHA fast-forward is accepted",
@@ -153,11 +203,13 @@ SCENARIOS: tuple[ScenarioSpec, ...] = (
             "the second publisher fails with stale-base semantics",
             "the losing mutation is absent from accepted canonical state",
             "no force publication path is available",
+            "final canonical owner matches the winning accepted allocation",
         ),
         fault_controls=("delay_publication",),
     ),
     ScenarioSpec(
-        7, "push failure before visibility",
+        7,
+        "push failure before visibility",
         "one ready task",
         "inject canonical publication failure",
         "no new canonical allocation exists",
@@ -169,7 +221,8 @@ SCENARIOS: tuple[ScenarioSpec, ...] = (
         fault_controls=("fail_canonical_push",),
     ),
     ScenarioSpec(
-        8, "projection failure and orphan invalidation",
+        8,
+        "projection failure and orphan invalidation",
         "one accepted canonical allocation",
         "fail the first valid projection post and separately inject an orphan projection",
         "ownership remains canonical; orphan records audit-only evidence with no manufactured request",
@@ -183,7 +236,8 @@ SCENARIOS: tuple[ScenarioSpec, ...] = (
         live_only=True,
     ),
     ScenarioSpec(
-        9, "source mutation boundary",
+        9,
+        "source mutation boundary",
         "uncanonicalised and canonicalised request comments",
         "cancel before mutation and edit/delete both before ingress and after canonicalisation",
         "pre-ingress edit is rejected/withdrawn; retained request is eventually terminal; post-ingress result is immutable",
@@ -194,11 +248,17 @@ SCENARIOS: tuple[ScenarioSpec, ...] = (
             "post-ingress edit/delete does not change canonical ownership",
             "reconciliation succeeds without the original runner workspace",
         ),
-        fault_controls=("edit_before_ingress", "delete_before_ingress", "edit_after_ingress", "delete_after_ingress"),
+        fault_controls=(
+            "edit_before_ingress",
+            "delete_before_ingress",
+            "edit_after_ingress",
+            "delete_after_ingress",
+        ),
         live_only=True,
     ),
     ScenarioSpec(
-        10, "clean Git-capable reconstruction",
+        10,
+        "clean Git-capable reconstruction",
         "accepted allocations and release history",
         "start a fresh client with no .beads and separately inject allocation/Beads mirror mismatch",
         "history reconstructs from durable Git state only when ownership invariant agrees; mismatch fails closed",
@@ -212,7 +272,8 @@ SCENARIOS: tuple[ScenarioSpec, ...] = (
         fault_controls=("inject_mirror_mismatch",),
     ),
     ScenarioSpec(
-        11, "GitHub-API-only consumption",
+        11,
+        "GitHub-API-only consumption",
         "one accepted allocation and complete projection",
         "consume using only the GitHub issue API",
         "no hidden canonical mutation is required by the client",
@@ -226,7 +287,8 @@ SCENARIOS: tuple[ScenarioSpec, ...] = (
         live_only=True,
     ),
     ScenarioSpec(
-        12, "authorised release",
+        12,
+        "authorised release",
         "one ACTIVE allocation with matching Beads mirror",
         "submit an authorised explicit RELEASE request",
         "allocation becomes RELEASED; uniqueness entry is removed; task returns open/unassigned; history remains",
@@ -238,24 +300,28 @@ SCENARIOS: tuple[ScenarioSpec, ...] = (
         ),
     ),
     ScenarioSpec(
-        13, "authorisation and token scope",
+        13,
+        "authorisation and token scope",
         "authorisation, installation-inventory and token-profile fixtures",
-        "exercise static identity negatives, live-installation negatives, inventory drift and token-scope negatives",
+        "exercise every required identity, installation, inventory, release and token-scope negative independently",
         "every rejected path terminates before unapproved canonical access or mutation",
         "AGENT_NOT_AUTHORISED, RELEASE_NOT_AUTHORISED or an explicit fail-closed scope result",
         (
-            "static negatives cannot enter the App-key job",
-            "wrong-installation/lost-access paths request no state token",
+            "every protocol-required negative fixture has its own typed fault identity and passing outcome evidence",
+            "static identity negatives cannot enter the App-key job",
+            "wrong-installation/lost-access paths request no state token or canonical access",
             "exact selected-repository inventory is current and contains only the approved control and state repository IDs",
             "control and state tokens each contain exactly one approved repository and permission profile",
-            "cross-repository access is denied",
-            "unscoped, default, multi-repository and unapproved-permission token requests are rejected before use",
+            "control and state token cross-repository access is denied",
+            "omitted/default/multi-repository/unapproved-permission token requests are rejected before use",
+            "unauthorised release and namespace paths create no ownership mutation",
         ),
-        fault_controls=("static_identity_negative", "live_installation_negative", "inventory_drift", "token_scope_negative"),
+        fault_controls=SCENARIO_13_FAULT_CONTROLS,
         live_only=True,
     ),
     ScenarioSpec(
-        14, "clean-runner GitHub-only durability",
+        14,
+        "clean-runner GitHub-only durability",
         "clean runner and isolated attempt namespace",
         "execute the complete Workstream D suite and discard all runner-local state",
         "only approved GitHub issue, repository, ref and Actions records remain durable",
@@ -277,6 +343,12 @@ def scenario_catalogue() -> tuple[ScenarioSpec, ...]:
     if tuple(s.scenario_id for s in SCENARIOS) != SCENARIO_IDS:
         raise AdversarialContractError("SCENARIO_COVERAGE_MISMATCH")
     return SCENARIOS
+
+
+def scenario_by_id(scenario_id: int) -> ScenarioSpec:
+    if scenario_id not in SCENARIO_IDS:
+        raise AdversarialContractError("UNAPPROVED_SCENARIO")
+    return SCENARIOS[scenario_id - 1]
 
 
 @dataclass(frozen=True)
@@ -318,20 +390,107 @@ class AssertionEvidence:
 class FaultEvidence:
     control: str
     identity: str
+    passed: bool
+    expected_outcome: str
+    actual_outcome: str
 
     def validate(self) -> None:
-        if not self.control or not self.identity:
+        if not all((self.control, self.identity, self.expected_outcome, self.actual_outcome)):
             raise AdversarialContractError("INCOMPLETE_FAULT_EVIDENCE")
+        if not self.passed:
+            raise AdversarialContractError(f"FAULT_OUTCOME_FAILED:{self.control}")
 
 
 @dataclass(frozen=True)
 class ClientTranscript:
     contract: str
-    transcript: str
+    transcript_sha256: str
+    clean_environment: bool
+    prohibited_capabilities_used: tuple[str, ...] = ()
 
     def validate(self) -> None:
-        if self.contract not in {"git-capable", "github-api-only"} or not self.transcript:
-            raise AdversarialContractError("INCOMPLETE_CLIENT_TRANSCRIPT")
+        if self.contract not in {"git-capable", "github-api-only"}:
+            raise AdversarialContractError("UNKNOWN_CLIENT_CONTRACT")
+        if not _SHA256.fullmatch(self.transcript_sha256):
+            raise AdversarialContractError("INVALID_CLIENT_TRANSCRIPT_DIGEST")
+        if not self.clean_environment:
+            raise AdversarialContractError("CLIENT_ENVIRONMENT_NOT_CLEAN")
+        if self.prohibited_capabilities_used:
+            raise AdversarialContractError("CLIENT_CONTRACT_VIOLATION")
+
+
+@dataclass(frozen=True)
+class ExecutableIdentity:
+    path: str
+    blob_sha: str
+    commit_sha: str
+
+    def validate(self, *, trusted_sha: str) -> None:
+        if not self.path or not _FULL_SHA.fullmatch(self.blob_sha):
+            raise AdversarialContractError("INVALID_EXECUTABLE_IDENTITY")
+        if self.commit_sha != trusted_sha or not _FULL_SHA.fullmatch(self.commit_sha):
+            raise AdversarialContractError("EXECUTABLE_NOT_BOUND_TO_TRUSTED_COMMIT")
+
+
+@dataclass(frozen=True)
+class RepeatedResultEvidence:
+    request_id: str
+    original_projection_sha256: str
+    repeated_projection_sha256: str
+    canonical_ref_before: str
+    canonical_ref_after: str
+    request_rows_before: int
+    request_rows_after: int
+    allocation_rows_before: int
+    allocation_rows_after: int
+
+    def validate(self) -> None:
+        if not self.request_id:
+            raise AdversarialContractError("MISSING_REPEATED_RESULT_REQUEST")
+        if not _SHA256.fullmatch(self.original_projection_sha256) or not _SHA256.fullmatch(
+            self.repeated_projection_sha256
+        ):
+            raise AdversarialContractError("INVALID_REPEATED_RESULT_DIGEST")
+        if self.original_projection_sha256 != self.repeated_projection_sha256:
+            raise AdversarialContractError("REPEATED_RESULT_PROJECTION_MISMATCH")
+        if (
+            not _FULL_SHA.fullmatch(self.canonical_ref_before)
+            or self.canonical_ref_before != self.canonical_ref_after
+        ):
+            raise AdversarialContractError("REPEATED_RESULT_CANONICAL_REF_CHANGED")
+        if self.request_rows_before != self.request_rows_after:
+            raise AdversarialContractError("REPEATED_RESULT_REQUEST_ROWS_CHANGED")
+        if self.allocation_rows_before != self.allocation_rows_after:
+            raise AdversarialContractError("REPEATED_RESULT_ALLOCATION_ROWS_CHANGED")
+
+
+@dataclass(frozen=True)
+class FinalOwnerEvidence:
+    winning_allocation_id: str
+    final_owner_allocation_id: str
+    stale_allocation_id: str
+    winning_ref_sha: str
+    final_ref_sha: str
+
+    def validate(self, *, accepted_ref_shas: tuple[str, ...]) -> None:
+        if not all(
+            (
+                self.winning_allocation_id,
+                self.final_owner_allocation_id,
+                self.stale_allocation_id,
+            )
+        ):
+            raise AdversarialContractError("INCOMPLETE_FINAL_OWNER_EVIDENCE")
+        if self.final_owner_allocation_id != self.winning_allocation_id:
+            raise AdversarialContractError("FINAL_OWNER_DOES_NOT_MATCH_WINNER")
+        if self.stale_allocation_id == self.final_owner_allocation_id:
+            raise AdversarialContractError("STALE_ALLOCATION_BECAME_OWNER")
+        if (
+            not _FULL_SHA.fullmatch(self.winning_ref_sha)
+            or self.winning_ref_sha != self.final_ref_sha
+            or self.winning_ref_sha not in accepted_ref_shas
+        ):
+            raise AdversarialContractError("FINAL_OWNER_REF_MISMATCH")
 
 
 @dataclass(frozen=True)
@@ -353,14 +512,14 @@ class TokenScopeEvidence:
             raise AdversarialContractError("TOKEN_REQUEST_REPOSITORY_SCOPE_MISMATCH")
         if self.returned_repository_ids != (repository_id,):
             raise AdversarialContractError("TOKEN_RETURNED_REPOSITORY_SCOPE_MISMATCH")
-        if len(set(self.requested_permissions)) != len(self.requested_permissions):
-            raise AdversarialContractError("DUPLICATE_REQUESTED_PERMISSION")
-        if len(set(self.returned_permissions)) != len(self.returned_permissions):
-            raise AdversarialContractError("DUPLICATE_RETURNED_PERMISSION")
         if frozenset(self.requested_permissions) != permissions:
             raise AdversarialContractError("TOKEN_REQUEST_PERMISSION_SCOPE_MISMATCH")
         if frozenset(self.returned_permissions) != permissions:
             raise AdversarialContractError("TOKEN_RETURNED_PERMISSION_SCOPE_MISMATCH")
+        if len(set(self.requested_permissions)) != len(self.requested_permissions):
+            raise AdversarialContractError("DUPLICATE_REQUESTED_PERMISSION")
+        if len(set(self.returned_permissions)) != len(self.returned_permissions):
+            raise AdversarialContractError("DUPLICATE_RETURNED_PERMISSION")
         if not self.restrictions_explicit:
             raise AdversarialContractError("TOKEN_RESTRICTIONS_NOT_EXPLICIT")
         if not self.returned_scope_validated:
@@ -389,15 +548,15 @@ class ScenarioEvidence:
     fault_ids: tuple[FaultEvidence, ...] = ()
     assertions: tuple[AssertionEvidence, ...] = ()
     client_transcripts: tuple[ClientTranscript, ...] = ()
-    executable_blob_shas: tuple[str, ...] = ()
+    executable_identities: tuple[ExecutableIdentity, ...] = ()
     dependency_identities: tuple[str, ...] = ()
     durability_records: tuple[str, ...] = ()
-    final_owner_evidence: tuple[str, ...] = ()
+    repeated_result: RepeatedResultEvidence | None = None
+    final_owner: FinalOwnerEvidence | None = None
     installation_inventory_repository_ids: tuple[int, ...] = ()
     installation_inventory_current: bool = False
     installation_inventory_attestation: str = ""
     token_scope_records: tuple[TokenScopeEvidence, ...] = ()
-    token_policy_negative_results: tuple[str, ...] = ()
     network_destinations: tuple[str, ...] = ()
     cleanup_decision: str = "retain"
     limitations: tuple[str, ...] = ()
@@ -409,11 +568,16 @@ class ScenarioEvidence:
             run_id=self.workflow_run_id,
             run_attempt=self.workflow_run_attempt,
         )
-        if not _FULL_SHA.fullmatch(self.trusted_sha) or not _FULL_SHA.fullmatch(self.protocol_sha):
+        if not _FULL_SHA.fullmatch(self.trusted_sha) or not _FULL_SHA.fullmatch(
+            self.protocol_sha
+        ):
             raise AdversarialContractError("INVALID_AUTHORITY_SHA")
         if self.workflow_run_id <= 0 or self.workflow_run_attempt != 1:
             raise AdversarialContractError("INVALID_WORKFLOW_ATTEMPT")
-        if self.control_repository_id != CONTROL_REPOSITORY_ID or self.state_repository_id != STATE_REPOSITORY_ID:
+        if (
+            self.control_repository_id != CONTROL_REPOSITORY_ID
+            or self.state_repository_id != STATE_REPOSITORY_ID
+        ):
             raise AdversarialContractError("REPOSITORY_IDENTITY_MISMATCH")
         if self.exit_status != 0:
             raise AdversarialContractError("SCENARIO_EXIT_STATUS_FAILED")
@@ -429,21 +593,30 @@ class ScenarioEvidence:
         fault_controls = tuple(fault.control for fault in self.fault_ids)
         if fault_controls != spec.fault_controls:
             raise AdversarialContractError("FAULT_EVIDENCE_BINDING_MISMATCH")
-        for fault in self.fault_ids:
-            fault.validate()
         if len({fault.identity for fault in self.fault_ids}) != len(self.fault_ids):
             raise AdversarialContractError("DUPLICATE_FAULT_IDENTITY")
+        for fault in self.fault_ids:
+            fault.validate()
 
-        client_contracts = tuple(transcript.contract for transcript in self.client_transcripts)
+        client_contracts = tuple(t.contract for t in self.client_transcripts)
         if client_contracts != spec.client_contracts:
             raise AdversarialContractError("CLIENT_TRANSCRIPT_BINDING_MISMATCH")
         for transcript in self.client_transcripts:
             transcript.validate()
 
-        if not self.executable_blob_shas or any(not _FULL_SHA.fullmatch(sha) for sha in self.executable_blob_shas):
+        if not self.executable_identities:
             raise AdversarialContractError("MISSING_EXECUTABLE_IDENTITY")
-        if not self.dependency_identities or any(not identity for identity in self.dependency_identities):
-            raise AdversarialContractError("MISSING_DEPENDENCY_IDENTITY")
+        executable_paths = tuple(identity.path for identity in self.executable_identities)
+        if len(set(executable_paths)) != len(executable_paths):
+            raise AdversarialContractError("DUPLICATE_EXECUTABLE_PATH")
+        for identity in self.executable_identities:
+            identity.validate(trusted_sha=self.trusted_sha)
+        if not REQUIRED_EXECUTABLE_PATHS.issubset(set(executable_paths)):
+            raise AdversarialContractError("INCOMPLETE_EXECUTABLE_INVENTORY")
+
+        if tuple(self.dependency_identities) != REQUIRED_DEPENDENCY_IDENTITIES:
+            raise AdversarialContractError("DEPENDENCY_IDENTITY_SET_MISMATCH")
+
         if not self.durability_records:
             raise AdversarialContractError("MISSING_DURABILITY_EVIDENCE")
         if len(set(self.durability_records)) != len(self.durability_records):
@@ -457,32 +630,59 @@ class ScenarioEvidence:
         if self.scenario_id in {1, 2, 4, 5, 6, 7, 8, 9, 10, 12, 14}:
             if not self.base_ref_shas or not self.accepted_ref_shas or not self.dolt_commits:
                 raise AdversarialContractError("MISSING_CANONICAL_IDENTITY_EVIDENCE")
+            for sha in (*self.base_ref_shas, *self.accepted_ref_shas):
+                if not _FULL_SHA.fullmatch(sha):
+                    raise AdversarialContractError("INVALID_CANONICAL_GIT_SHA")
         if self.scenario_id in {1, 2, 4, 5, 6, 7, 8, 9, 10, 12, 14} and not self.canonical_rows:
             raise AdversarialContractError("MISSING_CANONICAL_ROW_EVIDENCE")
         if self.scenario_id in {1, 2, 3, 4, 5, 8, 9, 11, 12, 14} and not self.projection_urls:
             raise AdversarialContractError("MISSING_PROJECTION_EVIDENCE")
-        if self.scenario_id == 6 and not self.final_owner_evidence:
-            raise AdversarialContractError("MISSING_FINAL_OWNER_EVIDENCE")
+
+        if self.scenario_id == 4:
+            if self.repeated_result is None:
+                raise AdversarialContractError("MISSING_REPEATED_RESULT_EVIDENCE")
+            self.repeated_result.validate()
+        elif self.repeated_result is not None:
+            raise AdversarialContractError("UNEXPECTED_REPEATED_RESULT_EVIDENCE")
+
+        if self.scenario_id == 6:
+            if self.final_owner is None:
+                raise AdversarialContractError("MISSING_FINAL_OWNER_EVIDENCE")
+            self.final_owner.validate(accepted_ref_shas=self.accepted_ref_shas)
+        elif self.final_owner is not None:
+            raise AdversarialContractError("UNEXPECTED_FINAL_OWNER_EVIDENCE")
 
         if self.scenario_id == 13:
-            if tuple(sorted(self.installation_inventory_repository_ids)) != tuple(sorted((CONTROL_REPOSITORY_ID, STATE_REPOSITORY_ID))):
+            if tuple(sorted(self.installation_inventory_repository_ids)) != tuple(
+                sorted((CONTROL_REPOSITORY_ID, STATE_REPOSITORY_ID))
+            ):
                 raise AdversarialContractError("INSTALLATION_INVENTORY_MISMATCH")
-            if not self.installation_inventory_current or not self.installation_inventory_attestation:
-                raise AdversarialContractError("STALE_OR_MISSING_INSTALLATION_INVENTORY")
+            if (
+                not self.installation_inventory_current
+                or not self.installation_inventory_attestation
+            ):
+                raise AdversarialContractError(
+                    "STALE_OR_MISSING_INSTALLATION_INVENTORY"
+                )
             profiles = tuple(record.profile for record in self.token_scope_records)
             if profiles != ("control", "state"):
                 raise AdversarialContractError("TOKEN_SCOPE_EVIDENCE_BINDING_MISMATCH")
             for record in self.token_scope_records:
                 record.validate()
-            negatives = frozenset(self.token_policy_negative_results)
-            if negatives != _REQUIRED_TOKEN_NEGATIVES or len(self.token_policy_negative_results) != len(_REQUIRED_TOKEN_NEGATIVES):
-                raise AdversarialContractError("TOKEN_NEGATIVE_EVIDENCE_INCOMPLETE")
 
         if self.scenario_id == 14:
-            if frozenset(self.durability_records) != _ALLOWED_DURABILITY or len(self.durability_records) != len(_ALLOWED_DURABILITY):
-                raise AdversarialContractError("GITHUB_DURABILITY_INVENTORY_INCOMPLETE")
-            if not self.network_destinations or any(not destination for destination in self.network_destinations):
-                raise AdversarialContractError("MISSING_NETWORK_DESTINATION_INVENTORY")
+            if frozenset(self.durability_records) != _ALLOWED_DURABILITY or len(
+                self.durability_records
+            ) != len(_ALLOWED_DURABILITY):
+                raise AdversarialContractError(
+                    "GITHUB_DURABILITY_INVENTORY_INCOMPLETE"
+                )
+            if not self.network_destinations or any(
+                not destination for destination in self.network_destinations
+            ):
+                raise AdversarialContractError(
+                    "MISSING_NETWORK_DESTINATION_INVENTORY"
+                )
 
     def to_json(self) -> str:
         self.validate()
@@ -504,43 +704,71 @@ class ScenarioEvidence:
                 "canonical_rows": list(self.canonical_rows),
                 "projection_urls": list(self.projection_urls),
                 "fault_ids": [
-                    {"control": fault.control, "identity": fault.identity}
-                    for fault in self.fault_ids
+                    {
+                        "control": f.control,
+                        "identity": f.identity,
+                        "passed": f.passed,
+                        "expected_outcome": f.expected_outcome,
+                        "actual_outcome": f.actual_outcome,
+                    }
+                    for f in self.fault_ids
                 ],
                 "assertions": [
                     {
-                        "name": assertion.name,
-                        "passed": assertion.passed,
-                        "expected": assertion.expected,
-                        "actual": assertion.actual,
+                        "name": a.name,
+                        "passed": a.passed,
+                        "expected": a.expected,
+                        "actual": a.actual,
                     }
-                    for assertion in self.assertions
+                    for a in self.assertions
                 ],
                 "client_transcripts": [
-                    {"contract": transcript.contract, "transcript": transcript.transcript}
-                    for transcript in self.client_transcripts
+                    {
+                        "contract": t.contract,
+                        "transcript_sha256": t.transcript_sha256,
+                        "clean_environment": t.clean_environment,
+                        "prohibited_capabilities_used": list(
+                            t.prohibited_capabilities_used
+                        ),
+                    }
+                    for t in self.client_transcripts
                 ],
-                "executable_blob_shas": list(self.executable_blob_shas),
+                "executable_identities": [
+                    {
+                        "path": e.path,
+                        "blob_sha": e.blob_sha,
+                        "commit_sha": e.commit_sha,
+                    }
+                    for e in self.executable_identities
+                ],
                 "dependency_identities": list(self.dependency_identities),
                 "durability_records": list(self.durability_records),
-                "final_owner_evidence": list(self.final_owner_evidence),
-                "installation_inventory_repository_ids": list(self.installation_inventory_repository_ids),
+                "repeated_result": (
+                    None
+                    if self.repeated_result is None
+                    else self.repeated_result.__dict__
+                ),
+                "final_owner": (
+                    None if self.final_owner is None else self.final_owner.__dict__
+                ),
+                "installation_inventory_repository_ids": list(
+                    self.installation_inventory_repository_ids
+                ),
                 "installation_inventory_current": self.installation_inventory_current,
                 "installation_inventory_attestation": self.installation_inventory_attestation,
                 "token_scope_records": [
                     {
-                        "profile": record.profile,
-                        "requested_repository_ids": list(record.requested_repository_ids),
-                        "returned_repository_ids": list(record.returned_repository_ids),
-                        "requested_permissions": list(record.requested_permissions),
-                        "returned_permissions": list(record.returned_permissions),
-                        "restrictions_explicit": record.restrictions_explicit,
-                        "returned_scope_validated": record.returned_scope_validated,
-                        "cross_repository_denied": record.cross_repository_denied,
+                        "profile": r.profile,
+                        "requested_repository_ids": list(r.requested_repository_ids),
+                        "returned_repository_ids": list(r.returned_repository_ids),
+                        "requested_permissions": list(r.requested_permissions),
+                        "returned_permissions": list(r.returned_permissions),
+                        "restrictions_explicit": r.restrictions_explicit,
+                        "returned_scope_validated": r.returned_scope_validated,
+                        "cross_repository_denied": r.cross_repository_denied,
                     }
-                    for record in self.token_scope_records
+                    for r in self.token_scope_records
                 ],
-                "token_policy_negative_results": list(self.token_policy_negative_results),
                 "network_destinations": list(self.network_destinations),
                 "cleanup_decision": self.cleanup_decision,
                 "limitations": list(self.limitations),
@@ -550,21 +778,28 @@ class ScenarioEvidence:
         )
 
 
-def scenario_by_id(scenario_id: int) -> ScenarioSpec:
-    if scenario_id not in SCENARIO_IDS:
-        raise AdversarialContractError("UNAPPROVED_SCENARIO")
-    return SCENARIOS[scenario_id - 1]
-
-
 class ScenarioBackend(Protocol):
-    def execute(self, spec: ScenarioSpec, namespace: AttemptNamespace) -> ScenarioEvidence: ...
+    def execute(
+        self, spec: ScenarioSpec, namespace: AttemptNamespace
+    ) -> ScenarioEvidence: ...
 
 
 @dataclass
 class ScenarioDriver:
     backend: ScenarioBackend
 
-    def run(self, scenario_ids: Iterable[int], namespace: AttemptNamespace) -> tuple[ScenarioEvidence, ...]:
+    def run(
+        self,
+        scenario_ids: Iterable[int],
+        namespace: AttemptNamespace,
+        *,
+        expected_trusted_sha: str,
+        expected_protocol_sha: str,
+    ) -> tuple[ScenarioEvidence, ...]:
+        if not _FULL_SHA.fullmatch(expected_trusted_sha) or not _FULL_SHA.fullmatch(
+            expected_protocol_sha
+        ):
+            raise AdversarialContractError("INVALID_EXPECTED_AUTHORITY_SHA")
         requested = tuple(scenario_ids)
         if not requested:
             raise AdversarialContractError("EMPTY_SCENARIO_SET")
@@ -582,6 +817,11 @@ class ScenarioDriver:
                 or result.workflow_run_attempt != namespace.run_attempt
             ):
                 raise AdversarialContractError("CROSS_ATTEMPT_EVIDENCE")
+            if (
+                result.trusted_sha != expected_trusted_sha
+                or result.protocol_sha != expected_protocol_sha
+            ):
+                raise AdversarialContractError("UNAUTHORISED_EVIDENCE_AUTHORITY")
             result.validate()
             evidence.append(result)
         return tuple(evidence)
@@ -590,7 +830,15 @@ class ScenarioDriver:
 @dataclass
 class EvidenceLedger:
     attempt_namespace: AttemptNamespace
+    expected_trusted_sha: str
+    expected_protocol_sha: str
     records: dict[int, ScenarioEvidence] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not _FULL_SHA.fullmatch(self.expected_trusted_sha) or not _FULL_SHA.fullmatch(
+            self.expected_protocol_sha
+        ):
+            raise AdversarialContractError("INVALID_EXPECTED_AUTHORITY_SHA")
 
     def append(self, evidence: ScenarioEvidence) -> None:
         evidence.validate()
@@ -600,27 +848,38 @@ class EvidenceLedger:
             or evidence.workflow_run_attempt != self.attempt_namespace.run_attempt
         ):
             raise AdversarialContractError("CROSS_ATTEMPT_EVIDENCE")
+        if (
+            evidence.trusted_sha != self.expected_trusted_sha
+            or evidence.protocol_sha != self.expected_protocol_sha
+        ):
+            raise AdversarialContractError("UNAUTHORISED_EVIDENCE_AUTHORITY")
         if evidence.scenario_id in self.records:
             raise AdversarialContractError("DUPLICATE_SCENARIO_EVIDENCE")
-        if self.records:
-            first = next(iter(self.records.values()))
-            if (
-                evidence.trusted_sha != first.trusted_sha
-                or evidence.protocol_sha != first.protocol_sha
-                or evidence.control_repository_id != first.control_repository_id
-                or evidence.state_repository_id != first.state_repository_id
-            ):
-                raise AdversarialContractError("MIXED_AUTHORITY_EVIDENCE")
         self.records[evidence.scenario_id] = evidence
 
     def finalise(self) -> tuple[ScenarioEvidence, ...]:
-        missing = [scenario_id for scenario_id in SCENARIO_IDS if scenario_id not in self.records]
+        missing = [
+            scenario_id
+            for scenario_id in SCENARIO_IDS
+            if scenario_id not in self.records
+        ]
         if missing:
             raise AdversarialContractError("INCOMPLETE_WORKSTREAM_D_EVIDENCE")
         ordered = tuple(self.records[scenario_id] for scenario_id in SCENARIO_IDS)
         for evidence in ordered:
-            evidence.validate()
+            self._validate_final_record(evidence)
         return ordered
+
+    def _validate_final_record(self, evidence: ScenarioEvidence) -> None:
+        evidence.validate()
+        if (
+            evidence.attempt_namespace != self.attempt_namespace.value
+            or evidence.workflow_run_id != self.attempt_namespace.run_id
+            or evidence.workflow_run_attempt != self.attempt_namespace.run_attempt
+            or evidence.trusted_sha != self.expected_trusted_sha
+            or evidence.protocol_sha != self.expected_protocol_sha
+        ):
+            raise AdversarialContractError("MIXED_OR_UNAUTHORISED_FINAL_EVIDENCE")
 
 
 def validate_live_gate(
@@ -649,26 +908,34 @@ def validate_live_gate(
         raise AdversarialContractError("WORKSTREAM_D_EXECUTION_DISABLED")
 
 
-def evidence_summary(records: Sequence[ScenarioEvidence]) -> dict[str, object]:
-    ledger_ids = [record.scenario_id for record in records]
-    if ledger_ids != list(SCENARIO_IDS):
-        raise AdversarialContractError("INCOMPLETE_WORKSTREAM_D_EVIDENCE")
+def evidence_summary(
+    records: Sequence[ScenarioEvidence],
+    *,
+    attempt_namespace: AttemptNamespace,
+    expected_trusted_sha: str,
+    expected_protocol_sha: str,
+) -> dict[str, object]:
+    ledger = EvidenceLedger(
+        attempt_namespace,
+        expected_trusted_sha=expected_trusted_sha,
+        expected_protocol_sha=expected_protocol_sha,
+    )
     for record in records:
-        record.validate()
+        ledger.append(record)
+    validated = ledger.finalise()
     durability = {
         durable_record
-        for record in records
+        for record in validated
         for durable_record in record.durability_records
     }
-    external_durable_service_present = any(
-        record not in _ALLOWED_DURABILITY for record in durability
-    )
     return {
         "protocol": PROTOCOL,
         "workstream": WORKSTREAM,
-        "scenarios": len(records),
+        "scenarios": len(validated),
         "all_assertions_passed": True,
-        "external_durable_service_present": external_durable_service_present,
+        "external_durable_service_present": any(
+            record not in _ALLOWED_DURABILITY for record in durability
+        ),
         "production_approval": False,
         "workstream_e_authorised": False,
     }
