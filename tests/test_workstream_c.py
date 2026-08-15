@@ -322,6 +322,111 @@ class ReconciliationTests(unittest.TestCase):
         self.assertEqual(visible[0]["canonical_git_ref_sha"], fixture.creation_identity.git_ref_sha)
         self.assertEqual(visible[0]["canonical_dolt_commit"], fixture.creation_identity.dolt_commit)
 
+    def test_posted_state_with_missing_visible_projection_records_repair_event(self):
+        fixture = Fixture()
+        gateway = FakeGateway([fixture.source])
+        fixture.reconciler(gateway).reconcile("run-visible-initial")
+        first_projection = next(
+            comment for comment in gateway.comments if parse_projection(comment.body) is not None
+        )
+        gateway.comments = [
+            comment for comment in gateway.comments if comment.comment_id != first_projection.comment_id
+        ]
+
+        summary = fixture.reconciler(gateway).reconcile("run-visible-repair")
+        self.assertEqual(len(summary.projections_repaired), 1)
+        repaired_id = summary.projections_repaired[0]
+        repaired_events = rows(
+            fixture.repository,
+            """SELECT details_json FROM allocation_events WHERE request_id = ?
+               AND event_type = 'PROJECTION_REPAIRED'""",
+            (fixture.command.request_id,),
+        )
+        self.assertTrue(
+            any(json.loads(event["details_json"])["comment_id"] == repaired_id for event in repaired_events)
+        )
+
+    def test_posted_state_with_missing_durable_projection_event_is_repaired(self):
+        fixture = Fixture()
+        gateway = FakeGateway([fixture.source])
+        fixture.reconciler(gateway).reconcile("run-event-initial")
+        projection = next(
+            comment for comment in gateway.comments if parse_projection(comment.body) is not None
+        )
+        snapshot = fixture.repository.bootstrap()
+        snapshot.connection.execute(
+            "DELETE FROM allocation_events WHERE request_id = ? AND event_type = 'PROJECTION_POSTED'",
+            (fixture.command.request_id,),
+        )
+        fixture.repository.publish(snapshot.identity.git_ref_sha, snapshot)
+        snapshot.close()
+
+        summary = fixture.reconciler(gateway).reconcile("run-event-repair")
+        self.assertIn(projection.comment_id, summary.projections_repaired)
+        repaired_events = rows(
+            fixture.repository,
+            """SELECT details_json FROM allocation_events WHERE request_id = ?
+               AND event_type = 'PROJECTION_REPAIRED'""",
+            (fixture.command.request_id,),
+        )
+        self.assertTrue(
+            any(
+                json.loads(event["details_json"])["comment_id"] == projection.comment_id
+                for event in repaired_events
+            )
+        )
+
+    def test_released_grant_is_superseded_without_false_ownership_mismatch(self):
+        fixture = Fixture()
+        gateway = FakeGateway([fixture.source])
+        fixture.reconciler(gateway).reconcile("run-grant-visible")
+        grant_projection = next(
+            comment for comment in gateway.comments if parse_projection(comment.body) is not None
+        )
+
+        command = release_command("release-after-visible-grant", fixture.result.allocation_id)
+        operator = RequestContext(
+            CONTROL_REPOSITORY,
+            ISSUE,
+            502,
+            "8ft0-ai",
+            "agent://operator/owner/session/recovery",
+            True,
+        )
+        released = OperatorRecovery(fixture.repository, clock=lambda: LATER).release(command, operator)
+        self.assertEqual(released.status, "RELEASED")
+        release_creation_identity = fixture.repository.identity
+        history = FakeCanonicalHistory(
+            [
+                CanonicalHistoryRevision(fixture.before_request_identity, frozenset()),
+                CanonicalHistoryRevision(
+                    fixture.creation_identity, frozenset({fixture.command.request_id})
+                ),
+                CanonicalHistoryRevision(
+                    release_creation_identity,
+                    frozenset({fixture.command.request_id, command.request_id}),
+                ),
+            ]
+        )
+
+        summary = fixture.reconciler(gateway, now=LATER, history=history).reconcile(
+            "run-release-visible"
+        )
+        self.assertNotIn(fixture.command.request_id, summary.ownership_mismatches)
+        self.assertIn((grant_projection.comment_id, "RELEASED"), gateway.invalidated)
+        findings = rows(
+            fixture.repository,
+            """SELECT reason_code FROM allocation_events WHERE request_id = ?
+               AND event_type = 'AUDIT_FINDING'""",
+            (fixture.command.request_id,),
+        )
+        self.assertIn(
+            "PROJECTION_SUPERSEDED_BY_RELEASE", {row["reason_code"] for row in findings}
+        )
+        visible = [parse_projection(comment.body) for comment in gateway.comments]
+        visible = [payload for payload in visible if payload]
+        self.assertTrue(any(payload["result_status"] == "RELEASED" for payload in visible))
+
     def test_orphan_projection_is_invalidated_and_audited_without_request_or_ownership(self):
         fixture = Fixture()
         orphan = CanonicalProjection(
@@ -590,6 +695,34 @@ class FakeAPI:
         return {"id": 9999, "html_url": "https://github.example/comment/9999"}
 
 
+class RepeatedPageAPI(FakeAPI):
+    def get(self, path):
+        self.get_paths.append(path)
+        return [
+            {
+                "id": index + 1,
+                "body": f"comment-{index + 1}",
+                "html_url": f"https://github.example/example/control/issues/1#issuecomment-{index + 1}",
+            }
+            for index in range(100)
+        ]
+
+
+class EndlessUniqueAPI(FakeAPI):
+    def get(self, path):
+        self.get_paths.append(path)
+        page = int(path.rsplit("page=", 1)[1])
+        start = ((page - 1) * 100) + 1
+        return [
+            {
+                "id": start + index,
+                "body": f"comment-{start + index}",
+                "html_url": f"https://github.example/example/control/issues/1#issuecomment-{start + index}",
+            }
+            for index in range(100)
+        ]
+
+
 class GitHubGatewayTests(unittest.TestCase):
     def test_comment_inventory_is_completely_paginated_and_writes_stay_on_control_issue(self):
         api = FakeAPI()
@@ -603,6 +736,16 @@ class GitHubGatewayTests(unittest.TestCase):
         posted = gateway.post_projection(ISSUE, "{}")
         self.assertEqual(posted.comment_id, 9999)
         self.assertEqual(api.posts[-1][0], "/repos/example/control/issues/1/comments")
+
+    def test_repeated_or_decreasing_comment_page_fails_closed(self):
+        gateway = GitHubIssueGateway(RepeatedPageAPI(), CONTROL_REPOSITORY)
+        with self.assertRaisesRegex(ValueError, "repeated or decreasing"):
+            gateway.list_comments(ISSUE)
+
+    def test_ambiguous_full_page_termination_fails_closed_at_bound(self):
+        gateway = GitHubIssueGateway(EndlessUniqueAPI(), CONTROL_REPOSITORY, max_pages=2)
+        with self.assertRaisesRegex(ValueError, "did not terminate within bound"):
+            gateway.list_comments(ISSUE)
 
 
 if __name__ == "__main__":
