@@ -18,14 +18,19 @@ The protected job receives the App key only after those request-side gates succe
 
 Workstream A supplies the completed intake and credential boundary. Workstream B
 adds the canonical Dolt schema, deterministic allocation/release library and a
-no-force expected-old-SHA compare-and-swap abstraction. The allocation row is
+no-force expected-old-SHA compare-and-swap implementation. The allocation row is
 the singular ownership authority; its active-task uniqueness entry and Beads
 status/assignee materialisation change in the same database transaction.
 
-The Workstream B implementation has no default live-state adapter. Its tests use
-only an isolated in-memory canonical repository and synthetic Beads fixtures.
-It does not post GitHub projections, authorise work to begin, mint credentials,
-or access `refs/dolt/data`. Runtime wiring and all result projection or
-reconciliation behaviour remain separate governed work.
+Workstream B includes a concrete Git/Dolt repository adapter and Beads SQL store,
+but deliberately configures no live state target and accepts no credential by
+default. A caller must inject an already-authorised state-repository URL and
+isolated database connection through the Workstream A boundary. Fast tests retain
+an in-memory canonical repository; focused adapter tests additionally exercise
+the real Beads `issues`/`dependencies`/`labels` contract and no-force publication
+semantics. The implementation does not post GitHub projections, authorise work
+to begin, mint credentials, dispatch intake or itself select/access live
+`refs/dolt/data`. Result projection and reconciliation remain separate governed
+work.
 
 Normal request-side writes and credentialed live checks remain fail-closed unless the separately reviewed activation variable `PHASE2_INTAKE_ENABLED` is exactly `true`. Neither Workstream A nor B creates that variable. Manual `workflow_dispatch` defaults to operator reconciliation; the protected scope probe is a separate explicit manual operation and never mutates canonical state.
