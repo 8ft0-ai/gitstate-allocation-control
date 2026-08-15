@@ -19,14 +19,23 @@ records an audit finding.
 
 `phase2.canonical` retains the dependency-free identity/CAS abstractions used by
 unit tests. `phase2.dolt_repository.DoltCanonicalRepository` is the concrete
-isolated Git/Dolt adapter: it fetches only `refs/dolt/data` into a fresh detached
-workspace, verifies both the Git ref SHA and Dolt `HEAD`, opens a caller-supplied
-PEP-249 connection to that isolated database, versions the accepted SQL
-transaction in Dolt, wraps the changed database in a child Git commit, rechecks
-the expected old ref immediately before publication and performs a normal
-non-force push. A stale writer is discarded and retried from fresh state; a
-transport failure does not install the candidate state. The adapter exposes no
-force option.
+isolated Git-backed Dolt adapter. `refs/dolt/data` is treated only as the
+expected-old Git CAS identity: the adapter probes it with `git ls-remote`,
+normalises the repository URL using the pinned Beads v1.1.0 Git-to-Dolt rules,
+and performs a fresh `dolt clone` into an isolated temporary database. The
+caller-supplied PEP-249 connection must open that exact clone; bootstrap fails
+closed unless its `DOLT_HASHOF('HEAD')` equals an independent Dolt-CLI read from
+the clone and `ACTIVE_BRANCH()` is the expected `main` branch. Ref movement
+while the clone is in flight invalidates the snapshot.
+
+Publication versions the accepted SQL transaction with `DOLT_ADD` and
+`DOLT_COMMIT`, repeats the connection-versus-clone identity check, rechecks the
+expected old `refs/dolt/data` SHA immediately before publication, then performs
+only `dolt push origin main`. No Git checkout, Git worktree commit or force push
+is used for canonical data. A failed push is classified as stale if the remote
+CAS identity moved and otherwise as a canonical push failure; a successful push
+must advance the canonical Git ref before an accepted identity is returned.
+Bounded stale retries always start from a fresh Dolt clone.
 
 The repository URL, state credential and database connection are deliberately
 not configured by Workstream B. `process_authorised_request` receives an
@@ -36,9 +45,9 @@ existing `LocalCanonicalRepository` remains an isolated SQLite fixture for fast
 credential-free failure and concurrency tests.
 
 Canonical allocation commits initially contain `anchor_status=PENDING` because
-a commit cannot contain its own identifier. `record_anchor` subsequently
-records the first accepted Git and Dolt identifiers and appends one
-`ANCHOR_RECORDED` event without changing task or allocation semantics.
+a commit cannot contain its own identifier. `record_anchor` subsequently records
+the first accepted Git and Dolt identifiers and appends one `ANCHOR_RECORDED`
+event without changing task or allocation semantics.
 
 No GitHub result projection or reconciliation behaviour is implemented here.
 No default live state target, allocator token, workflow dispatch or Workstream
