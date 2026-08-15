@@ -6,7 +6,11 @@ import unittest
 from phase2.allocation_schema import initialise_sqlite_fixture
 from phase2.allocation_types import AllocationCommand, RequestContext, stable_ulid
 from phase2.canonical import CanonicalIdentityMismatch, StaleCanonicalBase
-from phase2.dolt_repository import DoltCanonicalRepository, _normalise_dolt_remote
+from phase2.dolt_repository import (
+    DoltCanonicalRepository,
+    _git_probe_url,
+    _normalise_dolt_remote,
+)
 from phase2.dolt_store import DoltAllocationStore
 
 NOW = "2026-08-15T00:00:00Z"
@@ -234,6 +238,14 @@ class DoltRepositoryTests(unittest.TestCase):
             _normalise_dolt_remote("file:///tmp/state.git"),
             "file:///tmp/state.git",
         )
+        self.assertEqual(
+            _git_probe_url("git+file:///tmp/state.git"),
+            "file:///tmp/state.git",
+        )
+        with self.assertRaisesRegex(
+            CanonicalIdentityMismatch, "CANONICAL_GIT_BACKED_REMOTE_REQUIRED"
+        ):
+            DoltCanonicalRepository("file:///tmp/not-a-git-ref-remote", lambda _: None)
 
     def test_publication_clones_with_dolt_and_uses_non_force_dolt_push(self):
         commands = []
@@ -275,6 +287,8 @@ class DoltRepositoryTests(unittest.TestCase):
         clone = next(command for command in commands if command[:2] == ("dolt", "clone"))
         self.assertEqual(clone[2], "git+https://example.invalid/state.git")
         self.assertEqual(clone[3], "canonical")
+        git_probe = next(command for command in commands if command[:2] == ("git", "ls-remote"))
+        self.assertEqual(git_probe[3], "https://example.invalid/state.git")
         self.assertFalse(any(command[:2] == ("dolt", "push") for command in commands))
         self.assertFalse(any(command[:2] == ("git", "push") for command in commands))
         push_sql = [entry for entry in connection.statements if "DOLT_PUSH" in entry[0]]
