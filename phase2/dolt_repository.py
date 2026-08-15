@@ -75,6 +75,18 @@ def _normalise_dolt_remote(remote_url: str) -> str:
     return remote_url
 
 
+def _git_probe_url(dolt_remote_url: str) -> str:
+    """Return the ordinary Git URL backing a Dolt ``git+`` remote.
+
+    Workstream B is specifically bound to a Git repository ref
+    (``refs/dolt/data``), so Dolt-native object-store and filesystem remotes are
+    not valid canonical targets even though Dolt itself can use them.
+    """
+    if dolt_remote_url.startswith("git+"):
+        return dolt_remote_url[4:]
+    raise CanonicalIdentityMismatch("CANONICAL_GIT_BACKED_REMOTE_REQUIRED")
+
+
 def _scalar(connection: Any, sql: str) -> str:
     cursor = connection.cursor()
     try:
@@ -139,6 +151,7 @@ class DoltCanonicalRepository:
             raise ValueError("invalid dolt_branch")
         self.remote_url = remote_url
         self.dolt_remote_url = _normalise_dolt_remote(remote_url)
+        self.git_remote_url = _git_probe_url(self.dolt_remote_url)
         self.connection_factory = connection_factory
         self.git_bin = git_bin
         self.dolt_bin = dolt_bin
@@ -155,7 +168,7 @@ class DoltCanonicalRepository:
 
     def _remote_sha(self, workspace: Path) -> str:
         output = self._command(
-            (self.git_bin, "ls-remote", "--refs", self.remote_url, self.state_ref),
+            (self.git_bin, "ls-remote", "--refs", self.git_remote_url, self.state_ref),
             workspace,
             "CANONICAL_REMOTE_REF_LOOKUP_FAILED",
         )
