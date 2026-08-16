@@ -371,6 +371,60 @@ def _credential_free_git_env() -> dict[str, str]:
     return env
 
 
+def _canonical_creation_ref_order(
+    mirror: Path, current_sha: str, creation_refs: Sequence[str]
+) -> tuple[str, str]:
+    refs = tuple(creation_refs)
+    if len(refs) != 2:
+        raise LiveExecutorError("SCENARIO_1_CREATION_REF_COUNT_INVALID")
+    if refs[0] == refs[1]:
+        raise LiveExecutorError("SCENARIO_1_CREATION_REFS_EQUAL")
+
+    env = _credential_free_git_env()
+    try:
+        observed_current = _run(
+            ["git", "--git-dir", str(mirror), "rev-parse", "refs/dolt/data"],
+            cwd=mirror.parent,
+            env=env,
+        )
+    except LiveExecutorError as exc:
+        raise LiveExecutorError("SCENARIO_1_CANONICAL_CURRENT_REF_MISSING") from exc
+    if observed_current != current_sha:
+        raise LiveExecutorError("SCENARIO_1_CANONICAL_CURRENT_REF_MISMATCH")
+
+    def git_status(*arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["git", "--git-dir", str(mirror), *arguments],
+            cwd=mirror.parent,
+            env=env,
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+    for ref in refs:
+        if git_status("cat-file", "-e", f"{ref}^{{commit}}").returncode != 0:
+            raise LiveExecutorError("SCENARIO_1_CREATION_REF_MISSING")
+
+    def is_ancestor(older: str, newer: str) -> bool:
+        completed = git_status("merge-base", "--is-ancestor", older, newer)
+        if completed.returncode == 0:
+            return True
+        if completed.returncode == 1:
+            return False
+        raise LiveExecutorError("SCENARIO_1_CREATION_ANCESTRY_CHECK_FAILED")
+
+    left_before_right = is_ancestor(refs[0], refs[1])
+    right_before_left = is_ancestor(refs[1], refs[0])
+    if left_before_right == right_before_left:
+        raise LiveExecutorError("SCENARIO_1_CREATION_REFS_INCOMPARABLE")
+    ordered = refs if left_before_right else (refs[1], refs[0])
+    if not is_ancestor(ordered[1], current_sha):
+        raise LiveExecutorError("SCENARIO_1_CREATION_REF_NOT_CURRENT")
+    return ordered
+
+
 def assert_uninitialised_state(token: str, *, root: Path) -> None:
     output = _run(
         ["git", "ls-remote", "--refs", _remote_url()],
@@ -698,25 +752,6 @@ class _FailFirstProjectionGateway:
     def post_projection(self, issue_number: int, body: str):
         self.attempted = True
         raise RuntimeError("INJECTED_FIXTURE_PROJECTION_POST_FAILURE")
-
-
-@dataclass
-class _PublicationRecordingRepository:
-    delegate: DoltCanonicalRepository
-    accepted_refs: list[str]
-    lock: threading.Lock
-
-    def bootstrap(self):
-        return self.delegate.bootstrap()
-
-    def store(self, snapshot):
-        return self.delegate.store(snapshot)
-
-    def publish(self, expected_old_sha: str, snapshot):
-        accepted = self.delegate.publish(expected_old_sha, snapshot)
-        with self.lock:
-            self.accepted_refs.append(accepted.git_ref_sha)
-        return accepted
 
 
 FIXTURE_APP = {
@@ -1528,16 +1563,7 @@ class LiveFixtureBackend:
         sources, request_ids, source_elapsed, visible = self._post_protocol_sources(
             1, ("ALLOCATE_NEXT", "ALLOCATE_NEXT")
         )
-        publication_order: list[str] = []
-        publication_lock = threading.Lock()
-        workers = (
-            self._fresh_backend(
-                _PublicationRecordingRepository(self.repository, publication_order, publication_lock)
-            ),
-            self._fresh_backend(
-                _PublicationRecordingRepository(self.repository, publication_order, publication_lock)
-            ),
-        )
+        workers = (self._fresh_backend(), self._fresh_backend())
         values, process_start_spread = _run_close_timed_calls(
             (
                 lambda: workers[0]._process(
@@ -1579,16 +1605,25 @@ class LiveFixtureBackend:
             "both task mirrors satisfy ownership invariant",
         )
         selected = {first.task_id, second.task_id}
-        try:
-            creation_order = tuple(
-                record.task_id
-                for record in sorted(
-                    (first, second),
-                    key=lambda record: publication_order.index(record.accepted_ref),
+        if self.read_only_remote_factory is None:
+            raise LiveExecutorError("SCENARIO_1_READ_ONLY_MIRROR_BROKER_MISSING")
+        records_by_ref = {
+            first.accepted_ref: first,
+            second.accepted_ref: second,
+        }
+        if len(records_by_ref) != 2:
+            raise LiveExecutorError("SCENARIO_1_CREATION_REFS_EQUAL")
+        with tempfile.TemporaryDirectory(prefix="wd-scenario-1-order-") as directory:
+            mirror, current_ref = self.read_only_remote_factory(Path(directory))
+            try:
+                creation_refs = _canonical_creation_ref_order(
+                    mirror,
+                    current_ref,
+                    tuple(records_by_ref),
                 )
-            )
-        except ValueError as exc:
-            raise LiveExecutorError("SCENARIO_1_CREATION_PUBLICATION_NOT_RECORDED") from exc
+            finally:
+                _set_tree_read_only(mirror, read_only=False)
+        creation_order = tuple(records_by_ref[ref].task_id for ref in creation_refs)
         proof.assertion(
             3,
             selected == set(tasks)
@@ -1597,7 +1632,8 @@ class LiveFixtureBackend:
             (
                 f"expected_priority_created_id_order={expected_order} "
                 f"canonical_creation_order={creation_order} "
-                f"publication_refs={publication_order} start_spread={process_start_spread:.6f}"
+                f"creation_refs={creation_refs} current_ref={current_ref} "
+                f"start_spread={process_start_spread:.6f}"
             ),
         )
         return self._evidence(
