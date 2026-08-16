@@ -1,174 +1,278 @@
 # Workstream D — adversarial integration harness
 
 This candidate is governed by `8ft0-ai/gitstate-lab#15` and protocol authority
-`gitstate-lab@4ad2cebf6c37d21f44e5652a70f5fb4e77da74ae`. It starts from trusted
-control `main` `162832b59652740a07769b3e04cedbcab27921b5`.
+`gitstate-lab@4ad2cebf6c37d21f44e5652a70f5fb4e77da74ae`. The remediation starts from
+trusted control `main` `3683359168d3f6ce10633dc570f1fd780e65cfcd` and implements the
+freshly approved fixture-only trusted-main executor design recorded on #15.
 
 ## Purpose
 
-Workstream D is the evidence gate for protocol scenarios 1–14. This candidate
-adds the bounded harness contract needed to execute and adjudicate those
-scenarios without changing the accepted Workstream B ownership/transaction
-semantics or Workstream C projection/reconciliation semantics.
+Workstream D is the evidence gate for protocol scenarios 1–14. The existing
+harness defines the immutable scenario and evidence contract. The remediation
+adds only the missing protected-main execution path needed to exercise that
+contract against the dedicated Phase 2 fixture boundary. It does not change the
+accepted Workstream B ownership/transaction semantics, Workstream C
+projection/reconciliation semantics, runtime sender policy, token profiles, or
+any Workstream E capability.
 
-The harness defines:
+The harness continues to define:
 
 - the exact scenario 1–14 catalogue and executable assertions;
 - unique run/attempt-bound namespaces (`wd-<run>-<attempt>-<nonce>`);
 - exact expected control/protocol SHAs supplied to the scenario driver, evidence
-  ledger and final summary rather than inferred from the first evidence record;
-- one-to-one assertion evidence bound to each exact protocol assertion;
-- one explicit typed fault identity and outcome for every required fault control,
-  with each identity exactly qualified by the authorised run/attempt namespace
-  and each expected outcome owned by the harness contract rather than supplied by
-  the evidence record; a fixture cannot pass by declaring an arbitrary expected
-  result equal to its arbitrary actual result;
-- one typed clean-environment transcript digest for every required
-  Git-capable/API-only client contract;
-- executable identities containing path, blob SHA and the exact trusted commit
-  SHA, plus the retained exact `git ls-tree <trusted-commit> -- <path>` entry and
-  `<trusted-commit>:<path>` object specification; validation independently reruns
-  read-only Git object queries against the locally available trusted commit and
-  requires both the actual tree entry and resolved blob object to match, so a
-  fabricated but self-consistent retained identity cannot pass;
-- the complete reviewed pinned dependency set for checkout, Beads, Dolt and
-  PyMySQL;
-- structured scenario-specific source, Git/Dolt, canonical-row and projection
-  evidence;
-- explicit terminal-request bundles for scenarios 1–3, each binding one distinct
-  retained source comment and request ID to its exact terminal result code,
-  accepted Git ref, Dolt commit, canonical-row identity and projection URL;
-  top-level evidence must equal those bundles exactly, and duplicate refs, Dolt
-  commits, canonical rows, request IDs or projections fail closed;
-- scenario 4 repeated-result evidence bound to the retained request ID, canonical
-  request row, exact accepted ref and the exact original/repeated projection URLs,
-  in addition to identical projection digests and unchanged request/allocation row
-  counts;
-- scenario 6 winner/final-owner evidence bound to a structured retained canonical
-  allocation row whose allocation ID, row identity, accepted ref, ACTIVE state and
-  owner identity are validated, while the stale allocation is prohibited from the
-  retained canonical allocation-row set;
-- scenario 13 evidence with each required attribution, bot, installation,
-  namespace/release, inventory and token-policy negative represented as its own
-  exact fault control rather than an umbrella result name;
-- scenario 14 GitHub-only durability plus explicit network-destination inventory;
-- cleanup decisions that retain canonical history;
-- a final ledger that cannot pass unless all fourteen records belong to the same
-  authorised run/attempt and exact trusted/protocol SHAs; and
-- an explicit result boundary that does not imply production approval or permit
-  Workstream E.
+  ledger and final summary rather than inferred from evidence;
+- one-to-one assertion evidence bound to every protocol assertion;
+- explicit typed fault identities and contract-owned outcomes;
+- clean Git-capable and GitHub-API-only client transcript identities;
+- executable path/blob/trusted-commit binding through immutable Git objects;
+- the reviewed pinned checkout, Beads, Dolt and PyMySQL dependency identities;
+- structured source, Git/Dolt, canonical-row, projection and fault evidence;
+- exact retained terminal-request bindings for scenarios 1–3;
+- exact repeated-result/non-mutation evidence for scenario 4;
+- exact stale-writer/final-owner evidence for scenario 6;
+- complete scenario 13 attribution, installation, inventory and token-scope
+  negative identities;
+- GitHub-only durability plus explicit network-destination inventory for
+  scenario 14;
+- history-preserving cleanup decisions; and
+- a final boundary that never implies production approval or Workstream E
+  authority.
 
 ## Candidate validation
 
-Pull-request validation is credential-free. `tests/test_workstream_d.py` checks
-both the harness itself and representative accepted B/C semantics using only the
-isolated `LocalCanonicalRepository` fixture. In particular it verifies:
+Pull-request validation remains credential-free. `contract-check` checks out the
+candidate with `persist-credentials: false` and runs both the existing
+`tests/test_workstream_d.py` contract suite and the new
+`tests/test_workstream_d_live.py` remediation regressions. Repository CI also
+runs dependency-free unittest discovery and Python compilation before the
+existing isolated Workstream B real-runtime gate.
 
-- deterministic distinct `ALLOCATE_NEXT` allocation;
-- one-owner exclusion for simultaneous nominated-task semantics;
-- duplicate delivery idempotency;
-- changed-payload request-ID rejection without canonical mutation;
-- expected-old-SHA stale-writer rejection with no force path;
-- push failure before visibility;
-- history-preserving explicit release;
-- exact scenario coverage and run/attempt isolation;
-- exact-authority binding in the driver, ledger and final summary;
-- one-to-one assertion, fault and client evidence binding;
-- rejection of fault evidence whose expected outcome is self-defined instead of
-  the contract-owned outcome, whose identity is outside the authorised attempt,
-  whose fixture failed or whose actual outcome differs from the contract outcome;
-- scenarios 1 and 2 requiring exactly two distinct bound terminal-result bundles,
-  and scenario 3 requiring one distinct terminal bundle for every retained source
-  request rather than accepting parallel arrays that merely have sufficient
-  cardinality;
-- scenario 4 exact repeated-result/non-mutation evidence plus binding to the
-  retained request/ref/row/projection evidence;
-- scenario 6 exact winner/final-owner/ref evidence plus binding to the retained
-  canonical allocation row and rejection of any stale allocation row;
-- scenario 13 individual negative-fixture coverage plus exact inventory and token scopes;
-- scenario 14 complete GitHub durability and network inventory;
-- executable path/blob/trusted-commit binding by reading the actual checked-out
-  Git object database for the trusted commit and rejecting a fabricated
-  self-consistent tree entry/blob pair, plus an exact complete pinned dependency
-  identity set; and
-- successful exit status and Workstream E exclusion.
+The remediation regressions prove, without reading any allocator secret or
+performing live mutation, that:
 
-These PR tests are regression/contract checks. They are not scenario 1–14 live
-evidence and must never be cited as such.
+- the live path accepts only `8ft0-ai/gitstate-allocation-control`, protected
+  `main`, exact trusted/protocol SHAs, run attempt `1`, the exact attempt
+  namespace, explicit fixture mode and explicit execution enablement;
+- a failed gate cannot read the App private key;
+- the owner-authenticated installation inventory attestation must be current,
+  selected-repository mode, and exactly the control/state repository IDs;
+- the control/state installation-token profiles remain the existing exact
+  single-repository profiles;
+- both temporary installation tokens have an explicit revocation path and are
+  cleared from the process object after cleanup;
+- any pre-existing remote ref fails the one-time fixture bootstrap closed;
+- scenario 15 is unreachable and the executor dispatch set is exactly 1–14;
+- the module is not imported by normal Phase 2 intake and `policy/actors.json`
+  retains no new GitHub App principal;
+- the workflow remains manual-only, PR validation receives no allocator secret,
+  and the live job remains behind the existing protected environment; and
+- the result contract explicitly keeps production approval and Workstream E
+  false.
 
-## Trusted-main execution gate
+The existing Workstream D tests continue to validate the evidence schema,
+scenario-specific bindings, exact dependency identities, fault identity and
+outcome ownership, token-scope evidence, GitHub durability inventory and
+trusted Git-object identity checks. These PR tests remain regression/contract
+checks; they are not scenario 1–14 live evidence.
 
-`.github/workflows/phase2-adversarial.yml` remains manual-only. On an unmerged
-PR it can perform only credential-free contract validation. The protected live
-gate is fail-closed unless all of the following are true at execution time:
+## Fixture-only trusted-main execution path
+
+`.github/workflows/phase2-adversarial.yml` remains `workflow_dispatch` only. It
+now exposes three bounded operations:
+
+- `contract_check` — credential-free contract/regression validation only;
+- `live_authority_gate` — the pre-existing protected-main authority check only;
+- `live_scenario_suite` — the new fixture-only Workstream D executor, which is
+  not authorised merely by being present on `main`.
+
+`live_scenario_suite` is fail-closed unless all of the following are true at
+execution time:
 
 - repository is exactly `8ft0-ai/gitstate-allocation-control`;
 - ref is exactly protected `main`;
 - workflow run attempt is exactly `1`;
-- the supplied expected control and protocol SHAs equal the immutable trusted
-  values being authorised for that run;
-- `PHASE2_WORKSTREAM_D_EXECUTION_ENABLED=true` is present in repository Actions
-  variables;
-- a run-bound attempt namespace matches the current run ID and attempt; and
-- protected `phase-2-allocator` environment approval succeeds.
+- the supplied expected control SHA equals the immutable dispatched `main` SHA;
+- the supplied protocol SHA equals
+  `4ad2cebf6c37d21f44e5652a70f5fb4e77da74ae`;
+- a run-bound attempt namespace matches the current run ID and attempt;
+- fixture mode is exactly `workstream-d-synthetic-fixture-v1`;
+- `PHASE2_WORKSTREAM_D_EXECUTION_ENABLED=true` is present; and
+- the protected `phase-2-allocator` environment approval succeeds.
 
-The live operation intentionally stops at the authority/evidence-plan boundary
-in this candidate. It does not mint the allocator App credential, bootstrap or
-mutate `refs/dolt/data`, post request/projection comments or execute any of the
-fourteen scenarios merely because the harness PR exists. Those actions require
-a separate owner-authorised post-merge execution session that revalidates the
-current App inventory, token profiles, branch/environment controls and exact
-trusted SHAs immediately before credential use.
+The workflow performs this complete gate before dependency installation and
+before the step that references the App private key. The live step repeats the
+same validation before reading the key. A branch or PR version of the code
+therefore has no path to allocator credentials.
 
-This separation is deliberate: merge of the harness makes the scenario/evidence
-contract immutable on protected `main`; it does not itself grant live execution
-authority.
+## Exact installation and credential boundary
 
-## Evidence boundary
+The executor reuses the accepted credential helpers and does not add an App
+permission or token profile. Before credential use it validates a fresh
+owner-authenticated inventory attestation whose App/installation identity,
+`selected` repository mode, age and repository set must exactly match:
 
-A live Workstream D pass requires one validated `ScenarioEvidence` record for
-each scenario 1–14 under the same attempt namespace and the exact authority
-identities supplied by the owner-authorised run. Neither the scenario driver,
-ledger nor final summary accepts a different but syntactically valid control or
-protocol SHA. A first record therefore cannot redefine the authority boundary.
+- control: repository ID `1321106380`;
+- state: repository ID `1317964582`.
 
-Evidence is rejected if an assertion is missing, duplicated, substituted or
-failed; a required individual fault lacks its exact run/attempt-qualified
-identity, declares an expected outcome different from the contract-owned value,
-records a failed fixture, or records an actual outcome different from that
-contract value; a client contract lacks a clean transcript digest; any scenarios
-1–3 terminal bundle is missing, duplicated or does not map exactly to the retained
-source/request/ref/Dolt/row/projection evidence; an executable path/blob is not
-independently resolved from the exact trusted commit's Git tree and matched to
-the retained tree entry/blob identity; the trusted commit object is unavailable
-to the verifier; the pinned dependency set differs; the scenario exits non-zero;
-the run is a rerun; evidence crosses runs/attempts; or durability relies on a
-service outside GitHub Issues, repositories, refs or Actions.
+The attestation is non-secret input; the executor retains only its SHA-256
+identity in scenario evidence.
 
-Scenario 4 additionally requires proof that the repeated result envelope is
-identical, that neither the canonical ref nor request/allocation row counts
-change, and that the repeated proof names the exact retained canonical request
-row, accepted ref and original/repeated projection records. Scenario 6
-additionally requires a structured canonical allocation-row record for the
-winning allocation and proves that the stale allocation did not become a retained
-canonical row. Scenario 13 requires a current exact two-repository installation
-inventory, exact reduced control/state token request and returned scopes,
-cross-repository denial, and individual evidence for every required negative
-fixture. Scenario 14 requires the complete GitHub durability category inventory
-and a recorded network inventory. The final summary is derived only after the
-complete exact-authority ledger revalidates all fourteen records.
+After the static gate and inventory check, the credential sequence is fixed:
+
+1. read the protected App private key, immediately remove its environment entry,
+   and create the short-lived App JWT;
+2. revalidate exact App ID, installation ID, slug, owner account and selected
+   repository mode against the control repository;
+3. mint only the control token for repository `1321106380` with exactly
+   `metadata:read`, `contents:read`, `issues:write`, validate the returned scope,
+   and prove state-repository denial;
+4. mint only the state token for repository `1317964582` with exactly
+   `metadata:read`, `contents:write`, validate the returned scope, and prove it
+   cannot write the public control repository; and
+5. after execution or failure, attempt revocation of both installation tokens,
+   clear both token strings, and fail a nominally successful run if revocation
+   itself fails.
+
+No token is passed to checkout, written to a Git config, persisted to an
+artifact/cache/output, or included in retained evidence. The App JWT and private
+key are not evidence and are never printed.
+
+The temporary repository execution-enable variable remains an owner governance
+control rather than becoming a new runtime permission. The workflow deliberately
+does not request GitHub Actions administration permission or introduce an owner
+credential merely to delete that variable. The fresh live-execution procedure
+must remove the enablement immediately after the authorised run; the workflow
+result remains explicitly `...PENDING_ENABLEMENT_REMOVAL` until that governance
+cleanup is reconciled.
+
+## Isolated state bootstrap
+
+The live executor is valid only for the dedicated first-attempt synthetic
+fixture boundary. Before bootstrap it performs an authenticated `git ls-remote
+--refs` against `8ft0-ai/gitstate-allocation-state`. Any existing ref — including
+an existing `refs/dolt/data` or unrelated retained state — stops execution with
+`UNEXPECTED_CANONICAL_STATE`. Nothing is overwritten or reused.
+
+For an empty repository only, the executor uses the already reviewed pinned
+Beads `v1.1.0`, Dolt `v2.1.4` and PyMySQL `1.1.2` identities to initialise the
+synthetic Beads/Dolt state and apply the accepted Workstream B allocation schema.
+Subsequent canonical operations use the existing `DoltCanonicalRepository`,
+which preserves expected-old-SHA compare-and-swap publication and exposes no
+force path.
+
+All seeded tasks, request identities and fixture transport are qualified by the
+authorised Workstream D attempt namespace. No user, production, planning or
+other repository content is admitted to the fixture dataset.
+
+## GitHub fixture transport and runtime actor policy
+
+The control-token write surface is limited to the dedicated public allocation
+issue. Source/projection comments emitted by the executor are non-sensitive,
+synthetic, attempt-qualified Workstream D fixture evidence.
+
+Those fixture comments do **not** become a new positive sender class. The
+executor does not modify `policy/actors.json`, does not add the allocator App to
+`github_apps`, and is not imported by `phase2-intake.yml` or normal runtime
+intake. Positive fixture transactions are injected directly into the already
+accepted Workstream B service with an attempt-qualified synthetic context.
+Scenario 13 separately exercises the accepted authorisation function and the
+required negative App/bot/namespace/installation/inventory/token cases. This
+keeps runtime actor policy unchanged while still testing the Workstream D
+capability boundary.
+
+## Scenario execution and fault boundary
+
+`phase2/workstream_d_live.py` implements only scenarios 1–14. It composes the
+accepted Workstream B/C services and exact test-only fault wrappers; it does not
+add a general command runner, plugin point or production runtime API.
+
+The bounded fixture handlers cover:
+
+- deterministic close-timed allocation and nominated-task exclusion;
+- retained request processing and pagination checks;
+- idempotent redelivery and changed-payload rejection;
+- expected-old-SHA stale-writer rejection with no force publication;
+- injected canonical-push failure before visibility;
+- projection missing/repair and orphan invalidation from canonical state;
+- pre/post-ingress source edit/delete boundaries;
+- fresh Git-capable reconstruction and transient ownership-mismatch detection;
+- GitHub-API-only projection consumption;
+- explicit history-preserving release;
+- every scenario 13 fault identity plus exact current inventory/token evidence;
+  and
+- GitHub-only reconstruction/durability with explicit network inventory.
+
+Fault injection is attempt-local. It wraps accepted components or mutates only a
+transient clone unless the scenario specifically requires durable synthetic
+GitHub evidence. It does not change parser, policy, allocation, CAS,
+projection/reconciliation or credential-profile semantics.
+
+## Evidence and durability boundary
+
+Every live scenario result is validated by the existing `ScenarioEvidence`,
+`ScenarioDriver` and `EvidenceLedger` contract under one exact run/attempt,
+trusted control SHA and protocol SHA. The executor adds its own immutable
+`phase2/workstream_d_live.py` blob identity to each evidence record while
+retaining all previously required executable identities and pinned dependency
+identities.
+
+Durable evidence remains limited to GitHub Issues, GitHub repositories/refs and
+GitHub Actions. Scenario 14 records transient network destinations used by the
+bounded execution path; no external service is introduced as canonical or
+retained evidence storage.
+
+The public final summary contains only run/attempt authority identities,
+scenario-evidence SHA-256 identities, the inventory-attestation SHA-256 identity
+and explicit cleanup/governance flags. It never contains an App JWT, private key
+or installation token. The detailed governance reconciliation for #15 occurs
+only after credential revocation and log review.
+
+## Cleanup and retained history
+
+Scenario history, accepted canonical Git/Dolt history and public synthetic
+fixture evidence are retained because Workstream D is a durability/reconstruction
+gate. Cleanup therefore never deletes canonical request/allocation/event history
+merely to make the test repository look empty.
+
+The runtime cleanup boundary is instead:
+
+- temporary workspaces and local Dolt servers are destroyed;
+- both installation tokens are explicitly revoked and cleared;
+- the App private key is removed from the process environment after reading;
+- no credential-bearing URL is emitted in an error or retained result; and
+- the owner removes `PHASE2_WORKSTREAM_D_EXECUTION_ENABLED` immediately after the
+  authorised live run, with #15 reconciliation recording that cleanup.
+
+A failed cleanup cannot be converted into a Workstream D pass.
+
+## Authority boundary
+
+This remediation candidate and its PR validation do **not** authorise any live
+scenario execution. The prior live authority was consumed before the execution
+path gap was discovered. After this candidate is independently reviewed and
+merged, scenarios 1–14 require a fresh owner-authorised execution session that
+immediately revalidates current `main`, protocol authority, protected environment,
+App installation/inventory and exact reduced token profiles before any credential
+is read.
+
+A successful synthetic Workstream D result still does not approve production
+use. Workstream E / scenario 15 remains outside this module and requires its own
+governed gate.
 
 ## Non-goals
 
 This candidate does not:
 
-- execute scenarios 1–14;
-- use or expose allocator/App credentials;
-- bootstrap or mutate live canonical state;
-- alter the accepted intake parser or actor policy;
-- alter token profiles or cross-repository scope controls;
-- alter deterministic selection, canonical ownership, release or no-force CAS semantics;
-- alter projection/reconciliation ownership rules;
+- execute scenarios 1–14 during PR validation or under the previous authority;
+- grant a PR branch or normal intake path allocator credentials;
+- add or broaden an App permission, token profile or repository installation;
+- add the planning repository, another child repository or external durable
+  service to runtime scope;
+- add a standing owner credential or Actions-administration runtime permission;
+- change `policy/actors.json`, parser semantics or the positive runtime sender
+  set;
+- change deterministic selection, canonical ownership, release, no-force CAS,
+  projection or reconciliation semantics;
 - add leases, expiry, completion orchestration or another protocol capability;
 - implement scenario 15 or Workstream E; or
 - approve production use.
