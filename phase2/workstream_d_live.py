@@ -442,7 +442,12 @@ def _free_port() -> int:
 
 
 class ManagedDoltConnection:
-    def __init__(self, database: Path, dolt_bin: str) -> None:
+    def __init__(
+        self,
+        database: Path,
+        dolt_bin: str,
+        git_env: Mapping[str, str] | None = None,
+    ) -> None:
         try:
             import pymysql  # type: ignore
         except ImportError as exc:
@@ -463,6 +468,7 @@ class ManagedDoltConnection:
                 "warning",
             ],
             cwd=database,
+            env=None if git_env is None else dict(git_env),
             text=True,
             stdout=self.log,
             stderr=subprocess.STDOUT,
@@ -648,7 +654,7 @@ def bootstrap_fixture_repository(
 
     repository = DoltCanonicalRepository(
         "git+" + remote,
-        lambda database: ManagedDoltConnection(database, dolt_bin),
+        lambda database: ManagedDoltConnection(database, dolt_bin, env),
         dolt_bin=dolt_bin,
         run_command=credentialled_run,
         workspace_root=root,
