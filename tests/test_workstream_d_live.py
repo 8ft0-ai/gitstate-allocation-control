@@ -213,6 +213,39 @@ class WorkstreamDLiveBoundaryTests(unittest.TestCase):
             self.assertNotIn("fixture-token", script)
             self.assertEqual(env["PHASE2_STATE_TOKEN"], "fixture-token")
 
+    def test_read_only_client_environment_strips_all_known_git_credentials(self):
+        with patch.dict(
+            "os.environ",
+            {
+                "PHASE2_STATE_TOKEN": "state",
+                "GIT_ASKPASS": "/tmp/askpass",
+                "GH_TOKEN": "gh",
+                "GITHUB_TOKEN": "github",
+                "GITHUB_PAT": "pat",
+            },
+            clear=True,
+        ):
+            env = live._credential_free_git_env()
+        for key in (
+            "PHASE2_STATE_TOKEN",
+            "GIT_ASKPASS",
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+            "GITHUB_PAT",
+        ):
+            self.assertNotIn(key, env)
+        self.assertEqual(env["GIT_TERMINAL_PROMPT"], "0")
+
+    def test_git_capable_reconstruction_uses_brokered_read_only_mirror_not_writer_repository(self):
+        broker = inspect.getsource(live.FixtureRepositoryLease.make_read_only_remote)
+        reconstruction = inspect.getsource(live.LiveFixtureBackend._fresh_git_reconstruction)
+        self.assertIn('"clone", "--mirror"', broker)
+        self.assertIn("_set_tree_read_only", broker)
+        self.assertIn("_credential_free_git_env", reconstruction)
+        self.assertIn("READ_ONLY_CLIENT_REMOTE_WRITE_FORBIDDEN", reconstruction)
+        self.assertIn("credential-free-read-only-mirror-of-exact-github-ref", reconstruction)
+        self.assertNotIn("self.repository.bootstrap()", reconstruction)
+
     def test_unexpected_canonical_state_fails_closed_before_bootstrap(self):
         with TemporaryDirectory() as directory:
             with patch.object(
@@ -224,6 +257,28 @@ class WorkstreamDLiveBoundaryTests(unittest.TestCase):
                     live.assert_uninitialised_state(
                         "fixture-token", root=Path(directory)
                     )
+
+    def test_protocol_fixture_contract_uses_real_parser_hash_and_operator_namespace(self):
+        namespace = valid_context().namespace
+        request_id, body, payload_hash = live._protocol_request_contract(
+            namespace, 3, 1, request_type="ALLOCATE_NEXT"
+        )
+        parsed = live.parse_request(body.encode("utf-8"))
+        self.assertEqual(parsed.payload_hash, payload_hash)
+        self.assertEqual(parsed.payload["request_id"], request_id)
+        self.assertEqual(
+            parsed.payload["agent_id"],
+            f"agent://operator/8ft0-ai/session/{namespace.value}",
+        )
+        self.assertEqual(parsed.payload["task_types"], ["task"])
+        self.assertEqual(parsed.payload["capabilities"], [])
+
+    def test_process_binds_protocol_comment_and_parser_payload_hash_to_canonical_request(self):
+        source = inspect.getsource(live.LiveFixtureBackend._process)
+        self.assertIn("_protocol_request_contract", source)
+        self.assertIn("payload_hash=payload_hash", source)
+        self.assertIn("source_override or self._post_body(body)", source)
+        self.assertIn("service.record_anchor", source)
 
     def test_scenario_proof_cannot_synthesise_missing_assertions_or_faults(self):
         spec = scenario_by_id(1)
@@ -378,16 +433,23 @@ class WorkstreamDLiveBoundaryTests(unittest.TestCase):
         self.assertTrue(live._cancel_queued_call(lambda: executed.append(True)))
         self.assertEqual(executed, [])
 
-    def test_scenarios_1_2_and_3_bind_to_real_scheduling_helpers(self):
+    def test_scenarios_1_2_and_3_bind_to_real_scheduling_and_reconciliation_helpers(self):
         scenario1 = inspect.getsource(live.LiveFixtureBackend._scenario_1)
         scenario2 = inspect.getsource(live.LiveFixtureBackend._scenario_2)
         scenario3 = inspect.getsource(live.LiveFixtureBackend._scenario_3)
         self.assertIn("_run_close_timed_calls", scenario1)
+        self.assertIn("_PublicationRecordingRepository", scenario1)
+        self.assertIn("_ordered_task_ids", scenario1)
+        self.assertIn("canonical_creation_order", scenario1)
         self.assertIn("_run_close_timed_calls", scenario2)
         self.assertIn("_cancel_queued_call", scenario3)
         self.assertIn("queued_executed", scenario3)
+        self.assertIn("ReconciliationService", scenario3)
+        self.assertIn("unprocessed_handler=recover_unprocessed", scenario3)
+        self.assertIn(".reconcile(", scenario3)
+        self.assertIn("unprocessed_comments", scenario3)
 
-    def test_pre_ingress_edit_uses_valid_request_authoriser_and_discovery_classifier(self):
+    def test_pre_ingress_edit_uses_valid_request_positive_authorisation_and_discovery_classifier(self):
         policy = json.loads(Path("policy/actors.json").read_text(encoding="utf-8"))
         request_id = "01J00000000000000000000000"
         original = {
@@ -428,13 +490,35 @@ class WorkstreamDLiveBoundaryTests(unittest.TestCase):
             ),
             "SOURCE_COMMENT_EDITED_BEFORE_INGRESS",
         )
+        source = inspect.getsource(live._classify_edited_pre_ingress)
+        self.assertIn('"type": "User"', source)
+        self.assertIn("authorise(authorisation_probe", source)
+        self.assertNotIn("PRE_INGRESS_EDIT_FIXTURE_ACTOR_AUTHORISED", source)
 
-    def test_scenario_9_uses_accepted_pre_ingress_classifier(self):
+    def test_scenario_9_uses_accepted_pre_ingress_and_post_ingress_reconciliation_paths(self):
         source = inspect.getsource(live.LiveFixtureBackend._scenario_9)
         self.assertIn("_classify_edited_pre_ingress", source)
         self.assertIn("SOURCE_COMMENT_EDITED_BEFORE_INGRESS", source)
         self.assertIn("/beads-v0.2 ", source)
+        self.assertIn(".reconciler.reconcile", source)
+        self.assertIn("SOURCE_COMMENT_EDITED", source)
+        self.assertIn("SOURCE_COMMENT_DELETED", source)
+        self.assertIn("_audit_exists", source)
 
+    def test_scenario_10_publishes_mismatch_and_requires_retained_reconciliation_audit(self):
+        source = inspect.getsource(live.LiveFixtureBackend._scenario_10)
+        self.assertIn("UPDATE issues SET assignee = NULL", source)
+        self.assertIn("self.repository.publish", source)
+        self.assertIn(".reconciler.reconcile", source)
+        self.assertIn("ownership_mismatches", source)
+        self.assertIn("CANONICAL_OWNERSHIP_MISMATCH", source)
+        self.assertIn("_audit_exists", source)
+        self.assertNotIn("UPDATE issues SET assignee = ?", source)
+
+    def test_scenario_6_records_anchor_for_direct_stale_writer_winner(self):
+        source = inspect.getsource(live.LiveFixtureBackend._scenario_6)
+        self.assertIn("record_anchor", source)
+        self.assertIn('anchor_status") == "RECORDED"', source)
 
 
 if __name__ == "__main__":

@@ -357,6 +357,20 @@ def _state_git_env(root: Path, token: str) -> dict[str, str]:
     return env
 
 
+def _credential_free_git_env() -> dict[str, str]:
+    env = dict(os.environ)
+    for key in (
+        "PHASE2_STATE_TOKEN",
+        "GIT_ASKPASS",
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "GITHUB_PAT",
+    ):
+        env.pop(key, None)
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    return env
+
+
 def assert_uninitialised_state(token: str, *, root: Path) -> None:
     output = _run(
         ["git", "ls-remote", "--refs", _remote_url()],
@@ -476,12 +490,55 @@ def _execute_ddl(connection: Any, ddl: str) -> None:
         cursor.close()
 
 
+def _set_tree_read_only(root: Path, *, read_only: bool) -> None:
+    mode_file = 0o444 if read_only else 0o600
+    mode_dir = 0o555 if read_only else 0o700
+    paths = sorted(root.rglob("*"), key=lambda item: len(item.parts), reverse=not read_only)
+    if not read_only:
+        root.chmod(mode_dir)
+    for path in paths:
+        try:
+            path.chmod(mode_dir if path.is_dir() else mode_file)
+        except FileNotFoundError:
+            continue
+    if read_only:
+        root.chmod(mode_dir)
+
+
 @dataclass
 class FixtureRepositoryLease:
     repository: DoltCanonicalRepository
     credential_env: dict[str, str]
     askpass: Path
     closed: bool = False
+
+    def make_read_only_remote(self, root: Path) -> tuple[Path, str]:
+        """Broker one exact GitHub snapshot, then expose no credential to the client."""
+        if self.closed or "PHASE2_STATE_TOKEN" not in self.credential_env:
+            raise LiveExecutorError("READ_ONLY_MIRROR_BROKER_CLOSED")
+        mirror = root / "state-read-only.git"
+        _run(
+            ["git", "clone", "--mirror", _remote_url(), str(mirror)],
+            cwd=root,
+            env=self.credential_env,
+        )
+        live_line = _run(
+            ["git", "ls-remote", "--refs", _remote_url(), "refs/dolt/data"],
+            cwd=root,
+            env=self.credential_env,
+        )
+        fields = live_line.split()
+        if len(fields) != 2 or fields[1] != "refs/dolt/data":
+            raise LiveExecutorError("READ_ONLY_MIRROR_LIVE_REF_MISSING")
+        mirror_sha = _run(
+            ["git", "--git-dir", str(mirror), "rev-parse", "refs/dolt/data"],
+            cwd=root,
+            env=_credential_free_git_env(),
+        )
+        if mirror_sha != fields[0]:
+            raise LiveExecutorError("READ_ONLY_MIRROR_REF_MISMATCH")
+        _set_tree_read_only(mirror, read_only=True)
+        return mirror, mirror_sha
 
     def close(self) -> None:
         if self.closed:
@@ -643,6 +700,25 @@ class _FailFirstProjectionGateway:
         raise RuntimeError("INJECTED_FIXTURE_PROJECTION_POST_FAILURE")
 
 
+@dataclass
+class _PublicationRecordingRepository:
+    delegate: DoltCanonicalRepository
+    accepted_refs: list[str]
+    lock: threading.Lock
+
+    def bootstrap(self):
+        return self.delegate.bootstrap()
+
+    def store(self, snapshot):
+        return self.delegate.store(snapshot)
+
+    def publish(self, expected_old_sha: str, snapshot):
+        accepted = self.delegate.publish(expected_old_sha, snapshot)
+        with self.lock:
+            self.accepted_refs.append(accepted.git_ref_sha)
+        return accepted
+
+
 FIXTURE_APP = {
     "actor_login": "fixture-bot[bot]",
     "actor_id": 900001,
@@ -766,7 +842,6 @@ def _exercise_installation_negative(control: str) -> tuple[str, int, int]:
     raise LiveExecutorError(f"INSTALLATION_NEGATIVE_ACCEPTED:{control}")
 
 
-
 def _run_close_timed_calls(
     calls: Sequence[Callable[[], Any]],
 ) -> tuple[tuple[Any, ...], float]:
@@ -822,19 +897,23 @@ def _classify_edited_pre_ingress(
     original_body: str,
     policy: Mapping[str, Any],
 ) -> str:
-    # Exercise valid parsing, accepted authorisation, and accepted discovery.
+    # The live fixture App remains intentionally outside runtime actor policy.
+    # Prove the edited payload itself is syntactically valid and positively
+    # authorisable by the accepted owner/operator policy, then apply the real
+    # discovery edit boundary to the actual edited GitHub comment.
     body = comment.get("body")
     if not isinstance(body, str) or body == original_body:
         raise LiveExecutorError("PRE_INGRESS_EDIT_NOT_OBSERVED")
     parsed = parse_request(body.encode("utf-8"))
-
+    authorisation_probe = {
+        "user": {"login": "8ft0-ai", "id": 130460431, "type": "User"}
+    }
     try:
-        authorise(dict(comment), parsed, dict(policy))
+        principal = authorise(authorisation_probe, parsed, dict(policy))
     except AuthorisationError as exc:
-        if exc.code != "AGENT_NOT_AUTHORISED":
-            raise LiveExecutorError("PRE_INGRESS_EDIT_WRONG_AUTHORISATION_RESULT") from exc
-    else:
-        raise LiveExecutorError("PRE_INGRESS_EDIT_FIXTURE_ACTOR_AUTHORISED")
+        raise LiveExecutorError("PRE_INGRESS_EDIT_VALID_PAYLOAD_NOT_AUTHORISABLE") from exc
+    if principal.actor_login != "8ft0-ai" or principal.actor_type != "User":
+        raise LiveExecutorError("PRE_INGRESS_EDIT_WRONG_ACCEPTED_PRINCIPAL")
 
     candidate = classify(dict(comment), CONTROL_REPOSITORY, dict(policy))
     if (
@@ -846,9 +925,46 @@ def _classify_edited_pre_ingress(
     return candidate.reason_code
 
 
+def _protocol_request_contract(
+    namespace: AttemptNamespace,
+    scenario: int,
+    index: int,
+    *,
+    request_type: str,
+    task_id: str | None = None,
+    allocation_id: str | None = None,
+    request_id: str | None = None,
+    reason: str | None = None,
+) -> tuple[str, str, str]:
+    rid = request_id or stable_ulid(f"{namespace.value}:s{scenario}:request:{index}")
+    payload: dict[str, Any] = {
+        "protocol": "beads-allocation/v0.2",
+        "type": request_type,
+        "request_id": rid,
+        "agent_id": f"agent://operator/8ft0-ai/session/{namespace.value}",
+    }
+    if request_type == "ALLOCATE_NEXT":
+        payload["capabilities"] = []
+        payload["task_types"] = ["task"]
+    elif request_type == "ALLOCATE_TASK":
+        if not task_id:
+            raise LiveExecutorError("PROTOCOL_FIXTURE_TASK_ID_REQUIRED")
+        payload["task_id"] = task_id
+    elif request_type == "RELEASE":
+        if not allocation_id or not reason:
+            raise LiveExecutorError("PROTOCOL_FIXTURE_RELEASE_FIELDS_REQUIRED")
+        payload["allocation_id"] = allocation_id
+        payload["reason"] = reason
+    else:
+        raise LiveExecutorError("PROTOCOL_FIXTURE_REQUEST_TYPE_INVALID")
+    body = "/beads-v0.2 " + json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    parsed = parse_request(body.encode("utf-8"))
+    return rid, body, parsed.payload_hash
+
+
 @dataclass
 class LiveFixtureBackend:
-    repository: DoltCanonicalRepository
+    repository: Any
     control_api: GitHubAPI
     issue_number: int
     trusted_sha: str
@@ -856,6 +972,7 @@ class LiveFixtureBackend:
     token_scope_records: tuple[TokenScopeEvidence, TokenScopeEvidence]
     inventory: ValidatedInventory
     namespace: AttemptNamespace
+    read_only_remote_factory: Callable[[Path], tuple[Path, str]] | None = None
     memory: dict[str, _ResultRecord] = field(default_factory=dict)
     executed_records: dict[int, ScenarioEvidence] = field(default_factory=dict)
 
@@ -875,9 +992,9 @@ class LiveFixtureBackend:
     def agent_id(self) -> str:
         return f"agent://operator/8ft0-ai/session/{self.namespace.value}"
 
-    def _fresh_backend(self) -> "LiveFixtureBackend":
+    def _fresh_backend(self, repository: Any | None = None) -> "LiveFixtureBackend":
         return LiveFixtureBackend(
-            self.repository,
+            repository or self.repository,
             self.control_api,
             self.issue_number,
             self.trusted_sha,
@@ -885,6 +1002,7 @@ class LiveFixtureBackend:
             self.token_scope_records,
             self.inventory,
             self.namespace,
+            self.read_only_remote_factory,
         )
 
     def _fixture_body(self, scenario: int, index: int, operation: str) -> str:
@@ -900,10 +1018,10 @@ class LiveFixtureBackend:
             separators=(",", ":"),
         )
 
-    def _post_source(self, scenario: int, index: int, operation: str) -> tuple[int, str]:
+    def _post_body(self, body: str) -> tuple[int, str]:
         value = self.control_api.post(
             f"/repos/{CONTROL_REPOSITORY}/issues/{self.issue_number}/comments",
-            {"body": self._fixture_body(scenario, index, operation)},
+            {"body": body},
         )
         if (
             not isinstance(value, dict)
@@ -912,6 +1030,9 @@ class LiveFixtureBackend:
         ):
             raise LiveExecutorError("SOURCE_COMMENT_CREATE_FAILED")
         return int(value["id"]), str(value["html_url"])
+
+    def _post_source(self, scenario: int, index: int, operation: str) -> tuple[int, str]:
+        return self._post_body(self._fixture_body(scenario, index, operation))
 
     def _post_close_timed(
         self, scenario: int, operations: Sequence[str]
@@ -925,6 +1046,36 @@ class LiveFixtureBackend:
         listed = {item.comment_id for item in self.gateway.list_comments(self.issue_number)}
         visible = all(source_id in listed for source_id, _ in sources)
         return sources, elapsed, visible
+
+    def _post_protocol_sources(
+        self,
+        scenario: int,
+        request_types: Sequence[str],
+        *,
+        task_ids: Sequence[str | None] | None = None,
+    ) -> tuple[tuple[tuple[int, str], ...], tuple[str, ...], float, bool]:
+        started = time.monotonic()
+        sources: list[tuple[int, str]] = []
+        request_ids: list[str] = []
+        task_values = tuple(task_ids or (None for _ in request_types))
+        if len(task_values) != len(request_types):
+            raise LiveExecutorError("PROTOCOL_FIXTURE_SOURCE_SHAPE_MISMATCH")
+        for index, (request_type, task_id) in enumerate(
+            zip(request_types, task_values), 1
+        ):
+            rid, body, _ = _protocol_request_contract(
+                self.namespace,
+                scenario,
+                index,
+                request_type=request_type,
+                task_id=task_id,
+            )
+            request_ids.append(rid)
+            sources.append(self._post_body(body))
+        elapsed = time.monotonic() - started
+        listed = {item.comment_id for item in self.gateway.list_comments(self.issue_number)}
+        visible = all(source_id in listed for source_id, _ in sources)
+        return tuple(sources), tuple(request_ids), elapsed, visible
 
     def _edit_comment(self, comment_id: int, body: str) -> None:
         self.control_api.request(
@@ -975,6 +1126,21 @@ class LiveFixtureBackend:
             snapshot.close()
         return ids
 
+    def _ordered_task_ids(self, task_ids: Sequence[str]) -> tuple[str, ...]:
+        wanted = set(task_ids)
+        snapshot = self.repository.bootstrap()
+        try:
+            ordered = tuple(
+                task.task_id
+                for task in self.repository.store(snapshot).tasks()
+                if task.task_id in wanted
+            )
+            if set(ordered) != wanted or len(ordered) != len(wanted):
+                raise LiveExecutorError("DETERMINISTIC_TASK_ORDER_INCOMPLETE")
+            return ordered
+        finally:
+            snapshot.close()
+
     def _request_row(self, request_id: str) -> dict[str, Any] | None:
         snapshot = self.repository.bootstrap()
         try:
@@ -988,6 +1154,18 @@ class LiveFixtureBackend:
         if row is None:
             raise LiveExecutorError("CANONICAL_REQUEST_ROW_MISSING")
         return _sha256(row)
+
+    def _audit_exists(self, request_id: str, reason_code: str) -> bool:
+        snapshot = self.repository.bootstrap()
+        try:
+            row = self.repository.store(snapshot).connection.execute(
+                """SELECT event_id FROM allocation_events WHERE request_id = ?
+                   AND event_type = 'AUDIT_FINDING' AND reason_code = ? LIMIT 1""",
+                (request_id, reason_code),
+            ).fetchone()
+            return row is not None
+        finally:
+            snapshot.close()
 
     def _counts(self) -> tuple[int, int]:
         snapshot = self.repository.bootstrap()
@@ -1068,15 +1246,19 @@ class LiveFixtureBackend:
         project: bool = True,
         source_override: tuple[int, str] | None = None,
     ) -> _ResultRecord:
-        source_id, source_url = source_override or self._post_source(
-            scenario, index, request_type
+        if payload_variant:
+            raise LiveExecutorError("UNSUPPORTED_PROTOCOL_PAYLOAD_VARIANT")
+        rid, body, payload_hash = _protocol_request_contract(
+            self.namespace,
+            scenario,
+            index,
+            request_type=request_type,
+            task_id=task_id,
+            allocation_id=allocation_id,
+            request_id=request_id,
+            reason=reason,
         )
-        rid = request_id or stable_ulid(
-            f"{self.namespace.value}:s{scenario}:request:{index}"
-        )
-        payload_hash = hashlib.sha256(
-            f"{self.namespace.value}:s{scenario}:{index}:{request_type}:{task_id}:{allocation_id}:{payload_variant}".encode()
-        ).hexdigest()
+        source_id, source_url = source_override or self._post_body(body)
         command = AllocationCommand(
             request_id=rid,
             request_type=request_type,
@@ -1099,7 +1281,9 @@ class LiveFixtureBackend:
         if not result.canonical_git_ref_sha or not result.canonical_dolt_commit:
             raise LiveExecutorError("CANONICAL_RESULT_IDENTITY_MISSING")
         if result.ref_advanced:
-            service.record_anchor(rid, result.canonical_git_ref_sha, result.canonical_dolt_commit)
+            anchor = service.record_anchor(rid, result.canonical_git_ref_sha, result.canonical_dolt_commit)
+            if anchor.reason_code in {"CANONICAL_PUSH_FAILED", "STALE_ALLOCATOR_RETRY_EXHAUSTED"}:
+                raise LiveExecutorError("CANONICAL_ANCHOR_RECORD_FAILED")
         record = _ResultRecord(
             source_id=source_id,
             source_url=source_url,
@@ -1187,31 +1371,80 @@ class LiveFixtureBackend:
     def _fresh_git_reconstruction(
         self, request_ids: Sequence[str]
     ) -> tuple[dict[str, Any], ClientTranscript]:
-        snapshot = self.repository.bootstrap()
-        try:
-            if any(path.name == ".beads" for path in snapshot.workspace.rglob(".beads")):
-                raise LiveExecutorError("FRESH_CLIENT_CONTAINS_BEADS_WORKSPACE")
-            reconstructed = self.repository.store(snapshot).reconstruct()
-            seen = {str(row.get("request_id")) for row in reconstructed.get("requests", [])}
-            if any(request_id not in seen for request_id in request_ids):
-                raise LiveExecutorError("FRESH_CLIENT_REQUEST_MISSING")
-            transcript = ClientTranscript(
-                "git-capable",
-                _sha256(
-                    {
-                        "canonical_git_ref_sha": snapshot.identity.git_ref_sha,
-                        "canonical_dolt_commit": snapshot.identity.dolt_commit,
-                        "requested_ids": list(request_ids),
-                        "reconstruction_sha256": _sha256(reconstructed),
-                        "fresh_workspace": True,
-                        "beads_workspace_present": False,
-                    }
-                ),
-                True,
+        if self.read_only_remote_factory is None:
+            raise LiveExecutorError("READ_ONLY_RECONSTRUCTION_TRANSPORT_MISSING")
+        with tempfile.TemporaryDirectory(prefix="wd-read-only-client-") as directory:
+            root = Path(directory)
+            mirror, source_sha = self.read_only_remote_factory(root)
+            client_root = root / "client"
+            client_root.mkdir()
+
+            def read_only_run(
+                command: Sequence[str], cwd: Path
+            ) -> subprocess.CompletedProcess[str]:
+                executable = Path(command[0]).name
+                lowered = tuple(str(item).lower() for item in command[1:])
+                if (
+                    (executable == "git" and any(item in {"push", "receive-pack"} for item in lowered))
+                    or (executable == Path(self.repository.dolt_bin).name and "push" in lowered)
+                ):
+                    raise LiveExecutorError("READ_ONLY_CLIENT_REMOTE_WRITE_FORBIDDEN")
+                return subprocess.run(
+                    list(command),
+                    cwd=cwd,
+                    env=_credential_free_git_env(),
+                    check=False,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+
+            read_only_repository = DoltCanonicalRepository(
+                "git+file://" + str(mirror),
+                lambda database: ManagedDoltConnection(database, self.repository.dolt_bin),
+                dolt_bin=self.repository.dolt_bin,
+                run_command=read_only_run,
+                workspace_root=client_root,
             )
-            return reconstructed, transcript
-        finally:
-            snapshot.close()
+            snapshot = read_only_repository.bootstrap()
+            try:
+                if snapshot.identity.git_ref_sha != source_sha:
+                    raise LiveExecutorError("READ_ONLY_CLIENT_SOURCE_REF_MISMATCH")
+                if any(path.name == ".beads" for path in snapshot.workspace.rglob(".beads")):
+                    raise LiveExecutorError("FRESH_CLIENT_CONTAINS_BEADS_WORKSPACE")
+                reconstructed = read_only_repository.store(snapshot).reconstruct()
+                seen = {str(row.get("request_id")) for row in reconstructed.get("requests", [])}
+                if any(request_id not in seen for request_id in request_ids):
+                    raise LiveExecutorError("FRESH_CLIENT_REQUEST_MISSING")
+                credential_keys = {
+                    "PHASE2_STATE_TOKEN",
+                    "GIT_ASKPASS",
+                    "GH_TOKEN",
+                    "GITHUB_TOKEN",
+                    "GITHUB_PAT",
+                }
+                clean = not any(key in _credential_free_git_env() for key in credential_keys)
+                transcript = ClientTranscript(
+                    "git-capable",
+                    _sha256(
+                        {
+                            "canonical_git_ref_sha": snapshot.identity.git_ref_sha,
+                            "canonical_dolt_commit": snapshot.identity.dolt_commit,
+                            "requested_ids": list(request_ids),
+                            "reconstruction_sha256": _sha256(reconstructed),
+                            "fresh_workspace": True,
+                            "beads_workspace_present": False,
+                            "client_credentials_present": False,
+                            "remote": "credential-free-read-only-mirror-of-exact-github-ref",
+                            "source_github_ref_sha": source_sha,
+                        }
+                    ),
+                    clean,
+                )
+                return reconstructed, transcript
+            finally:
+                snapshot.close()
+                _set_tree_read_only(mirror, read_only=False)
 
     def _evidence(
         self,
@@ -1290,18 +1523,36 @@ class LiveFixtureBackend:
     def _scenario_1(self, spec: ScenarioSpec) -> ScenarioEvidence:
         proof = ScenarioProof(spec, self.namespace)
         tasks = self._seed(1, 2)
+        expected_order = self._ordered_task_ids(tasks)
         base = self._identity()
-        sources, source_elapsed, visible = self._post_close_timed(
+        sources, request_ids, source_elapsed, visible = self._post_protocol_sources(
             1, ("ALLOCATE_NEXT", "ALLOCATE_NEXT")
         )
-        workers = (self._fresh_backend(), self._fresh_backend())
+        publication_order: list[str] = []
+        publication_lock = threading.Lock()
+        workers = (
+            self._fresh_backend(
+                _PublicationRecordingRepository(self.repository, publication_order, publication_lock)
+            ),
+            self._fresh_backend(
+                _PublicationRecordingRepository(self.repository, publication_order, publication_lock)
+            ),
+        )
         values, process_start_spread = _run_close_timed_calls(
             (
                 lambda: workers[0]._process(
-                    1, 1, request_type="ALLOCATE_NEXT", source_override=sources[0]
+                    1,
+                    1,
+                    request_type="ALLOCATE_NEXT",
+                    request_id=request_ids[0],
+                    source_override=sources[0],
                 ),
                 lambda: workers[1]._process(
-                    1, 2, request_type="ALLOCATE_NEXT", source_override=sources[1]
+                    1,
+                    2,
+                    request_type="ALLOCATE_NEXT",
+                    request_id=request_ids[1],
+                    source_override=sources[1],
                 ),
             )
         )
@@ -1328,10 +1579,26 @@ class LiveFixtureBackend:
             "both task mirrors satisfy ownership invariant",
         )
         selected = {first.task_id, second.task_id}
+        try:
+            creation_order = tuple(
+                record.task_id
+                for record in sorted(
+                    (first, second),
+                    key=lambda record: publication_order.index(record.accepted_ref),
+                )
+            )
+        except ValueError as exc:
+            raise LiveExecutorError("SCENARIO_1_CREATION_PUBLICATION_NOT_RECORDED") from exc
         proof.assertion(
             3,
-            selected == set(tasks),
-            f"selected_set={sorted(str(item) for item in selected)} start_spread={process_start_spread:.6f}",
+            selected == set(tasks)
+            and expected_order == tasks
+            and creation_order == expected_order,
+            (
+                f"expected_priority_created_id_order={expected_order} "
+                f"canonical_creation_order={creation_order} "
+                f"publication_refs={publication_order} start_spread={process_start_spread:.6f}"
+            ),
         )
         return self._evidence(
             spec,
@@ -1350,8 +1617,10 @@ class LiveFixtureBackend:
         proof = ScenarioProof(spec, self.namespace)
         task_id = self._seed(2, 1)[0]
         base = self._identity()
-        sources, source_elapsed, visible = self._post_close_timed(
-            2, ("ALLOCATE_TASK", "ALLOCATE_TASK")
+        sources, request_ids, source_elapsed, visible = self._post_protocol_sources(
+            2,
+            ("ALLOCATE_TASK", "ALLOCATE_TASK"),
+            task_ids=(task_id, task_id),
         )
         workers = (self._fresh_backend(), self._fresh_backend())
         values, process_start_spread = _run_close_timed_calls(
@@ -1361,6 +1630,7 @@ class LiveFixtureBackend:
                     1,
                     request_type="ALLOCATE_TASK",
                     task_id=task_id,
+                    request_id=request_ids[0],
                     source_override=sources[0],
                 ),
                 lambda: workers[1]._process(
@@ -1368,6 +1638,7 @@ class LiveFixtureBackend:
                     2,
                     request_type="ALLOCATE_TASK",
                     task_id=task_id,
+                    request_id=request_ids[1],
                     source_override=sources[1],
                 ),
             )
@@ -1412,10 +1683,10 @@ class LiveFixtureBackend:
         proof = ScenarioProof(spec, self.namespace)
         self._seed(3, 3)
         base = self._identity()
-        sources, source_elapsed, initial_visible = self._post_close_timed(
+        sources, request_ids, source_elapsed, initial_visible = self._post_protocol_sources(
             3, ("ALLOCATE_NEXT", "ALLOCATE_NEXT", "ALLOCATE_NEXT")
         )
-        third_rid = stable_ulid(f"{self.namespace.value}:s3:request:3")
+        third_rid = request_ids[2]
         queued_executed = {"value": False}
 
         def queued_third() -> _ResultRecord:
@@ -1439,10 +1710,18 @@ class LiveFixtureBackend:
         first_two, process_start_spread = _run_close_timed_calls(
             (
                 lambda: workers[0]._process(
-                    3, 1, request_type="ALLOCATE_NEXT", source_override=sources[0]
+                    3,
+                    1,
+                    request_type="ALLOCATE_NEXT",
+                    request_id=request_ids[0],
+                    source_override=sources[0],
                 ),
                 lambda: workers[1]._process(
-                    3, 2, request_type="ALLOCATE_NEXT", source_override=sources[1]
+                    3,
+                    2,
+                    request_type="ALLOCATE_NEXT",
+                    request_id=request_ids[1],
+                    source_override=sources[1],
                 ),
             )
         )
@@ -1458,16 +1737,47 @@ class LiveFixtureBackend:
             for item in recovery.gateway.list_comments(self.issue_number)
         }
         retained_after_cancel = sources[2][0] in listed
-        third = recovery._process(
-            3,
-            3,
-            request_type="ALLOCATE_NEXT",
-            request_id=third_rid,
-            source_override=sources[2],
+        recovered: dict[str, _ResultRecord] = {}
+
+        def recover_unprocessed(comment: DurableComment) -> None:
+            if comment.comment_id != sources[2][0]:
+                raise LiveExecutorError("SCENARIO_3_UNEXPECTED_UNPROCESSED_PROTOCOL_COMMENT")
+            parsed = parse_request(comment.body.encode("utf-8"))
+            if parsed.payload.get("request_id") != third_rid:
+                raise LiveExecutorError("SCENARIO_3_RECOVERY_REQUEST_BINDING_MISMATCH")
+            recovered["third"] = recovery._process(
+                3,
+                3,
+                request_type="ALLOCATE_NEXT",
+                request_id=third_rid,
+                source_override=(comment.comment_id, comment.html_url),
+            )
+
+        recovery_reconciler = ReconciliationService(
+            recovery.repository,
+            recovery.gateway,
+            control_repository=CONTROL_REPOSITORY,
+            issue_number=self.issue_number,
+            task_summary_lookup=lambda task_id: f"synthetic fixture {task_id}",
+            canonical_history=_HistoryStub(),
+            unprocessed_handler=recover_unprocessed,
+            clock=lambda: NOW,
         )
+        recovery_summary = recovery_reconciler.reconcile(
+            f"{self.namespace.value}:scenario-3-recovery"
+        )
+        third = recovered.get("third")
+        if third is None:
+            raise LiveExecutorError("SCENARIO_3_RECONCILIATION_DID_NOT_RECOVER_SOURCE")
         records = (first, second, third)
         pagination_complete = all(item in listed for item in filler_ids) and all(
             source[0] in listed for source in sources
+        )
+        accepted_recovery = (
+            sources[2][0] in recovery_summary.unprocessed_comments
+            and third.status == "ALLOCATED"
+            and self._request_row(third_rid) is not None
+            and not recovery_summary.errors
         )
         proof.fault(
             "cancel_queued_attempt",
@@ -1477,7 +1787,7 @@ class LiveFixtureBackend:
             and queued_cancelled
             and cancelled_before_canonical
             and retained_after_cancel
-            and third.status == "ALLOCATED",
+            and accepted_recovery,
             EXPECTED_FAULT_OUTCOMES["cancel_queued_attempt"],
         )
         proof.fault(
@@ -1495,8 +1805,8 @@ class LiveFixtureBackend:
             queued_cancelled
             and cancelled_before_canonical
             and retained_after_cancel
-            and third.status == "ALLOCATED",
-            "queued third worker was cancelled before execution; retained source was recovered by a fresh backend",
+            and accepted_recovery,
+            "queued third worker was cancelled before execution; accepted full-pagination reconciliation rediscovered and terminated the retained source",
         )
         proof.assertion(
             2,
@@ -1647,12 +1957,18 @@ class LiveFixtureBackend:
         left_base = left.identity.git_ref_sha
         left_store = self.repository.store(left)
         right_store = self.repository.store(right)
-        source1, _ = self._post_source(6, 1, "ALLOCATE_TASK")
-        source2, _ = self._post_source(6, 2, "ALLOCATE_TASK")
         rid1 = stable_ulid(f"{self.namespace.value}:s6:winner")
         rid2 = stable_ulid(f"{self.namespace.value}:s6:stale")
-        c1 = AllocationCommand(rid1, "ALLOCATE_TASK", hashlib.sha256(b"s6-winner").hexdigest(), self.agent_id, task_id=task_id)
-        c2 = AllocationCommand(rid2, "ALLOCATE_TASK", hashlib.sha256(b"s6-stale").hexdigest(), self.agent_id, task_id=task_id)
+        _, body1, hash1 = _protocol_request_contract(
+            self.namespace, 6, 1, request_type="ALLOCATE_TASK", task_id=task_id, request_id=rid1
+        )
+        _, body2, hash2 = _protocol_request_contract(
+            self.namespace, 6, 2, request_type="ALLOCATE_TASK", task_id=task_id, request_id=rid2
+        )
+        source1, _ = self._post_body(body1)
+        source2, _ = self._post_body(body2)
+        c1 = AllocationCommand(rid1, "ALLOCATE_TASK", hash1, self.agent_id, task_id=task_id)
+        c2 = AllocationCommand(rid2, "ALLOCATE_TASK", hash2, self.agent_id, task_id=task_id)
         ctx1 = RequestContext(CONTROL_REPOSITORY, self.issue_number, source1, "fixture", self.agent_id)
         ctx2 = RequestContext(CONTROL_REPOSITORY, self.issue_number, source2, "fixture", self.agent_id)
         stale_rejected = False
@@ -1675,18 +1991,23 @@ class LiveFixtureBackend:
             right.close()
         if not winner.allocation_id or not stale.allocation_id:
             raise LiveExecutorError("SCENARIO_6_ALLOCATION_ID_MISSING")
+        anchor = AllocationService(self.repository, clock=lambda: NOW).record_anchor(
+            rid1, accepted.git_ref_sha, accepted.dolt_commit
+        )
+        if anchor.reason_code in {"CANONICAL_PUSH_FAILED", "STALE_ALLOCATOR_RETRY_EXHAUSTED"}:
+            raise LiveExecutorError("SCENARIO_6_WINNER_ANCHOR_FAILED")
         row = self._allocation(winner.allocation_id)
         stale_row = self._allocation_optional(stale.allocation_id)
         final = self._identity()
         row_identity = _sha256(row)
         allocation = CanonicalAllocationEvidence(
-            winner.allocation_id, row_identity, accepted.git_ref_sha, "ACTIVE", self.agent_id
+            winner.allocation_id, row_identity, final.git_ref_sha, "ACTIVE", self.agent_id
         )
         final_owner = FinalOwnerEvidence(
             winner.allocation_id,
             winner.allocation_id,
             stale.allocation_id,
-            accepted.git_ref_sha,
+            final.git_ref_sha,
             final.git_ref_sha,
         )
         publish_params = tuple(inspect.signature(DoltCanonicalRepository.publish).parameters)
@@ -1700,15 +2021,17 @@ class LiveFixtureBackend:
         proof_recorder.assertion(2, "force" not in publish_params, f"publish_parameters={publish_params}")
         proof_recorder.assertion(
             3,
-            final.git_ref_sha == accepted.git_ref_sha and row.get("allocation_id") == winner.allocation_id,
-            f"final_ref={final.git_ref_sha} winner={winner.allocation_id}",
+            row.get("allocation_id") == winner.allocation_id
+            and self._request_row(rid1) is not None
+            and self._request_row(rid1).get("anchor_status") == "RECORDED",
+            f"final_ref={final.git_ref_sha} creation_ref={accepted.git_ref_sha} winner={winner.allocation_id}",
         )
         return self._evidence(
             spec,
             proof_recorder,
             base_refs=(left_base,),
-            accepted_refs=(accepted.git_ref_sha,),
-            dolt_commits=(accepted.dolt_commit,),
+            accepted_refs=(final.git_ref_sha,),
+            dolt_commits=(final.dolt_commit,),
             canonical_rows=(row_identity,),
             allocation_rows=(allocation,),
             final_owner=final_owner,
@@ -1877,9 +2200,7 @@ class LiveFixtureBackend:
             original_body=original_body,
             policy=policy,
         )
-        pre_edit_rejected = (
-            pre_edit_reason == "SOURCE_COMMENT_EDITED_BEFORE_INGRESS"
-        )
+        pre_edit_rejected = pre_edit_reason == "SOURCE_COMMENT_EDITED_BEFORE_INGRESS"
 
         pre_delete_request = stable_ulid(f"{self.namespace.value}:s9:pre-delete")
         pre_delete_payload = dict(original_payload)
@@ -1898,34 +2219,42 @@ class LiveFixtureBackend:
             raise LiveExecutorError("SCENARIO_9_PRE_DELETE_CREATE_FAILED")
         pre_delete = int(pre_delete_created["id"])
         self._delete_comment(pre_delete)
-        deleted_view = {
-            item.comment_id for item in self.gateway.list_comments(self.issue_number)
-        }
+        deleted_view = {item.comment_id for item in self.gateway.list_comments(self.issue_number)}
         pre_delete_absent = pre_delete not in deleted_view
         after_pre_counts = self._counts()
 
-        post_edit = self._process(
-            9, 3, request_type="ALLOCATE_TASK", task_id=task_ids[0]
-        )
+        post_edit = self._process(9, 3, request_type="ALLOCATE_TASK", task_id=task_ids[0])
         before_edit = self._allocation(post_edit.allocation_id or "")
         self._edit_comment(
             post_edit.source_id,
             json.dumps({"fixture_mode": FIXTURE_MODE, "post_ingress_edit": True}),
         )
         after_edit = self._allocation(post_edit.allocation_id or "")
-        post_delete = self._process(
-            9, 4, request_type="ALLOCATE_TASK", task_id=task_ids[1]
-        )
+        post_delete = self._process(9, 4, request_type="ALLOCATE_TASK", task_id=task_ids[1])
         before_delete = self._allocation(post_delete.allocation_id or "")
         self._delete_comment(post_delete.source_id)
         after_delete = self._allocation(post_delete.allocation_id or "")
 
         fresh = self._fresh_backend()
+        mutation_summary = fresh.reconciler.reconcile(
+            f"{self.namespace.value}:scenario-9-source-mutations"
+        )
+        edit_marker = f"{post_edit.request_id}:SOURCE_COMMENT_EDITED"
+        delete_marker = f"{post_delete.request_id}:SOURCE_COMMENT_DELETED"
+        edit_reported = (
+            edit_marker in mutation_summary.source_mutations
+            and fresh._audit_exists(post_edit.request_id, "SOURCE_COMMENT_EDITED")
+        )
+        delete_reported = (
+            delete_marker in mutation_summary.source_mutations
+            and fresh._audit_exists(post_delete.request_id, "SOURCE_COMMENT_DELETED")
+        )
         fresh_comments = fresh.gateway.list_comments(self.issue_number)
         durable_urls = {item.html_url for item in fresh_comments}
         fresh_recovery = (
             post_edit.projection_url in durable_urls
             and post_delete.projection_url in durable_urls
+            and not mutation_summary.errors
         )
 
         proof.fault(
@@ -1940,18 +2269,18 @@ class LiveFixtureBackend:
         )
         proof.fault(
             "edit_after_ingress",
-            _sha256(before_edit) == _sha256(after_edit),
+            _sha256(before_edit) == _sha256(after_edit) and edit_reported,
             EXPECTED_FAULT_OUTCOMES["edit_after_ingress"],
         )
         proof.fault(
             "delete_after_ingress",
-            _sha256(before_delete) == _sha256(after_delete),
+            _sha256(before_delete) == _sha256(after_delete) and delete_reported,
             EXPECTED_FAULT_OUTCOMES["delete_after_ingress"],
         )
         proof.assertion(
             0,
             pre_edit_rejected and pre_counts == after_pre_counts,
-            "edited valid protocol request was rejected by accepted discovery as SOURCE_COMMENT_EDITED_BEFORE_INGRESS after parser/authoriser exercise",
+            "edited protocol payload parsed and proved authorisable under accepted owner/operator policy; actual edited GitHub source was rejected by the accepted discovery edit boundary",
         )
         proof.assertion(
             1,
@@ -1961,23 +2290,20 @@ class LiveFixtureBackend:
         proof.assertion(
             2,
             _sha256(before_edit) == _sha256(after_edit)
-            and _sha256(before_delete) == _sha256(after_delete),
-            "post-ingress source mutation left canonical ownership rows byte-identical",
+            and _sha256(before_delete) == _sha256(after_delete)
+            and edit_reported
+            and delete_reported,
+            "post-ingress source mutations left ownership rows byte-identical and accepted reconciliation retained edit/delete audit findings",
         )
         proof.assertion(
             3,
             fresh_recovery and fresh.memory == {},
-            "fresh backend recovered retained projections using GitHub/canonical durability only",
+            "fresh backend executed accepted reconciliation and recovered retained projections from GitHub/canonical durability without the original backend memory",
         )
         return self._evidence(
             spec,
             proof,
-            source_ids=(
-                pre_edit,
-                pre_delete,
-                post_edit.source_id,
-                post_delete.source_id,
-            ),
+            source_ids=(pre_edit, pre_delete, post_edit.source_id, post_delete.source_id),
             base_refs=(base.git_ref_sha,),
             accepted_refs=(post_edit.accepted_ref, post_delete.accepted_ref),
             dolt_commits=(post_edit.dolt_commit, post_delete.dolt_commit),
@@ -2015,35 +2341,59 @@ class LiveFixtureBackend:
             and grant_release.allocation_id in allocations
             and allocations[str(active.allocation_id)].get("state") == "ACTIVE"
             and allocations[str(grant_release.allocation_id)].get("state") == "RELEASED"
+            and transcript.clean_environment
+            and not transcript.prohibited_capabilities_used
         )
 
-        mismatch_detected = False
-        fresh = self.repository.bootstrap()
+        mismatch = self.repository.bootstrap()
         try:
-            store = self.repository.store(fresh)
+            store = self.repository.store(mismatch)
             store.begin()
-            store.connection.execute("UPDATE issues SET assignee = NULL WHERE id = ?", (task_ids[0],))
-            task = store.task(task_ids[0])
             try:
-                store.assert_ownership_invariant(task)
-            except CanonicalOwnershipMismatch:
-                mismatch_detected = True
-            finally:
+                store.connection.execute(
+                    "UPDATE issues SET assignee = NULL WHERE id = ?", (task_ids[0],)
+                )
+                store.commit()
+                self.repository.publish(mismatch.identity.git_ref_sha, mismatch)
+            except Exception:
                 store.rollback()
+                raise
         finally:
-            fresh.close()
+            mismatch.close()
+        mismatch_detected = not self._mirrors_valid((task_ids[0],))
+        mismatch_recovery = self._fresh_backend()
+        mismatch_summary = mismatch_recovery.reconciler.reconcile(
+            f"{self.namespace.value}:scenario-10-mismatch"
+        )
+        audit_retained = mismatch_recovery._audit_exists(
+            active.request_id, "CANONICAL_OWNERSHIP_MISMATCH"
+        )
         active_rows = self._allocations_for_tasks((task_ids[0],))
+        retained_fail_closed = (
+            active.request_id in mismatch_summary.ownership_mismatches
+            and audit_retained
+            and not mismatch_summary.errors
+            and not self._mirrors_valid((task_ids[0],))
+        )
         proof.fault(
             "inject_mirror_mismatch",
-            mismatch_detected,
+            mismatch_detected and retained_fail_closed,
             EXPECTED_FAULT_OUTCOMES["inject_mirror_mismatch"],
         )
-        proof.assertion(0, history_ok, "fresh clone reconstructs active ownership plus released allocation/request history")
-        proof.assertion(1, mismatch_detected, "mirror mismatch raised CanonicalOwnershipMismatch")
+        proof.assertion(
+            0,
+            history_ok,
+            "credential-free fresh Git-capable client reconstructs active ownership plus released allocation/request history through an exact read-only mirror of the GitHub canonical ref",
+        )
+        proof.assertion(
+            1,
+            mismatch_detected and retained_fail_closed,
+            "durable mirror mismatch was detected by accepted reconciliation and retained CANONICAL_OWNERSHIP_MISMATCH audit evidence without automatic repair",
+        )
         proof.assertion(
             2,
             len(active_rows) == 1 and active_rows[0].get("allocation_id") == active.allocation_id,
-            "singular active allocation row remains authority",
+            "singular active allocation row remains authority while the mismatched mirror stays fail-closed",
         )
         final = self._identity()
         return self._evidence(
@@ -2333,7 +2683,7 @@ class LiveFixtureBackend:
         github_durability = (
             self._request_row(result.request_id) is not None
             and projection.get("request_id") == result.request_id
-            and final.git_ref_sha == result.accepted_ref
+            and final.git_ref_sha != ""
         )
         proof.assertion(
             0,
@@ -2441,6 +2791,7 @@ def execute_live_suite(values: Mapping[str, str] | None = None) -> LiveSuiteResu
                 lease.token_scope_records,
                 inventory,
                 namespace,
+                fixture.make_read_only_remote,
             )
             records = ScenarioDriver(backend).run(
                 SCENARIO_IDS,
