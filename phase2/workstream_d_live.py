@@ -81,6 +81,8 @@ from .reconciliation import DurableComment, ReconciliationService, Reconciliatio
 
 CONTROL_REPOSITORY = "8ft0-ai/gitstate-allocation-control"
 STATE_REPOSITORY = "8ft0-ai/gitstate-allocation-state"
+STATE_REPOSITORY_BASELINE_REF = "refs/heads/main"
+STATE_REPOSITORY_BASELINE_SHA = "fb872aeb52863ce3597ff8337d545cae13292696"
 CONTROL_ISSUE_NUMBER = 1
 PROTOCOL_AUTHORITY = "4ad2cebf6c37d21f44e5652a70f5fb4e77da74ae"
 FIXTURE_MODE = "workstream-d-synthetic-fixture-v1"
@@ -431,7 +433,10 @@ def assert_uninitialised_state(token: str, *, root: Path) -> None:
         cwd=root,
         env=_state_git_env(root, token),
     )
-    if output.strip():
+    expected = (
+        f"{STATE_REPOSITORY_BASELINE_SHA}\t{STATE_REPOSITORY_BASELINE_REF}"
+    )
+    if output.strip() != expected:
         raise LiveExecutorError("UNEXPECTED_CANONICAL_STATE")
 
 
@@ -633,8 +638,9 @@ def bootstrap_fixture_repository(
         env=env,
     )
     remote = _remote_url()
-    _run(["git", "remote", "add", "fixture-state", remote], cwd=source, env=env)
-    _run(["git", "push", "fixture-state", "main:main"], cwd=source, env=env)
+    # GitHub requires a default branch.  The exact remote main ref is a pinned
+    # synthetic transport sentinel, not canonical allocator state, and must
+    # never be advanced or replaced by the fixture executor.
     _run([bd_bin, "dolt", "remote", "add", "origin", "git+" + remote], cwd=source, env=env)
     _run([bd_bin, "dolt", "commit", "-m", "Workstream D pinned Beads baseline"], cwd=source, env=env)
     _run([bd_bin, "dolt", "push"], cwd=source, env=env)
