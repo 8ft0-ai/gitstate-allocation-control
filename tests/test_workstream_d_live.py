@@ -246,6 +246,108 @@ class WorkstreamDLiveBoundaryTests(unittest.TestCase):
         self.assertIn("credential-free-read-only-mirror-of-exact-github-ref", reconstruction)
         self.assertNotIn("self.repository.bootstrap()", reconstruction)
 
+    def test_scenario_1_creation_order_uses_local_git_ancestry_not_input_order(self):
+        helper = inspect.getsource(live._canonical_creation_ref_order)
+        self.assertIn('"merge-base", "--is-ancestor"', helper)
+        self.assertIn("_credential_free_git_env", helper)
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            mirror = root / "mirror.git"
+            source.mkdir()
+            env = live._credential_free_git_env()
+            live._run(["git", "init", "--initial-branch=main"], cwd=source, env=env)
+            live._run(["git", "config", "user.name", "Workstream D Test"], cwd=source, env=env)
+            live._run(
+                ["git", "config", "user.email", "workstream-d-test@example.invalid"],
+                cwd=source,
+                env=env,
+            )
+
+            marker = source / "marker.txt"
+            marker.write_text("base\n", encoding="utf-8")
+            live._run(["git", "add", "marker.txt"], cwd=source, env=env)
+            live._run(["git", "commit", "-m", "base"], cwd=source, env=env)
+            base = live._run(["git", "rev-parse", "HEAD"], cwd=source, env=env)
+
+            marker.write_text("first\n", encoding="utf-8")
+            live._run(["git", "commit", "-am", "first"], cwd=source, env=env)
+            first = live._run(["git", "rev-parse", "HEAD"], cwd=source, env=env)
+
+            marker.write_text("second\n", encoding="utf-8")
+            live._run(["git", "commit", "-am", "second"], cwd=source, env=env)
+            second = live._run(["git", "rev-parse", "HEAD"], cwd=source, env=env)
+
+            marker.write_text("current\n", encoding="utf-8")
+            live._run(["git", "commit", "-am", "current"], cwd=source, env=env)
+            current = live._run(["git", "rev-parse", "HEAD"], cwd=source, env=env)
+            live._run(
+                ["git", "update-ref", "refs/dolt/data", current], cwd=source, env=env
+            )
+
+            live._run(["git", "switch", "-c", "unrelated", base], cwd=source, env=env)
+            (source / "unrelated.txt").write_text("unrelated\n", encoding="utf-8")
+            live._run(["git", "add", "unrelated.txt"], cwd=source, env=env)
+            live._run(["git", "commit", "-m", "unrelated"], cwd=source, env=env)
+            unrelated = live._run(["git", "rev-parse", "HEAD"], cwd=source, env=env)
+
+            live._run(
+                ["git", "clone", "--mirror", str(source), str(mirror)],
+                cwd=root,
+                env=env,
+            )
+            mirror_current = live._run(
+                ["git", "--git-dir", str(mirror), "rev-parse", "refs/dolt/data"],
+                cwd=root,
+                env=env,
+            )
+            self.assertEqual(mirror_current, current)
+            self.assertEqual(
+                live._canonical_creation_ref_order(
+                    mirror, mirror_current, (second, first)
+                ),
+                (first, second),
+            )
+
+            with self.assertRaisesRegex(
+                live.LiveExecutorError, "SCENARIO_1_CREATION_REFS_EQUAL"
+            ):
+                live._canonical_creation_ref_order(
+                    mirror, mirror_current, (first, first)
+                )
+            with self.assertRaisesRegex(
+                live.LiveExecutorError, "SCENARIO_1_CREATION_REF_MISSING"
+            ):
+                live._canonical_creation_ref_order(
+                    mirror, mirror_current, ("f" * 40, second)
+                )
+            with self.assertRaisesRegex(
+                live.LiveExecutorError, "SCENARIO_1_CREATION_REFS_INCOMPARABLE"
+            ):
+                live._canonical_creation_ref_order(
+                    mirror, mirror_current, (first, unrelated)
+                )
+
+            live._run(
+                [
+                    "git",
+                    "--git-dir",
+                    str(mirror),
+                    "update-ref",
+                    "refs/dolt/data",
+                    unrelated,
+                ],
+                cwd=root,
+                env=env,
+            )
+            with self.assertRaisesRegex(
+                live.LiveExecutorError, "SCENARIO_1_CREATION_REF_NOT_CURRENT"
+            ):
+                live._canonical_creation_ref_order(
+                    mirror, unrelated, (first, second)
+                )
+
     def test_unexpected_canonical_state_fails_closed_before_bootstrap(self):
         with TemporaryDirectory() as directory:
             with patch.object(
@@ -438,9 +540,11 @@ class WorkstreamDLiveBoundaryTests(unittest.TestCase):
         scenario2 = inspect.getsource(live.LiveFixtureBackend._scenario_2)
         scenario3 = inspect.getsource(live.LiveFixtureBackend._scenario_3)
         self.assertIn("_run_close_timed_calls", scenario1)
-        self.assertIn("_PublicationRecordingRepository", scenario1)
+        self.assertIn("read_only_remote_factory", scenario1)
+        self.assertIn("_canonical_creation_ref_order", scenario1)
         self.assertIn("_ordered_task_ids", scenario1)
         self.assertIn("canonical_creation_order", scenario1)
+        self.assertNotIn("_PublicationRecordingRepository", scenario1)
         self.assertIn("_run_close_timed_calls", scenario2)
         self.assertIn("_cancel_queued_call", scenario3)
         self.assertIn("queued_executed", scenario3)
