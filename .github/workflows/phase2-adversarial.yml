@@ -204,11 +204,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          PYTHONPATH=. "$RUNTIME_PYTHON" -m phase2.workstream_d_live
+          PYTHONPATH=. "$RUNTIME_PYTHON" -m phase2.workstream_d_remediated
 
       - name: Preserve post-run governance boundary
         if: ${{ always() }}
         run: |
-          echo 'The executor revokes both installation tokens before a successful exit and emits no credential material.'
+          echo 'The remediated executor emits a non-secret structured success record only after both installation tokens are revoked.'
           echo 'The repository execution-enable variable remains a governance control: remove it immediately after the authorised live run.'
           echo 'No result from this workflow authorises production use or Workstream E.'
