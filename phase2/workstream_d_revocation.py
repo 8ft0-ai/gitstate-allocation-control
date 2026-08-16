@@ -85,7 +85,7 @@ def _cleanup_record(
         "attempt_namespace": context.namespace.value,
         "credential_material_emitted": False,
         "credential_revoked": True,
-        "installation_tokens_revoked": lease.revoked_token_count,
+        "installation_tokens_revoked": 2,
         "run_attempt": context.run_attempt,
         "run_id": context.run_id,
         "status": REVOCATION_STATUS,
@@ -121,7 +121,15 @@ def execute_live_suite(
             raise lease.revocation_error
         raise lease.revocation_error from primary_error
 
-    if lease is not None and lease.revocation_attempted and lease.revoked:
+    # Only two successful revoke calls prove the normal live credential pair
+    # was positively revoked. Partial-acquisition cleanup remains fail-closed
+    # but does not emit the two-token success marker.
+    if (
+        lease is not None
+        and lease.revocation_attempted
+        and lease.revoked
+        and lease.revoked_token_count == 2
+    ):
         print(
             json.dumps(
                 _cleanup_record(context, lease),
