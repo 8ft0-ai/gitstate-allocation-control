@@ -646,7 +646,7 @@ FIXTURE_APP = {
     "app_id": 900002,
     "app_slug": "fixture-bot",
     "installation_id": 900003,
-    "agent_prefix": "agent://github-app/fixture-bot/session/",
+    "agent_prefix": "agent://github-app/fixture-bot/900003/session/",
 }
 
 
