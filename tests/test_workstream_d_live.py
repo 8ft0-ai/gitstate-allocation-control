@@ -348,17 +348,45 @@ class WorkstreamDLiveBoundaryTests(unittest.TestCase):
                     mirror, unrelated, (first, second)
                 )
 
-    def test_unexpected_canonical_state_fails_closed_before_bootstrap(self):
+    def test_exact_state_repository_sentinel_is_the_only_clean_prebootstrap_state(self):
+        expected = (
+            f"{live.STATE_REPOSITORY_BASELINE_SHA}\t"
+            f"{live.STATE_REPOSITORY_BASELINE_REF}"
+        )
         with TemporaryDirectory() as directory:
-            with patch.object(
-                live, "_run", return_value="a" * 40 + "\trefs/dolt/data"
-            ):
-                with self.assertRaisesRegex(
-                    live.LiveExecutorError, "UNEXPECTED_CANONICAL_STATE"
-                ):
-                    live.assert_uninitialised_state(
-                        "fixture-token", root=Path(directory)
-                    )
+            root = Path(directory)
+            with patch.object(live, "_run", return_value=expected):
+                live.assert_uninitialised_state("fixture-token", root=root)
+
+            rejected = (
+                "",
+                "a" * 40 + "\trefs/heads/main",
+                expected + "\n" + "b" * 40 + "\trefs/dolt/data",
+                expected
+                + "\n"
+                + "c" * 40
+                + "\trefs/heads/__dolt_remote_info__",
+            )
+            for output in rejected:
+                with self.subTest(output=output):
+                    with patch.object(live, "_run", return_value=output):
+                        with self.assertRaisesRegex(
+                            live.LiveExecutorError,
+                            "UNEXPECTED_CANONICAL_STATE",
+                        ):
+                            live.assert_uninitialised_state(
+                                "fixture-token", root=root
+                            )
+
+    def test_fixture_bootstrap_never_pushes_or_mutates_sentinel_main(self):
+        guard = inspect.getsource(live.assert_uninitialised_state)
+        bootstrap = inspect.getsource(live.bootstrap_fixture_repository)
+
+        self.assertIn("STATE_REPOSITORY_BASELINE_SHA", guard)
+        self.assertIn("STATE_REPOSITORY_BASELINE_REF", guard)
+        self.assertNotIn('"main:main"', bootstrap)
+        self.assertNotIn('"fixture-state"', bootstrap)
+        self.assertIn('[bd_bin, "dolt", "push"]', bootstrap)
 
     def test_protocol_fixture_contract_uses_real_parser_hash_and_operator_namespace(self):
         namespace = valid_context().namespace
