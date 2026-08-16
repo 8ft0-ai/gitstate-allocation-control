@@ -20,7 +20,9 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -68,6 +70,7 @@ from .credentials import (
     verify_live_installation,
 )
 from .dolt_repository import DoltCanonicalRepository
+from .discovery import classify
 from .github_api import GitHubAPI, GitHubAPIError
 from .inventory import InventoryAttestation, InventoryError
 from .parser import parse_request
@@ -763,6 +766,86 @@ def _exercise_installation_negative(control: str) -> tuple[str, int, int]:
     raise LiveExecutorError(f"INSTALLATION_NEGATIVE_ACCEPTED:{control}")
 
 
+
+def _run_close_timed_calls(
+    calls: Sequence[Callable[[], Any]],
+) -> tuple[tuple[Any, ...], float]:
+    # Release all fixture calls through one barrier and report actual start spread.
+    if len(calls) < 2:
+        raise LiveExecutorError("CLOSE_TIMED_CALL_COUNT_INVALID")
+    barrier = threading.Barrier(len(calls))
+    lock = threading.Lock()
+    started: list[float] = []
+
+    def run(call: Callable[[], Any]) -> Any:
+        try:
+            barrier.wait(timeout=10)
+        except threading.BrokenBarrierError as exc:
+            raise LiveExecutorError("CLOSE_TIMED_BARRIER_FAILED") from exc
+        timestamp = time.monotonic()
+        with lock:
+            started.append(timestamp)
+        return call()
+
+    with ThreadPoolExecutor(max_workers=len(calls), thread_name_prefix="wd-close") as pool:
+        futures = [pool.submit(run, call) for call in calls]
+        values = tuple(future.result(timeout=240) for future in futures)
+    if len(started) != len(calls):
+        raise LiveExecutorError("CLOSE_TIMED_START_EVIDENCE_INCOMPLETE")
+    return values, max(started) - min(started)
+
+
+def _cancel_queued_call(call: Callable[[], Any]) -> bool:
+    # Occupy a one-worker executor, queue exactly one fixture call, then cancel it.
+    blocker_started = threading.Event()
+    release_blocker = threading.Event()
+
+    def blocker() -> None:
+        blocker_started.set()
+        if not release_blocker.wait(timeout=10):
+            raise LiveExecutorError("QUEUED_CANCEL_BLOCKER_TIMEOUT")
+
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="wd-cancel") as pool:
+        blocker_future = pool.submit(blocker)
+        if not blocker_started.wait(timeout=10):
+            raise LiveExecutorError("QUEUED_CANCEL_BLOCKER_NOT_STARTED")
+        queued_future = pool.submit(call)
+        cancelled = queued_future.cancel()
+        release_blocker.set()
+        blocker_future.result(timeout=30)
+    return cancelled and queued_future.cancelled()
+
+
+def _classify_edited_pre_ingress(
+    comment: Mapping[str, Any],
+    *,
+    original_body: str,
+    policy: Mapping[str, Any],
+) -> str:
+    # Exercise valid parsing, accepted authorisation, and accepted discovery.
+    body = comment.get("body")
+    if not isinstance(body, str) or body == original_body:
+        raise LiveExecutorError("PRE_INGRESS_EDIT_NOT_OBSERVED")
+    parsed = parse_request(body.encode("utf-8"))
+
+    try:
+        authorise(dict(comment), parsed, dict(policy))
+    except AuthorisationError as exc:
+        if exc.code != "AGENT_NOT_AUTHORISED":
+            raise LiveExecutorError("PRE_INGRESS_EDIT_WRONG_AUTHORISATION_RESULT") from exc
+    else:
+        raise LiveExecutorError("PRE_INGRESS_EDIT_FIXTURE_ACTOR_AUTHORISED")
+
+    candidate = classify(dict(comment), CONTROL_REPOSITORY, dict(policy))
+    if (
+        candidate is None
+        or candidate.disposition != "REJECTED"
+        or candidate.reason_code != "SOURCE_COMMENT_EDITED_BEFORE_INGRESS"
+    ):
+        raise LiveExecutorError("PRE_INGRESS_EDIT_DISCOVERY_NOT_REJECTED")
+    return candidate.reason_code
+
+
 @dataclass
 class LiveFixtureBackend:
     repository: DoltCanonicalRepository
@@ -1208,14 +1291,28 @@ class LiveFixtureBackend:
         proof = ScenarioProof(spec, self.namespace)
         tasks = self._seed(1, 2)
         base = self._identity()
-        sources, elapsed, visible = self._post_close_timed(1, ("ALLOCATE_NEXT", "ALLOCATE_NEXT"))
-        first = self._process(1, 1, request_type="ALLOCATE_NEXT", source_override=sources[0])
-        second = self._process(1, 2, request_type="ALLOCATE_NEXT", source_override=sources[1])
+        sources, source_elapsed, visible = self._post_close_timed(
+            1, ("ALLOCATE_NEXT", "ALLOCATE_NEXT")
+        )
+        workers = (self._fresh_backend(), self._fresh_backend())
+        values, process_start_spread = _run_close_timed_calls(
+            (
+                lambda: workers[0]._process(
+                    1, 1, request_type="ALLOCATE_NEXT", source_override=sources[0]
+                ),
+                lambda: workers[1]._process(
+                    1, 2, request_type="ALLOCATE_NEXT", source_override=sources[1]
+                ),
+            )
+        )
+        first, second = values
         rows = self._allocations_for_tasks(tasks)
         active = tuple(row for row in rows if row.get("state") == "ACTIVE")
         proof.fault(
             "close_timed_requests",
-            visible and elapsed <= CLOSE_TIMED_MAX_SECONDS,
+            visible
+            and source_elapsed <= CLOSE_TIMED_MAX_SECONDS
+            and process_start_spread <= CLOSE_TIMED_MAX_SECONDS,
             EXPECTED_FAULT_OUTCOMES["close_timed_requests"],
         )
         proof.assertion(0, len(active) == 2, f"active_rows={len(active)}")
@@ -1225,18 +1322,23 @@ class LiveFixtureBackend:
             and len({row.get("allocation_id") for row in active}) == 2,
             "task_ids and allocation_ids are pairwise distinct",
         )
-        proof.assertion(2, self._mirrors_valid(tasks), "both task mirrors satisfy ownership invariant")
+        proof.assertion(
+            2,
+            self._mirrors_valid(tasks),
+            "both task mirrors satisfy ownership invariant",
+        )
+        selected = {first.task_id, second.task_id}
         proof.assertion(
             3,
-            (first.task_id, second.task_id) == tasks,
-            f"selected={first.task_id},{second.task_id}",
+            selected == set(tasks),
+            f"selected_set={sorted(str(item) for item in selected)} start_spread={process_start_spread:.6f}",
         )
         return self._evidence(
             spec,
             proof,
             source_ids=(first.source_id, second.source_id),
             request_ids=(first.request_id, second.request_id),
-            base_refs=(base.git_ref_sha, first.accepted_ref),
+            base_refs=(base.git_ref_sha, base.git_ref_sha),
             accepted_refs=(first.accepted_ref, second.accepted_ref),
             dolt_commits=(first.dolt_commit, second.dolt_commit),
             canonical_rows=(first.canonical_row, second.canonical_row),
@@ -1248,29 +1350,57 @@ class LiveFixtureBackend:
         proof = ScenarioProof(spec, self.namespace)
         task_id = self._seed(2, 1)[0]
         base = self._identity()
-        sources, elapsed, visible = self._post_close_timed(2, ("ALLOCATE_TASK", "ALLOCATE_TASK"))
-        first = self._process(2, 1, request_type="ALLOCATE_TASK", task_id=task_id, source_override=sources[0])
-        second = self._process(2, 2, request_type="ALLOCATE_TASK", task_id=task_id, source_override=sources[1])
+        sources, source_elapsed, visible = self._post_close_timed(
+            2, ("ALLOCATE_TASK", "ALLOCATE_TASK")
+        )
+        workers = (self._fresh_backend(), self._fresh_backend())
+        values, process_start_spread = _run_close_timed_calls(
+            (
+                lambda: workers[0]._process(
+                    2,
+                    1,
+                    request_type="ALLOCATE_TASK",
+                    task_id=task_id,
+                    source_override=sources[0],
+                ),
+                lambda: workers[1]._process(
+                    2,
+                    2,
+                    request_type="ALLOCATE_TASK",
+                    task_id=task_id,
+                    source_override=sources[1],
+                ),
+            )
+        )
+        first, second = values
         rows = self._allocations_for_tasks((task_id,))
         active = tuple(row for row in rows if row.get("state") == "ACTIVE")
         proof.fault(
             "close_timed_requests",
-            visible and elapsed <= CLOSE_TIMED_MAX_SECONDS,
+            visible
+            and source_elapsed <= CLOSE_TIMED_MAX_SECONDS
+            and process_start_spread <= CLOSE_TIMED_MAX_SECONDS,
             EXPECTED_FAULT_OUTCOMES["close_timed_requests"],
         )
         proof.assertion(0, len(active) == 1, f"active_rows={len(active)}")
-        proof.assertion(1, self._mirrors_valid((task_id,)), "task mirror agrees with single active allocation")
+        proof.assertion(
+            1,
+            self._mirrors_valid((task_id,)),
+            "task mirror agrees with single active allocation",
+        )
         proof.assertion(
             2,
-            len(rows) == 1 and sorted((first.reason, second.reason)) == ["ALLOCATED", "TASK_ALREADY_ALLOCATED"],
-            f"allocation_rows={len(rows)} results={first.reason},{second.reason}",
+            len(rows) == 1
+            and sorted((first.reason, second.reason))
+            == ["ALLOCATED", "TASK_ALREADY_ALLOCATED"],
+            f"allocation_rows={len(rows)} results={first.reason},{second.reason} start_spread={process_start_spread:.6f}",
         )
         return self._evidence(
             spec,
             proof,
             source_ids=(first.source_id, second.source_id),
             request_ids=(first.request_id, second.request_id),
-            base_refs=(base.git_ref_sha, first.accepted_ref),
+            base_refs=(base.git_ref_sha, base.git_ref_sha),
             accepted_refs=(first.accepted_ref, second.accepted_ref),
             dolt_commits=(first.dolt_commit, second.dolt_commit),
             canonical_rows=(first.canonical_row, second.canonical_row),
@@ -1282,19 +1412,51 @@ class LiveFixtureBackend:
         proof = ScenarioProof(spec, self.namespace)
         self._seed(3, 3)
         base = self._identity()
-        sources, elapsed, initial_visible = self._post_close_timed(
+        sources, source_elapsed, initial_visible = self._post_close_timed(
             3, ("ALLOCATE_NEXT", "ALLOCATE_NEXT", "ALLOCATE_NEXT")
         )
-        first = self._process(3, 1, request_type="ALLOCATE_NEXT", source_override=sources[0])
-        second = self._process(3, 2, request_type="ALLOCATE_NEXT", source_override=sources[1])
         third_rid = stable_ulid(f"{self.namespace.value}:s3:request:3")
-        cancelled_before_canonical = self._request_row(third_rid) is None
+        queued_executed = {"value": False}
+
+        def queued_third() -> _ResultRecord:
+            queued_executed["value"] = True
+            return self._fresh_backend()._process(
+                3,
+                3,
+                request_type="ALLOCATE_NEXT",
+                request_id=third_rid,
+                source_override=sources[2],
+            )
+
+        queued_cancelled = _cancel_queued_call(queued_third)
+        cancelled_before_canonical = (
+            queued_cancelled
+            and not queued_executed["value"]
+            and self._request_row(third_rid) is None
+        )
+
+        workers = (self._fresh_backend(), self._fresh_backend())
+        first_two, process_start_spread = _run_close_timed_calls(
+            (
+                lambda: workers[0]._process(
+                    3, 1, request_type="ALLOCATE_NEXT", source_override=sources[0]
+                ),
+                lambda: workers[1]._process(
+                    3, 2, request_type="ALLOCATE_NEXT", source_override=sources[1]
+                ),
+            )
+        )
+        first, second = first_two
+
         filler_ids = tuple(
             self._post_source(3, 1000 + index, "pagination-fixture")[0]
             for index in range(101)
         )
         recovery = self._fresh_backend()
-        listed = {item.comment_id for item in recovery.gateway.list_comments(self.issue_number)}
+        listed = {
+            item.comment_id
+            for item in recovery.gateway.list_comments(self.issue_number)
+        }
         retained_after_cancel = sources[2][0] in listed
         third = recovery._process(
             3,
@@ -1310,7 +1472,9 @@ class LiveFixtureBackend:
         proof.fault(
             "cancel_queued_attempt",
             initial_visible
-            and elapsed <= CLOSE_TIMED_MAX_SECONDS
+            and source_elapsed <= CLOSE_TIMED_MAX_SECONDS
+            and process_start_spread <= CLOSE_TIMED_MAX_SECONDS
+            and queued_cancelled
             and cancelled_before_canonical
             and retained_after_cancel
             and third.status == "ALLOCATED",
@@ -1321,11 +1485,18 @@ class LiveFixtureBackend:
             pagination_complete,
             EXPECTED_FAULT_OUTCOMES["multi_page_comment_fixture"],
         )
-        proof.assertion(0, pagination_complete, f"listed_filler_count={sum(item in listed for item in filler_ids)}")
+        proof.assertion(
+            0,
+            pagination_complete,
+            f"listed_filler_count={sum(item in listed for item in filler_ids)}",
+        )
         proof.assertion(
             1,
-            cancelled_before_canonical and third.status == "ALLOCATED",
-            "third retained source had no pre-recovery canonical row and was recovered by fresh backend",
+            queued_cancelled
+            and cancelled_before_canonical
+            and retained_after_cancel
+            and third.status == "ALLOCATED",
+            "queued third worker was cancelled before execution; retained source was recovered by a fresh backend",
         )
         proof.assertion(
             2,
@@ -1338,7 +1509,7 @@ class LiveFixtureBackend:
             proof,
             source_ids=tuple(item.source_id for item in records),
             request_ids=tuple(item.request_id for item in records),
-            base_refs=(base.git_ref_sha, first.accepted_ref, second.accepted_ref),
+            base_refs=(base.git_ref_sha, base.git_ref_sha, second.accepted_ref),
             accepted_refs=tuple(item.accepted_ref for item in records),
             dolt_commits=tuple(item.dolt_commit for item in records),
             canonical_rows=tuple(item.canonical_row for item in records),
@@ -1669,32 +1840,93 @@ class LiveFixtureBackend:
         task_ids = self._seed(9, 2)
         base = self._identity()
         pre_counts = self._counts()
-        pre_edit_body = self._fixture_body(9, 1, "pre-ingress-edit")
-        pre_edit, _ = self._post_source(9, 1, "pre-ingress-edit")
-        self._edit_comment(pre_edit, json.dumps({"fixture_mode": FIXTURE_MODE, "mutated": True}))
-        edited_view = {item.comment_id: item for item in self.gateway.list_comments(self.issue_number)}
-        pre_edit_rejected = pre_edit in edited_view and edited_view[pre_edit].body != pre_edit_body
-        pre_delete, _ = self._post_source(9, 2, "pre-ingress-delete")
+        policy = load_policy("policy/actors.json")
+
+        pre_edit_request = stable_ulid(f"{self.namespace.value}:s9:pre-edit")
+        original_payload = {
+            "protocol": "beads-allocation/v0.2",
+            "type": "ALLOCATE_TASK",
+            "request_id": pre_edit_request,
+            "agent_id": self.agent_id,
+            "task_id": task_ids[0],
+        }
+        original_body = "/beads-v0.2 " + json.dumps(
+            original_payload, sort_keys=True, separators=(",", ":")
+        )
+        created = self.control_api.post(
+            f"/repos/{CONTROL_REPOSITORY}/issues/{self.issue_number}/comments",
+            {"body": original_body},
+        )
+        if not isinstance(created, dict) or not isinstance(created.get("id"), int):
+            raise LiveExecutorError("SCENARIO_9_PRE_EDIT_CREATE_FAILED")
+        pre_edit = int(created["id"])
+
+        edited_payload = dict(original_payload)
+        edited_payload["task_id"] = task_ids[1]
+        edited_body = "/beads-v0.2 " + json.dumps(
+            edited_payload, sort_keys=True, separators=(",", ":")
+        )
+        self._edit_comment(pre_edit, edited_body)
+        current_pre_edit = self.control_api.get(
+            f"/repos/{CONTROL_REPOSITORY}/issues/comments/{pre_edit}"
+        )
+        if not isinstance(current_pre_edit, dict):
+            raise LiveExecutorError("SCENARIO_9_PRE_EDIT_READ_FAILED")
+        pre_edit_reason = _classify_edited_pre_ingress(
+            current_pre_edit,
+            original_body=original_body,
+            policy=policy,
+        )
+        pre_edit_rejected = (
+            pre_edit_reason == "SOURCE_COMMENT_EDITED_BEFORE_INGRESS"
+        )
+
+        pre_delete_request = stable_ulid(f"{self.namespace.value}:s9:pre-delete")
+        pre_delete_payload = dict(original_payload)
+        pre_delete_payload["request_id"] = pre_delete_request
+        pre_delete_body = "/beads-v0.2 " + json.dumps(
+            pre_delete_payload, sort_keys=True, separators=(",", ":")
+        )
+        pre_delete_created = self.control_api.post(
+            f"/repos/{CONTROL_REPOSITORY}/issues/{self.issue_number}/comments",
+            {"body": pre_delete_body},
+        )
+        if (
+            not isinstance(pre_delete_created, dict)
+            or not isinstance(pre_delete_created.get("id"), int)
+        ):
+            raise LiveExecutorError("SCENARIO_9_PRE_DELETE_CREATE_FAILED")
+        pre_delete = int(pre_delete_created["id"])
         self._delete_comment(pre_delete)
-        deleted_view = {item.comment_id for item in self.gateway.list_comments(self.issue_number)}
+        deleted_view = {
+            item.comment_id for item in self.gateway.list_comments(self.issue_number)
+        }
         pre_delete_absent = pre_delete not in deleted_view
         after_pre_counts = self._counts()
 
-        post_edit = self._process(9, 3, request_type="ALLOCATE_TASK", task_id=task_ids[0])
+        post_edit = self._process(
+            9, 3, request_type="ALLOCATE_TASK", task_id=task_ids[0]
+        )
         before_edit = self._allocation(post_edit.allocation_id or "")
         self._edit_comment(
             post_edit.source_id,
             json.dumps({"fixture_mode": FIXTURE_MODE, "post_ingress_edit": True}),
         )
         after_edit = self._allocation(post_edit.allocation_id or "")
-        post_delete = self._process(9, 4, request_type="ALLOCATE_TASK", task_id=task_ids[1])
+        post_delete = self._process(
+            9, 4, request_type="ALLOCATE_TASK", task_id=task_ids[1]
+        )
         before_delete = self._allocation(post_delete.allocation_id or "")
         self._delete_comment(post_delete.source_id)
         after_delete = self._allocation(post_delete.allocation_id or "")
+
         fresh = self._fresh_backend()
         fresh_comments = fresh.gateway.list_comments(self.issue_number)
         durable_urls = {item.html_url for item in fresh_comments}
-        fresh_recovery = post_edit.projection_url in durable_urls and post_delete.projection_url in durable_urls
+        fresh_recovery = (
+            post_edit.projection_url in durable_urls
+            and post_delete.projection_url in durable_urls
+        )
 
         proof.fault(
             "edit_before_ingress",
@@ -1719,12 +1951,12 @@ class LiveFixtureBackend:
         proof.assertion(
             0,
             pre_edit_rejected and pre_counts == after_pre_counts,
-            "edited pre-ingress fixture body differs from captured body and created no canonical row",
+            "edited valid protocol request was rejected by accepted discovery as SOURCE_COMMENT_EDITED_BEFORE_INGRESS after parser/authoriser exercise",
         )
         proof.assertion(
             1,
             pre_delete_absent and pre_counts == after_pre_counts,
-            "deleted pre-ingress fixture is absent and no durable original body is claimed",
+            "valid protocol request deleted before discovery is absent and no durable original body is claimed",
         )
         proof.assertion(
             2,
@@ -1740,7 +1972,12 @@ class LiveFixtureBackend:
         return self._evidence(
             spec,
             proof,
-            source_ids=(pre_edit, pre_delete, post_edit.source_id, post_delete.source_id),
+            source_ids=(
+                pre_edit,
+                pre_delete,
+                post_edit.source_id,
+                post_delete.source_id,
+            ),
             base_refs=(base.git_ref_sha,),
             accepted_refs=(post_edit.accepted_ref, post_delete.accepted_ref),
             dolt_commits=(post_edit.dolt_commit, post_delete.dolt_commit),

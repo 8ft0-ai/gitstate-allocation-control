@@ -349,6 +349,93 @@ class WorkstreamDLiveBoundaryTests(unittest.TestCase):
         self.assertTrue(result["credential_revocation_required"])
         self.assertTrue(result["enablement_removal_required"])
 
+    def test_close_timed_scheduler_really_overlaps_calls(self):
+        import threading
+
+        lock = threading.Lock()
+        both_entered = threading.Event()
+        entered = 0
+
+        def make(value):
+            def call():
+                nonlocal entered
+                with lock:
+                    entered += 1
+                    if entered == 2:
+                        both_entered.set()
+                if not both_entered.wait(timeout=2):
+                    raise AssertionError("close-timed calls did not overlap")
+                return value
+            return call
+
+        values, spread = live._run_close_timed_calls((make("a"), make("b")))
+        self.assertEqual(set(values), {"a", "b"})
+        self.assertEqual(entered, 2)
+        self.assertLessEqual(spread, live.CLOSE_TIMED_MAX_SECONDS)
+
+    def test_queued_cancellation_really_prevents_callable_execution(self):
+        executed = []
+        self.assertTrue(live._cancel_queued_call(lambda: executed.append(True)))
+        self.assertEqual(executed, [])
+
+    def test_scenarios_1_2_and_3_bind_to_real_scheduling_helpers(self):
+        scenario1 = inspect.getsource(live.LiveFixtureBackend._scenario_1)
+        scenario2 = inspect.getsource(live.LiveFixtureBackend._scenario_2)
+        scenario3 = inspect.getsource(live.LiveFixtureBackend._scenario_3)
+        self.assertIn("_run_close_timed_calls", scenario1)
+        self.assertIn("_run_close_timed_calls", scenario2)
+        self.assertIn("_cancel_queued_call", scenario3)
+        self.assertIn("queued_executed", scenario3)
+
+    def test_pre_ingress_edit_uses_valid_request_authoriser_and_discovery_classifier(self):
+        policy = json.loads(Path("policy/actors.json").read_text(encoding="utf-8"))
+        request_id = "01J00000000000000000000000"
+        original = {
+            "protocol": "beads-allocation/v0.2",
+            "type": "ALLOCATE_TASK",
+            "request_id": request_id,
+            "agent_id": "agent://operator/8ft0-ai/session/test",
+            "task_id": "task-one",
+        }
+        edited = dict(original)
+        edited["task_id"] = "task-two"
+        original_body = "/beads-v0.2 " + json.dumps(
+            original, sort_keys=True, separators=(",", ":")
+        )
+        edited_body = "/beads-v0.2 " + json.dumps(
+            edited, sort_keys=True, separators=(",", ":")
+        )
+        comment = {
+            "id": 123,
+            "body": edited_body,
+            "created_at": "2026-08-16T00:00:00Z",
+            "updated_at": "2026-08-16T00:00:01Z",
+            "user": {
+                "login": live.FIXTURE_APP["actor_login"],
+                "id": live.FIXTURE_APP["actor_id"],
+                "type": "Bot",
+            },
+            "performed_via_github_app": {
+                "id": live.FIXTURE_APP["app_id"],
+                "slug": live.FIXTURE_APP["app_slug"],
+            },
+        }
+        self.assertEqual(
+            live._classify_edited_pre_ingress(
+                comment,
+                original_body=original_body,
+                policy=policy,
+            ),
+            "SOURCE_COMMENT_EDITED_BEFORE_INGRESS",
+        )
+
+    def test_scenario_9_uses_accepted_pre_ingress_classifier(self):
+        source = inspect.getsource(live.LiveFixtureBackend._scenario_9)
+        self.assertIn("_classify_edited_pre_ingress", source)
+        self.assertIn("SOURCE_COMMENT_EDITED_BEFORE_INGRESS", source)
+        self.assertIn("/beads-v0.2 ", source)
+
+
 
 if __name__ == "__main__":
     unittest.main()
