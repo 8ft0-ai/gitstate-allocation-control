@@ -1323,7 +1323,7 @@ class LiveFixtureBackend:
             "fixture:gitstate-phase-2-allocator",
             self.agent_id,
         )
-        service = AllocationService(self.repository, clock=lambda: NOW, max_stale_retries=1)
+        service = AllocationService(self.repository, clock=lambda: NOW)
         result = service.process(command, context)
         if not result.canonical_git_ref_sha or not result.canonical_dolt_commit:
             raise LiveExecutorError("CANONICAL_RESULT_IDENTITY_MISSING")
