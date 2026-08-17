@@ -283,7 +283,7 @@ def assert_durable_anchor_history_repair(
     dolt_bin: str,
     granted,
 ) -> None:
-    """Exercise the production first-parent history reader through anchor repair."""
+    """Exercise production durable history and Workstream C anchor repair."""
     creation_git_sha = granted.canonical_git_ref_sha
     creation_dolt_commit = granted.canonical_dolt_commit
     if not creation_git_sha or not creation_dolt_commit:
