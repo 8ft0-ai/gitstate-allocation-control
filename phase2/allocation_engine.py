@@ -68,10 +68,29 @@ class AllocationService:
         self.max_stale_retries = max_stale_retries
         self.supported_task_types = supported_task_types
 
+    def _consume_stale_retry(self, stale_retries: int) -> int | None:
+        """Return the next retry count, or ``None`` when the bounded budget is spent."""
+        if stale_retries >= self.max_stale_retries:
+            return None
+        return stale_retries + 1
+
     def process(self, command: AllocationCommand, context: RequestContext) -> AllocationResult:
         stale_retries = 0
         while True:
-            snapshot = self.repository.bootstrap()
+            try:
+                snapshot = self.repository.bootstrap()
+            except StaleCanonicalBase:
+                next_retry = self._consume_stale_retry(stale_retries)
+                if next_retry is None:
+                    return AllocationResult(
+                        command.request_id,
+                        "REJECTED",
+                        "STALE_ALLOCATOR_RETRY_EXHAUSTED",
+                        retry_count=stale_retries,
+                    )
+                stale_retries = next_retry
+                continue
+
             verify_canonical_identity(snapshot.identity)
             store = _store(self.repository, snapshot)
             source = store.get_request_by_source(context)
@@ -130,14 +149,15 @@ class AllocationService:
                 accepted = self.repository.publish(expected, snapshot)
             except StaleCanonicalBase:
                 snapshot.close()
-                if stale_retries >= self.max_stale_retries:
+                next_retry = self._consume_stale_retry(stale_retries)
+                if next_retry is None:
                     return AllocationResult(
                         command.request_id,
                         "REJECTED",
                         "STALE_ALLOCATOR_RETRY_EXHAUSTED",
                         retry_count=stale_retries,
                     )
-                stale_retries += 1
+                stale_retries = next_retry
                 continue
             except CanonicalPushFailed:
                 snapshot.close()
@@ -227,7 +247,20 @@ class AllocationService:
             CanonicalIdentity("refs/dolt/data", first_git_ref_sha, first_dolt_commit)
         )
         while True:
-            snapshot = self.repository.bootstrap()
+            try:
+                snapshot = self.repository.bootstrap()
+            except StaleCanonicalBase:
+                next_retry = self._consume_stale_retry(stale_retries)
+                if next_retry is None:
+                    return AllocationResult(
+                        request_id,
+                        "REJECTED",
+                        "STALE_ALLOCATOR_RETRY_EXHAUSTED",
+                        retry_count=stale_retries,
+                    )
+                stale_retries = next_retry
+                continue
+
             store = _store(self.repository, snapshot)
             try:
                 store.begin()
@@ -249,11 +282,15 @@ class AllocationService:
                 accepted = self.repository.publish(snapshot.identity.git_ref_sha, snapshot)
             except StaleCanonicalBase:
                 snapshot.close()
-                if stale_retries >= self.max_stale_retries:
+                next_retry = self._consume_stale_retry(stale_retries)
+                if next_retry is None:
                     return AllocationResult(
-                        request_id, "REJECTED", "STALE_ALLOCATOR_RETRY_EXHAUSTED", retry_count=stale_retries
+                        request_id,
+                        "REJECTED",
+                        "STALE_ALLOCATOR_RETRY_EXHAUSTED",
+                        retry_count=stale_retries,
                     )
-                stale_retries += 1
+                stale_retries = next_retry
                 continue
             except CanonicalPushFailed:
                 snapshot.close()
