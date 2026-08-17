@@ -21,6 +21,7 @@ from typing import Any, Callable, ClassVar, Mapping, Sequence
 
 from . import workstream_d_live as live
 from .allocation_store import AllocationStore
+from .canonical import CanonicalPushFailed
 from .dolt_repository import DoltCanonicalRepository
 from .reconciliation import (
     CanonicalHistoryRevision,
@@ -51,11 +52,16 @@ def _request_row(repository: Any, request_id: str) -> dict[str, Any] | None:
 
 
 class DurableAcceptedHistory:
-    """Complete first-parent accepted history reconstructed from a read-only mirror.
+    """Complete Phase 2 first-parent history from one exact read-only mirror.
 
     The owner-authorised state token is used only by the existing broker to make
-    one exact Git mirror.  All history traversal and historical Dolt clones below
-    use only local file:// transport with the credential-free environment.
+    one exact Git mirror. All traversal and historical Dolt reconstruction below
+    uses local file transport with the credential-free environment. GitBlobstore
+    transport commits that do not change the NBS manifest are not Dolt snapshots.
+    Pre-Phase-2 manifest history may also predate a cloneable database/schema;
+    that prefix is accepted only when the first readable Phase 2 snapshot is
+    request-empty. Once Phase 2 history begins every manifest revision must be
+    readable and retain the Phase 2 schema.
     """
 
     def __init__(
@@ -70,8 +76,8 @@ class DurableAcceptedHistory:
 
     @property
     def complete(self) -> bool:
-        # accepted_revisions either returns the complete first-parent traversal
-        # or raises; no partial history is represented as complete evidence.
+        # accepted_revisions either proves the bounded Phase 2 history or raises;
+        # no partial post-schema history is represented as complete evidence.
         return True
 
     @staticmethod
@@ -96,12 +102,14 @@ class DurableAcceptedHistory:
         )
 
     @staticmethod
-    def _request_ids(repository: DoltCanonicalRepository, snapshot: Any) -> frozenset[str]:
+    def _request_ids(
+        repository: DoltCanonicalRepository, snapshot: Any
+    ) -> frozenset[str] | None:
         cursor = snapshot.connection.cursor()
         try:
             cursor.execute("SHOW TABLES LIKE 'allocation_requests'")
             if cursor.fetchone() is None:
-                return frozenset()
+                return None
         finally:
             cursor.close()
         reconstructed = repository.store(snapshot).reconstruct()
@@ -136,7 +144,7 @@ class DurableAcceptedHistory:
         *,
         root: Path,
         index: int,
-    ) -> CanonicalHistoryRevision:
+    ) -> CanonicalHistoryRevision | None:
         historical_remote = root / f"history-{index}.git"
         live._run(
             [
@@ -177,9 +185,10 @@ class DurableAcceptedHistory:
                 raise live.LiveExecutorError(
                     "CANONICAL_HISTORY_REVISION_IDENTITY_MISMATCH"
                 )
-            return CanonicalHistoryRevision(
-                snapshot.identity, self._request_ids(repository, snapshot)
-            )
+            request_ids = self._request_ids(repository, snapshot)
+            if request_ids is None:
+                return None
+            return CanonicalHistoryRevision(snapshot.identity, request_ids)
         finally:
             snapshot.close()
 
@@ -212,8 +221,6 @@ class DurableAcceptedHistory:
                 # GitBlobstore may advance refs/dolt/data while staging immutable
                 # table files as part of one Dolt push. Only a commit that changes
                 # the NBS manifest represents a complete accepted Dolt snapshot.
-                # Preserve first-parent order, but never interpret intermediate
-                # storage-transport commits as canonical allocation revisions.
                 manifest_shas = tuple(
                     git_sha
                     for git_sha in git_shas
@@ -226,14 +233,42 @@ class DurableAcceptedHistory:
                         "CANONICAL_HISTORY_CURRENT_REF_NOT_MANIFEST"
                     )
 
-                revisions = tuple(
-                    self._revision(mirror, git_sha, root=root, index=index)
-                    for index, git_sha in enumerate(manifest_shas, 1)
-                )
+                revisions: list[CanonicalHistoryRevision] = []
+                for index, git_sha in enumerate(manifest_shas, 1):
+                    try:
+                        revision = self._revision(
+                            mirror, git_sha, root=root, index=index
+                        )
+                    except CanonicalPushFailed as exc:
+                        if revisions:
+                            raise live.LiveExecutorError(
+                                "CANONICAL_HISTORY_UNREADABLE_AFTER_PHASE2"
+                            ) from exc
+                        # Initial GitBlobstore manifests may predate a cloneable
+                        # Dolt database. They cannot be treated as Phase 2 state.
+                        continue
+                    if revision is None:
+                        if revisions:
+                            raise live.LiveExecutorError(
+                                "CANONICAL_HISTORY_PHASE2_SCHEMA_REGRESSION"
+                            )
+                        continue
+                    if not revisions and revision.request_ids:
+                        # An unreadable/pre-schema prefix is safe to exclude only
+                        # when the first proven Phase 2 snapshot predates requests.
+                        raise live.LiveExecutorError(
+                            "CANONICAL_HISTORY_PHASE2_PREFIX_AMBIGUOUS"
+                        )
+                    revisions.append(revision)
+
                 if not revisions:
-                    raise live.LiveExecutorError("CANONICAL_HISTORY_EMPTY")
-                self._cache = revisions
-                return revisions
+                    raise live.LiveExecutorError("CANONICAL_HISTORY_PHASE2_EMPTY")
+                if revisions[-1].identity.git_ref_sha != source_sha:
+                    raise live.LiveExecutorError(
+                        "CANONICAL_HISTORY_CURRENT_PHASE2_REVISION_MISSING"
+                    )
+                self._cache = tuple(revisions)
+                return self._cache
             finally:
                 # The broker intentionally makes the mirror read-only. Restore
                 # only local temp permissions so TemporaryDirectory can remove it.
@@ -351,7 +386,7 @@ class AnchorRepairLiveFixtureBackend(live.LiveFixtureBackend):
             self.agent_id,
         )
 
-        # Use Workstream B's accepted/default bounded retry budget.  The previous
+        # Use Workstream B's accepted/default bounded retry budget. The previous
         # Workstream-D-only max_stale_retries=1 override is deliberately removed.
         service = live.AllocationService(self.repository, clock=lambda: live.NOW)
         result = service.process(command, context)
@@ -377,9 +412,9 @@ class AnchorRepairLiveFixtureBackend(live.LiveFixtureBackend):
             row = _request_row(self.repository, rid)
 
         # A replay may encounter an earlier accepted request whose anchor is
-        # still pending.  Never manufacture a current identity from runner
-        # memory: reconstruct the original creation identity through accepted
-        # history and use Workstream C's repair path.
+        # still pending. Never manufacture a current identity from runner memory:
+        # reconstruct the original creation identity through accepted history and
+        # use Workstream C's repair path.
         if row is not None and row.get("anchor_status") != "RECORDED":
             row = self._repair_request_anchor(rid)
 
