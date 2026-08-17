@@ -1,7 +1,10 @@
 import hashlib
+import subprocess
+import tempfile
 import threading
 import unittest
 from datetime import datetime, timezone
+from pathlib import Path
 
 from phase2.adversarial import (
     AttemptNamespace,
@@ -17,6 +20,7 @@ from phase2.allocation_types import (
     stable_ulid,
 )
 from phase2.canonical import LocalCanonicalRepository, StaleCanonicalBase
+from phase2.dolt_repository import DoltCanonicalRepository
 from phase2.inventory import InventoryAttestation
 from phase2.workstream_d_live import (
     LiveFixtureBackend,
@@ -84,25 +88,150 @@ class BootstrapStaleRepository:
         return self.inner.publish(expected_old_sha, snapshot)
 
 
-class CloseTimedBootstrapStaleRepository:
-    """Give the first close-timed worker two bootstrap stales, then delegate."""
+class ProbeCursor:
+    def __init__(self) -> None:
+        self.row = None
 
-    def __init__(self, inner: LocalCanonicalRepository) -> None:
+    def execute(self, sql, params=()):
+        if "DOLT_HASHOF" in sql:
+            self.row = ("probe-head",)
+        elif "ACTIVE_BRANCH" in sql:
+            self.row = ("main",)
+        else:
+            raise AssertionError(f"unexpected probe SQL: {sql}")
+        return self
+
+    def fetchone(self):
+        return self.row
+
+    def close(self):
+        pass
+
+
+class ProbeConnection:
+    def cursor(self):
+        return ProbeCursor()
+
+    def close(self):
+        pass
+
+
+class CloseTimedBootstrapStaleRepository:
+    """Reproduce real bootstrap CAS movement twice for the first close-timed worker."""
+
+    def __init__(self, inner: LocalCanonicalRepository, root: Path) -> None:
         self.inner = inner
+        self.root = root
+        self.remote = root / "canonical.git"
         self.lock = threading.Lock()
         self.victim: int | None = None
-        self.remaining = 2
         self.bootstrap_stales = 0
+        self.ref_moves = 0
+        self._next_ref_shas = self._initialise_probe_remote()
+
+    @staticmethod
+    def _run_git(command: list[str], *, cwd: Path) -> str:
+        completed = subprocess.run(
+            command,
+            cwd=cwd,
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if completed.returncode != 0:
+            raise AssertionError(
+                f"git command failed ({completed.returncode}): {' '.join(command)}\n"
+                f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
+            )
+        return completed.stdout.strip()
+
+    def _initialise_probe_remote(self) -> tuple[str, str]:
+        source = self.root / "source"
+        source.mkdir()
+        self._run_git(["git", "init", "--initial-branch=main"], cwd=source)
+        self._run_git(["git", "config", "user.name", "Bootstrap Stale Test"], cwd=source)
+        self._run_git(
+            ["git", "config", "user.email", "bootstrap-stale@example.invalid"], cwd=source
+        )
+
+        commits = []
+        for index in range(3):
+            (source / "state.txt").write_text(f"state-{index}\n", encoding="utf-8")
+            self._run_git(["git", "add", "state.txt"], cwd=source)
+            self._run_git(["git", "commit", "-m", f"state {index}"], cwd=source)
+            commits.append(self._run_git(["git", "rev-parse", "HEAD"], cwd=source))
+
+        self._run_git(["git", "init", "--bare", str(self.remote)], cwd=self.root)
+        self._run_git(
+            ["git", "push", str(self.remote), f"{commits[0]}:refs/dolt/data"], cwd=source
+        )
+        # Transfer both future commits without advancing the canonical ref yet.
+        self._run_git(
+            [
+                "git",
+                "push",
+                str(self.remote),
+                f"{commits[2]}:refs/heads/bootstrap-stale-next",
+            ],
+            cwd=source,
+        )
+        return commits[1], commits[2]
+
+    def _probe_bootstrap(self, *, move_ref: bool) -> None:
+        next_sha = self._next_ref_shas[self.ref_moves] if move_ref else None
+
+        def runner(command, cwd):
+            command = tuple(command)
+            if command[:2] == ("git", "ls-remote"):
+                return subprocess.run(
+                    list(command),
+                    cwd=cwd,
+                    check=False,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+            if command[:2] == ("dolt", "clone"):
+                (cwd / command[3]).mkdir(exist_ok=True)
+                if next_sha is not None:
+                    self._run_git(
+                        [
+                            "git",
+                            "--git-dir",
+                            str(self.remote),
+                            "update-ref",
+                            "refs/dolt/data",
+                            next_sha,
+                        ],
+                        cwd=self.root,
+                    )
+                    self.ref_moves += 1
+                return subprocess.CompletedProcess(command, 0, "", "")
+            if command[:2] == ("dolt", "sql"):
+                return subprocess.CompletedProcess(command, 0, "commit_hash\nprobe-head\n", "")
+            raise AssertionError(f"unexpected probe command: {command}")
+
+        repository = DoltCanonicalRepository(
+            "git+file://" + str(self.remote),
+            lambda _: ProbeConnection(),
+            run_command=runner,
+            workspace_root=self.root,
+        )
+        snapshot = repository.bootstrap()
+        snapshot.close()
 
     def bootstrap(self):
         worker = threading.get_ident()
         with self.lock:
             if self.victim is None:
                 self.victim = worker
-            if worker == self.victim and self.remaining:
-                self.remaining -= 1
+            move_ref = worker == self.victim and self.ref_moves < len(self._next_ref_shas)
+            try:
+                self._probe_bootstrap(move_ref=move_ref)
+            except StaleCanonicalBase:
                 self.bootstrap_stales += 1
-                raise StaleCanonicalBase("STALE_EXPECTED_OLD_SHA")
+                raise
         return self.inner.bootstrap()
 
     @staticmethod
@@ -204,63 +333,65 @@ class BootstrapStaleRetryTests(unittest.TestCase):
         self.assertEqual(allocations[0]["allocation_id"], granted.allocation_id)
         self.assertEqual(allocations[0]["state"], "ACTIVE")
 
-    def test_close_timed_workstream_d_adapter_uses_default_stale_budget(self):
+    def test_close_timed_workstream_d_adapter_retries_real_bootstrap_ref_movement(self):
         inner = self.repository(
             task("task-a", "2026-01-01T00:00:00Z"),
             task("task-b", "2026-01-01T00:00:01Z"),
         )
-        repository = CloseTimedBootstrapStaleRepository(inner)
-        namespace = AttemptNamespace.parse("wd-1-1-abc123", run_id=1, run_attempt=1)
-        inventory = ValidatedInventory(
-            InventoryAttestation(
-                app_id=1,
-                installation_id=2,
-                repository_selection="selected",
-                repository_ids=(CONTROL_REPOSITORY_ID, STATE_REPOSITORY_ID),
-                audited_at=datetime.now(timezone.utc),
-            ),
-            "fixture-inventory",
-        )
-        backend = LiveFixtureBackend(
-            repository,
-            object(),
-            1,
-            "a" * 40,
-            PROTOCOL_AUTHORITY,
-            (),
-            inventory,
-            namespace,
-        )
-        workers = (backend._fresh_backend(), backend._fresh_backend())
-
-        values, start_spread = _run_close_timed_calls(
-            (
-                lambda: workers[0]._process(
-                    1,
-                    1,
-                    request_type="ALLOCATE_NEXT",
-                    project=False,
-                    source_override=(201, "https://example.invalid/source/201"),
+        with tempfile.TemporaryDirectory(prefix="bootstrap-stale-ref-move-") as directory:
+            repository = CloseTimedBootstrapStaleRepository(inner, Path(directory))
+            namespace = AttemptNamespace.parse("wd-1-1-abc123", run_id=1, run_attempt=1)
+            inventory = ValidatedInventory(
+                InventoryAttestation(
+                    app_id=1,
+                    installation_id=2,
+                    repository_selection="selected",
+                    repository_ids=(CONTROL_REPOSITORY_ID, STATE_REPOSITORY_ID),
+                    audited_at=datetime.now(timezone.utc),
                 ),
-                lambda: workers[1]._process(
-                    1,
-                    2,
-                    request_type="ALLOCATE_NEXT",
-                    project=False,
-                    source_override=(202, "https://example.invalid/source/202"),
-                ),
+                "fixture-inventory",
             )
-        )
+            backend = LiveFixtureBackend(
+                repository,
+                object(),
+                1,
+                "a" * 40,
+                PROTOCOL_AUTHORITY,
+                (),
+                inventory,
+                namespace,
+            )
+            workers = (backend._fresh_backend(), backend._fresh_backend())
 
-        self.assertLessEqual(start_spread, 30.0)
-        self.assertEqual(repository.bootstrap_stales, 2)
-        self.assertEqual({record.reason for record in values}, {"ALLOCATED"})
-        self.assertEqual({record.task_id for record in values}, {"task-a", "task-b"})
-        self.assertEqual(len(rows(inner, "allocations")), 2)
-        self.assertEqual(
-            {row["anchor_status"] for row in rows(inner, "allocation_requests")},
-            {"RECORDED"},
-        )
+            values, start_spread = _run_close_timed_calls(
+                (
+                    lambda: workers[0]._process(
+                        1,
+                        1,
+                        request_type="ALLOCATE_NEXT",
+                        project=False,
+                        source_override=(201, "https://example.invalid/source/201"),
+                    ),
+                    lambda: workers[1]._process(
+                        1,
+                        2,
+                        request_type="ALLOCATE_NEXT",
+                        project=False,
+                        source_override=(202, "https://example.invalid/source/202"),
+                    ),
+                )
+            )
+
+            self.assertLessEqual(start_spread, 30.0)
+            self.assertEqual(repository.ref_moves, 2)
+            self.assertEqual(repository.bootstrap_stales, 2)
+            self.assertEqual({record.reason for record in values}, {"ALLOCATED"})
+            self.assertEqual({record.task_id for record in values}, {"task-a", "task-b"})
+            self.assertEqual(len(rows(inner, "allocations")), 2)
+            self.assertEqual(
+                {row["anchor_status"] for row in rows(inner, "allocation_requests")},
+                {"RECORDED"},
+            )
 
 
 if __name__ == "__main__":
