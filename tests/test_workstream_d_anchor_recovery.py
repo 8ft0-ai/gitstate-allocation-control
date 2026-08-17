@@ -9,7 +9,7 @@ from phase2 import workstream_d_live as live
 from phase2 import workstream_d_revocation as remediation
 from phase2.allocation_engine import AllocationService, seed_local_fixture
 from phase2.allocation_types import AllocationCommand, AllocationResult, RequestContext, Task, stable_ulid
-from phase2.canonical import LocalCanonicalRepository, StaleCanonicalBase
+from phase2.canonical import LocalCanonicalRepository
 from phase2.projection import ProjectionError
 from phase2.reconciliation import CanonicalHistoryRevision, ReconciliationService
 
@@ -69,9 +69,6 @@ class FirstBootstrapBarrier:
         if wait:
             self.barrier.wait(timeout=10)
         return snapshot
-
-    def store(self, snapshot):
-        return self.inner.store(snapshot)
 
     def publish(self, expected_old_sha, snapshot):
         return self.inner.publish(expected_old_sha, snapshot)
