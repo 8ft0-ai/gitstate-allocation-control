@@ -18,6 +18,8 @@ from pathlib import Path
 
 import pymysql
 
+from phase2 import workstream_d_anchor_repair as anchor_repair
+from phase2 import workstream_d_live as live
 from phase2.allocation_engine import AllocationService
 from phase2.allocation_schema import dolt_schema
 from phase2.allocation_types import AllocationCommand, RequestContext, Task, stable_ulid
@@ -275,6 +277,111 @@ def initialise_pinned_beads_remote(root: Path, bd_bin: str) -> tuple[Path, str]:
     return remote, fields[0]
 
 
+def assert_durable_anchor_history_repair(
+    repository: DoltCanonicalRepository,
+    remote: Path,
+    dolt_bin: str,
+    granted,
+) -> None:
+    """Exercise production durable history and Workstream C anchor repair."""
+    creation_git_sha = granted.canonical_git_ref_sha
+    creation_dolt_commit = granted.canonical_dolt_commit
+    if not creation_git_sha or not creation_dolt_commit:
+        raise AssertionError("grant did not expose allocation-creation identity")
+
+    snapshot = repository.bootstrap()
+    try:
+        row = repository.store(snapshot).get_request(granted.request_id)
+        if row is None or row["anchor_status"] != "PENDING":
+            raise AssertionError(f"grant was not pending anchor before repair: {row}")
+    finally:
+        snapshot.close()
+
+    # Advance canonical state after the allocation but before repair. This makes
+    # the current head deliberately different from the allocation-creation
+    # identity, so a repair that substitutes current runner state cannot pass.
+    snapshot = repository.bootstrap()
+    try:
+        store = repository.store(snapshot)
+        store.begin()
+        store.seed_task(
+            Task(
+                "task-anchor-history-later",
+                "task",
+                "open",
+                None,
+                4,
+                NOW,
+                True,
+                False,
+            )
+        )
+        store.commit()
+        intervening = repository.publish(snapshot.identity.git_ref_sha, snapshot)
+    finally:
+        snapshot.close()
+    if intervening.git_ref_sha == creation_git_sha:
+        raise AssertionError("intervening canonical mutation did not advance Git history")
+    if intervening.dolt_commit == creation_dolt_commit:
+        raise AssertionError("intervening canonical mutation did not advance Dolt history")
+
+    def read_only_remote_factory(root: Path) -> tuple[Path, str]:
+        mirror = root / "state-read-only.git"
+        env = live._credential_free_git_env()
+        run(
+            ["git", "clone", "--mirror", "--no-hardlinks", str(remote), str(mirror)],
+            cwd=root,
+            env=env,
+        )
+        source_sha = run(
+            ["git", "--git-dir", str(mirror), "rev-parse", "refs/dolt/data"],
+            cwd=root,
+            env=env,
+        )
+        live._set_tree_read_only(mirror, read_only=True)
+        return mirror, source_sha
+
+    history = anchor_repair.DurableAcceptedHistory(
+        read_only_remote_factory,
+        dolt_bin=dolt_bin,
+    )
+    repaired = anchor_repair.repair_pending_anchor(
+        repository,
+        granted.request_id,
+        history,
+        control_repository="runtime/control",
+        issue_number=1,
+        clock=lambda: NOW,
+    )
+    if repaired["anchor_status"] != "RECORDED":
+        raise AssertionError(f"anchor repair did not record metadata: {repaired}")
+    if repaired["canonical_git_ref_sha"] != creation_git_sha:
+        raise AssertionError(
+            "durable history repair did not retain allocation-creation Git SHA"
+        )
+    if repaired["canonical_dolt_commit"] != creation_dolt_commit:
+        raise AssertionError(
+            "durable history repair did not retain allocation-creation Dolt commit"
+        )
+
+    snapshot = repository.bootstrap()
+    try:
+        current = snapshot.identity
+        row = repository.store(snapshot).get_request(granted.request_id)
+        if row is None:
+            raise AssertionError("repaired request disappeared")
+        if row["canonical_git_ref_sha"] != creation_git_sha:
+            raise AssertionError("canonical row drifted from original Git identity")
+        if row["canonical_dolt_commit"] != creation_dolt_commit:
+            raise AssertionError("canonical row drifted from original Dolt identity")
+        if current.git_ref_sha in {creation_git_sha, intervening.git_ref_sha}:
+            raise AssertionError("metadata-only anchor repair did not create a later Git commit")
+        if current.dolt_commit in {creation_dolt_commit, intervening.dolt_commit}:
+            raise AssertionError("metadata-only anchor repair did not create a later Dolt commit")
+    finally:
+        snapshot.close()
+
+
 def main() -> None:
     bd_bin = os.environ.get("BD_BIN")
     dolt_bin = os.environ.get("DOLT_BIN")
@@ -389,6 +496,7 @@ def main() -> None:
         finally:
             snapshot.close()
 
+        assert_durable_anchor_history_repair(repository, remote, dolt_bin, granted)
         assert_append_only_trigger(repository)
 
         release = AllocationCommand(
@@ -476,6 +584,7 @@ def main() -> None:
         print("dolt_version=2.1.4")
         print("ddl_applied=true")
         print("grant_release_atomic=true")
+        print("durable_anchor_history_repair=true")
         print("append_only_trigger=true")
         print("stale_expected_old_sha_rejected=true")
         print("force_push_used=false")

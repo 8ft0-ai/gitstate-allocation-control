@@ -18,6 +18,7 @@ import os
 import sys
 from typing import Any, ClassVar, Mapping
 
+from . import workstream_d_anchor_repair as anchor_repair
 from . import workstream_d_live as live
 
 REMEDIATION_EXECUTABLE_PATH = "phase2/workstream_d_revocation.py"
@@ -109,7 +110,7 @@ def execute_live_suite(
     result: live.LiveSuiteResult | None = None
     try:
         try:
-            result = live.execute_live_suite(env)
+            result = anchor_repair.execute_live_suite(env)
         except Exception as exc:
             primary_error = exc
     finally:
