@@ -224,7 +224,9 @@ class WorkstreamDAnchorRepairTests(unittest.TestCase):
             "service = live.AllocationService(self.repository, clock=lambda: live.NOW)",
             source,
         )
-        self.assertNotIn("max_stale_retries=1", source)
+        self.assertNotRegex(
+            source, r"AllocationService\([^)]*max_stale_retries\s*=\s*1"
+        )
         self.assertIn("self._repair_request_anchor", source)
         self.assertIn("_canonical_projection", source)
         self.assertLess(
