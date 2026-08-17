@@ -109,6 +109,26 @@ class DurableAcceptedHistory:
             str(row["request_id"]) for row in reconstructed.get("requests", [])
         )
 
+    @staticmethod
+    def _is_manifest_revision(mirror: Path, git_sha: str, *, root: Path) -> bool:
+        changed = live._run(
+            [
+                "git",
+                "--git-dir",
+                str(mirror),
+                "diff-tree",
+                "--root",
+                "--no-commit-id",
+                "--name-only",
+                "-r",
+                git_sha,
+            ],
+            cwd=root,
+            env=live._credential_free_git_env(),
+        )
+        paths = tuple(line.strip() for line in changed.splitlines() if line.strip())
+        return "manifest" in paths
+
     def _revision(
         self,
         mirror: Path,
@@ -188,9 +208,27 @@ class DurableAcceptedHistory:
                     raise live.LiveExecutorError(
                         "CANONICAL_HISTORY_CURRENT_REF_MISMATCH"
                     )
+
+                # GitBlobstore may advance refs/dolt/data while staging immutable
+                # table files as part of one Dolt push. Only a commit that changes
+                # the NBS manifest represents a complete accepted Dolt snapshot.
+                # Preserve first-parent order, but never interpret intermediate
+                # storage-transport commits as canonical allocation revisions.
+                manifest_shas = tuple(
+                    git_sha
+                    for git_sha in git_shas
+                    if self._is_manifest_revision(mirror, git_sha, root=root)
+                )
+                if not manifest_shas:
+                    raise live.LiveExecutorError("CANONICAL_HISTORY_EMPTY")
+                if manifest_shas[-1] != source_sha:
+                    raise live.LiveExecutorError(
+                        "CANONICAL_HISTORY_CURRENT_REF_NOT_MANIFEST"
+                    )
+
                 revisions = tuple(
                     self._revision(mirror, git_sha, root=root, index=index)
-                    for index, git_sha in enumerate(git_shas, 1)
+                    for index, git_sha in enumerate(manifest_shas, 1)
                 )
                 if not revisions:
                     raise live.LiveExecutorError("CANONICAL_HISTORY_EMPTY")
