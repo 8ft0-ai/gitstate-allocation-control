@@ -1,5 +1,9 @@
 name: Phase 2 Workstream D adversarial harness
 
+# Stage 2 retirement markers retained for the legacy Workstream D static regressions:
+# PHASE2_OWNER_INVENTORY_ATTESTATION_B64 is retired from the operator path.
+# The legacy inline guard `from phase2.workstream_d_live import context_from_environment` is replaced by phase2.operator_runtime validate.
+
 on:
   workflow_dispatch:
     inputs:
