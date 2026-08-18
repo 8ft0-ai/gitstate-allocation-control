@@ -163,7 +163,7 @@ class OperatorInventoryTests(unittest.TestCase):
             )
         self.assertIn(("inventory", "DELETE", "/installation/token"), calls)
 
-    def test_permission_widening_fails_before_inventory_use(self):
+    def test_permission_widening_fails_without_inventory_use_but_still_revokes(self):
         calls = []
         app = FakeAppAPI(
             calls,
@@ -173,6 +173,7 @@ class OperatorInventoryTests(unittest.TestCase):
                 "repository_selection": "selected",
             },
         )
+        token_api = FakeTokenAPI({}, calls)
         with self.assertRaisesRegex(InventoryProofError, "INVENTORY_TOKEN_PERMISSION_MISMATCH"):
             prove_installation_inventory(
                 app,
@@ -185,8 +186,20 @@ class OperatorInventoryTests(unittest.TestCase):
                 capsule_id="b" * 32,
                 capsule_body_sha256="c" * 64,
                 api_url="https://api.github.invalid",
+                api_factory=lambda token, url: token_api,
             )
-        self.assertEqual(len(calls), 1)
+        self.assertEqual(
+            calls,
+            [
+                (
+                    "app",
+                    "POST",
+                    "/app/installations/20/access_tokens",
+                    {"permissions": {"metadata": "read"}},
+                ),
+                ("inventory", "DELETE", "/installation/token"),
+            ],
+        )
 
     def test_revocation_must_return_204(self):
         calls = []
