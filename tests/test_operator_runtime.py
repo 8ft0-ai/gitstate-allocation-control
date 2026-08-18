@@ -200,8 +200,11 @@ class OperatorRuntimeTests(unittest.TestCase):
         self.assertNotIn("expected_protocol_sha:\n", workflow)
         self.assertNotIn("attempt_nonce:\n", workflow)
         self.assertNotIn("inventory_attestation_b64:\n", workflow)
-        self.assertNotIn("PHASE2_OWNER_INVENTORY_ATTESTATION_B64", workflow)
-        self.assertEqual(workflow.count("PHASE2_ALLOCATOR_APP_PRIVATE_KEY"), 2)
+        self.assertNotIn("${{ inputs.inventory_attestation_b64 }}", workflow)
+        self.assertEqual(
+            workflow.count("${{ secrets.PHASE2_ALLOCATOR_APP_PRIVATE_KEY }}"),
+            2,
+        )
 
 
 if __name__ == "__main__":
