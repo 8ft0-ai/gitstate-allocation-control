@@ -6,7 +6,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 
 from phase2.allocation_engine import AllocationService, seed_local_fixture
-from phase2.allocation_types import AllocationCommand, RequestContext, Task
+from phase2.allocation_types import AllocationCommand, RequestContext, Task, stable_ulid
 from phase2.canonical import LocalCanonicalRepository, StaleCanonicalBase
 from phase2.parser import parse_request
 from phase2.reconciliation import PostedComment, ReconciliationError, ReconciliationService
@@ -76,9 +76,7 @@ def request_body(name: str, task_id: str) -> str:
     payload = {
         "agent_id": AGENT,
         "protocol": "beads-allocation/v0.2",
-        "request_id": __import__("phase2.allocation_types", fromlist=["stable_ulid"]).stable_ulid(
-            f"issue-31:{name}"
-        ),
+        "request_id": stable_ulid(f"issue-31:{name}"),
         "task_id": task_id,
         "type": "ALLOCATE_TASK",
     }
