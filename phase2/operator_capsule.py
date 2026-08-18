@@ -20,6 +20,7 @@ STATE_BASELINE_SHA = "fb872aeb52863ce3597ff8337d545cae13292696"
 CAPSULE_PREFIX = "/gitstate-operator-v1 "
 CONSUMPTION_PREFIX = "/gitstate-consumption-v1 "
 CAPSULE_CONTRACT = "gitstate-operator/v1"
+CONSUMPTION_CONTRACT = "gitstate-consumption/v1"
 GOVERNANCE_CONTRACT = "gitstate-private-governance/v1"
 LIVE_PROFILE = "workstream-d-scenarios-1-14/v1"
 PREFLIGHT_PROFILE = "operator-preflight/v1"
@@ -49,7 +50,6 @@ CAPSULE_FIELDS = frozenset(
         "workstream_e_authorised",
     }
 )
-
 CONSUMPTION_FIELDS = frozenset(
     {
         "contract",
@@ -79,7 +79,20 @@ def _reject_duplicate_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return value
 
 
-def _strict_json(raw: str) -> dict[str, Any]:
+def canonical_json(value: Mapping[str, Any]) -> str:
+    # Capsule fields are deliberately limited to strings/booleans, so this
+    # deterministic representation is the RFC-8785/JCS representation for the
+    # accepted payload value domain.
+    return json.dumps(
+        dict(value),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+
+
+def _strict_json(raw: str, *, require_canonical: bool = True) -> dict[str, Any]:
     try:
         value = json.loads(raw, object_pairs_hook=_reject_duplicate_pairs)
     except OperatorCapsuleError:
@@ -88,17 +101,9 @@ def _strict_json(raw: str) -> dict[str, Any]:
         raise OperatorCapsuleError("MALFORMED_CAPSULE_JSON") from exc
     if not isinstance(value, dict):
         raise OperatorCapsuleError("CAPSULE_JSON_OBJECT_REQUIRED")
+    if require_canonical and raw != canonical_json(value):
+        raise OperatorCapsuleError("CAPSULE_NONCANONICAL_JSON")
     return value
-
-
-def canonical_json(value: Mapping[str, Any]) -> str:
-    return json.dumps(
-        dict(value),
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-        allow_nan=False,
-    )
 
 
 def sha256_text(value: str) -> str:
@@ -169,7 +174,7 @@ class Capsule:
         return str(self.payload["expected_state_baseline"])
 
     def runtime_outputs(self, *, run_id: int, run_attempt: int) -> dict[str, str]:
-        attempt_nonce = hashlib.sha256(
+        nonce = hashlib.sha256(
             f"{run_id}:{run_attempt}:{self.capsule_id}:{self.body_sha256}".encode("ascii")
         ).hexdigest()[:16]
         return {
@@ -181,7 +186,7 @@ class Capsule:
             "expected_protocol_sha": self.expected_protocol_sha,
             "expected_state_baseline": self.expected_state_baseline,
             "operation_profile": self.operation,
-            "attempt_nonce": attempt_nonce,
+            "attempt_nonce": nonce,
         }
 
 
@@ -192,7 +197,8 @@ def parse_capsule_comment(
     expected_control_sha: str,
     expected_profile: str,
 ) -> Capsule:
-    if not isinstance(comment.get("id"), int):
+    comment_id = comment.get("id")
+    if not isinstance(comment_id, int):
         raise OperatorCapsuleError("CAPSULE_COMMENT_ID_INVALID")
     body = comment.get("body")
     if not isinstance(body, str) or "\n" in body or not body.startswith(CAPSULE_PREFIX):
@@ -200,17 +206,20 @@ def parse_capsule_comment(
     user = comment.get("user")
     if not isinstance(user, Mapping) or user.get("login") != OPERATOR_OWNER:
         raise OperatorCapsuleError("CAPSULE_WRONG_OWNER")
+
     comment_created = _parse_time(comment.get("created_at"), "CAPSULE_COMMENT_TIME_INVALID")
     comment_updated = _parse_time(comment.get("updated_at"), "CAPSULE_COMMENT_TIME_INVALID")
     if comment_created != comment_updated:
         raise OperatorCapsuleError("CAPSULE_SOURCE_EDITED")
 
-    payload = _strict_json(body[len(CAPSULE_PREFIX) :])
+    raw_payload = body[len(CAPSULE_PREFIX) :]
+    payload = _strict_json(raw_payload, require_canonical=True)
     _require_exact_keys(payload, CAPSULE_FIELDS, "CAPSULE_SCHEMA_MISMATCH")
     if payload.get("contract") != CAPSULE_CONTRACT:
         raise OperatorCapsuleError("CAPSULE_CONTRACT_MISMATCH")
     if payload.get("governance_contract") != GOVERNANCE_CONTRACT:
         raise OperatorCapsuleError("CAPSULE_GOVERNANCE_CONTRACT_MISMATCH")
+
     _require_hex(payload.get("capsule_id"), OPAQUE_ID, "CAPSULE_ID_INVALID")
     for key in ("governance_record_id", "review_record_id", "authority_record_id"):
         _require_hex(payload.get(key), OPAQUE_ID, "CAPSULE_PROVENANCE_ID_INVALID")
@@ -219,6 +228,7 @@ def parse_capsule_comment(
     _require_hex(payload.get("expected_control_sha"), SHA40, "CAPSULE_CONTROL_SHA_INVALID")
     _require_hex(payload.get("expected_protocol_sha"), SHA40, "CAPSULE_PROTOCOL_SHA_INVALID")
     _require_hex(payload.get("expected_state_baseline"), SHA40, "CAPSULE_STATE_BASELINE_INVALID")
+
     if payload.get("single_use") is not True:
         raise OperatorCapsuleError("CAPSULE_SINGLE_USE_REQUIRED")
     if payload.get("workstream_e_authorised") is not False:
@@ -246,33 +256,29 @@ def parse_capsule_comment(
 
     canonical = canonical_json(payload)
     return Capsule(
-        dict(payload),
-        sha256_text(body),
-        sha256_text(canonical),
-        int(comment["id"]),
-        comment_created,
+        payload=dict(payload),
+        body_sha256=sha256_text(body),
+        canonical_payload_sha256=sha256_text(canonical),
+        comment_id=comment_id,
+        created_at=comment_created,
     )
 
 
 def _list_issue_comments(api: GitHubAPI) -> list[dict[str, Any]]:
     comments: list[dict[str, Any]] = []
-    page = 1
-    while True:
+    for page in range(1, 101):
         payload = api.get(
             f"/repos/{CONTROL_REPOSITORY}/issues/{OPERATOR_ISSUE_NUMBER}/comments"
             f"?per_page=100&page={page}"
         )
         if not isinstance(payload, list):
             raise OperatorCapsuleError("OPERATOR_COMMENT_LIST_INVALID")
-        for item in payload:
-            if not isinstance(item, dict):
-                raise OperatorCapsuleError("OPERATOR_COMMENT_LIST_INVALID")
-            comments.append(item)
+        if any(not isinstance(item, dict) for item in payload):
+            raise OperatorCapsuleError("OPERATOR_COMMENT_LIST_INVALID")
+        comments.extend(payload)
         if len(payload) < 100:
             return comments
-        page += 1
-        if page > 100:
-            raise OperatorCapsuleError("OPERATOR_COMMENT_PAGINATION_EXCESSIVE")
+    raise OperatorCapsuleError("OPERATOR_COMMENT_PAGINATION_EXCESSIVE")
 
 
 def _valid_consumption_for(comment: Mapping[str, Any], capsule: Capsule) -> bool:
@@ -287,12 +293,12 @@ def _valid_consumption_for(comment: Mapping[str, Any], capsule: Capsule) -> bool
         updated = _parse_time(comment.get("updated_at"), "CONSUMPTION_TIME_INVALID")
         if created != updated:
             return False
-        payload = _strict_json(body[len(CONSUMPTION_PREFIX) :])
+        payload = _strict_json(body[len(CONSUMPTION_PREFIX) :], require_canonical=True)
         _require_exact_keys(payload, CONSUMPTION_FIELDS, "CONSUMPTION_SCHEMA_MISMATCH")
     except OperatorCapsuleError:
         return False
     return (
-        payload.get("contract") == "gitstate-consumption/v1"
+        payload.get("contract") == CONSUMPTION_CONTRACT
         and payload.get("capsule_id") == capsule.capsule_id
         and payload.get("capsule_comment_id") == capsule.comment_id
         and payload.get("capsule_body_sha256") == capsule.body_sha256
@@ -363,8 +369,9 @@ def consume_capsule(
         or capsule.body_sha256 != expected_body_sha256
     ):
         raise OperatorCapsuleError("CAPSULE_CHANGED_BEFORE_CONSUMPTION")
+
     payload: dict[str, Any] = {
-        "contract": "gitstate-consumption/v1",
+        "contract": CONSUMPTION_CONTRACT,
         "capsule_id": capsule.capsule_id,
         "capsule_comment_id": capsule.comment_id,
         "capsule_body_sha256": capsule.body_sha256,
@@ -399,8 +406,7 @@ def _require_workflow_identity(values: Mapping[str, str]) -> tuple[str, int, int
         raise OperatorCapsuleError("OPERATOR_RUN_IDENTITY_INVALID") from exc
     if run_id <= 0 or run_attempt != 1:
         raise OperatorCapsuleError("OPERATOR_RERUN_FORBIDDEN")
-    profile = profile_for_dispatch(values.get("INPUT_OPERATION", ""))
-    return sha, run_id, run_attempt, profile
+    return sha, run_id, run_attempt, profile_for_dispatch(values.get("INPUT_OPERATION", ""))
 
 
 def _write_outputs(path: str, values: Mapping[str, str]) -> None:
@@ -428,8 +434,10 @@ def command_discover(values: Mapping[str, str]) -> None:
         expected_profile=profile,
         run_attempt=run_attempt,
     )
-    outputs = capsule.runtime_outputs(run_id=run_id, run_attempt=run_attempt)
-    _write_outputs(values.get("GITHUB_OUTPUT", ""), outputs)
+    _write_outputs(
+        values.get("GITHUB_OUTPUT", ""),
+        capsule.runtime_outputs(run_id=run_id, run_attempt=run_attempt),
+    )
     print(
         json.dumps(
             {
