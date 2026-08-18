@@ -4,31 +4,14 @@ on:
   workflow_dispatch:
     inputs:
       operation:
-        description: Bounded Workstream D operation
+        description: Bounded governed Workstream D operator action
         required: true
         default: contract_check
         type: choice
         options:
           - contract_check
-          - live_authority_gate
+          - operator_preflight
           - live_scenario_suite
-      expected_control_sha:
-        description: Exact trusted control main SHA authorised for this run
-        required: true
-        type: string
-      expected_protocol_sha:
-        description: Exact authoritative gitstate-lab protocol SHA
-        required: true
-        type: string
-      attempt_nonce:
-        description: Lowercase alphanumeric 6-24 character attempt nonce
-        required: true
-        type: string
-      inventory_attestation_b64:
-        description: Fresh owner-authenticated exact two-repository inventory attestation (base64url JSON; live suite only)
-        required: false
-        default: ""
-        type: string
 
 concurrency:
   group: beads-allocation-v0.2-${{ github.repository }}
@@ -50,12 +33,81 @@ jobs:
           persist-credentials: false
           fetch-depth: 1
 
-      - name: Run credential-free Workstream D harness checks
-        run: python3 -m unittest discover -s tests -p 'test_workstream_d*.py' -v
+      - name: Run credential-free operator and Workstream D checks
+        run: |
+          python3 -m unittest discover -s tests -p 'test_operator*.py' -v
+          python3 -m unittest discover -s tests -p 'test_workstream_d*.py' -v
 
-  live-authority-gate:
+  capsule-discovery:
     needs: contract-check
-    if: ${{ inputs.operation == 'live_authority_gate' }}
+    if: ${{ inputs.operation == 'operator_preflight' || inputs.operation == 'live_scenario_suite' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      issues: read
+    outputs:
+      capsule_id: ${{ steps.capsule.outputs.capsule_id }}
+      capsule_comment_id: ${{ steps.capsule.outputs.capsule_comment_id }}
+      capsule_body_sha256: ${{ steps.capsule.outputs.capsule_body_sha256 }}
+      capsule_payload_sha256: ${{ steps.capsule.outputs.capsule_payload_sha256 }}
+      expected_control_sha: ${{ steps.capsule.outputs.expected_control_sha }}
+      expected_protocol_sha: ${{ steps.capsule.outputs.expected_protocol_sha }}
+      expected_state_baseline: ${{ steps.capsule.outputs.expected_state_baseline }}
+      operation_profile: ${{ steps.capsule.outputs.operation_profile }}
+      attempt_nonce: ${{ steps.capsule.outputs.attempt_nonce }}
+    steps:
+      - name: Checkout immutable dispatched commit without persisted credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Discover exactly one valid unconsumed public execution capsule
+        id: capsule
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          INPUT_OPERATION: ${{ inputs.operation }}
+        run: PYTHONPATH=. python3 -m phase2.operator_capsule discover
+
+  capsule-consumption:
+    needs: [contract-check, capsule-discovery]
+    if: ${{ inputs.operation == 'operator_preflight' || inputs.operation == 'live_scenario_suite' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      issues: write
+    outputs:
+      capsule_id: ${{ steps.consume.outputs.capsule_id }}
+      capsule_comment_id: ${{ steps.consume.outputs.capsule_comment_id }}
+      capsule_body_sha256: ${{ steps.consume.outputs.capsule_body_sha256 }}
+      expected_control_sha: ${{ steps.consume.outputs.expected_control_sha }}
+      expected_protocol_sha: ${{ steps.consume.outputs.expected_protocol_sha }}
+      expected_state_baseline: ${{ steps.consume.outputs.expected_state_baseline }}
+      operation_profile: ${{ steps.consume.outputs.operation_profile }}
+      attempt_nonce: ${{ steps.consume.outputs.attempt_nonce }}
+      consumption_record_sha256: ${{ steps.consume.outputs.consumption_record_sha256 }}
+    steps:
+      - name: Checkout immutable dispatched commit without persisted credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Revalidate and durably consume the capsule before protected execution
+        id: consume
+        env:
+          EXPECTED_CAPSULE_BODY_SHA256: ${{ needs.capsule-discovery.outputs.capsule_body_sha256 }}
+          EXPECTED_CAPSULE_COMMENT_ID: ${{ needs.capsule-discovery.outputs.capsule_comment_id }}
+          EXPECTED_CAPSULE_ID: ${{ needs.capsule-discovery.outputs.capsule_id }}
+          GITHUB_TOKEN: ${{ github.token }}
+          INPUT_OPERATION: ${{ inputs.operation }}
+        run: PYTHONPATH=. python3 -m phase2.operator_capsule consume
+
+  operator-preflight:
+    needs: [contract-check, capsule-consumption]
+    if: ${{ inputs.operation == 'operator_preflight' }}
     runs-on: ubuntu-24.04
     environment: phase-2-allocator
     permissions:
@@ -68,57 +120,45 @@ jobs:
           persist-credentials: false
           fetch-depth: 1
 
-      - name: Fail closed unless the separate live-execution authority guard is exact
+      - name: Validate consumed operator context before allocator secret access
         env:
-          ATTEMPT_NONCE: ${{ inputs.attempt_nonce }}
-          EXPECTED_CONTROL_SHA: ${{ inputs.expected_control_sha }}
-          EXPECTED_PROTOCOL_SHA: ${{ inputs.expected_protocol_sha }}
-          PHASE2_WORKSTREAM_D_EXECUTION_ENABLED: ${{ vars.PHASE2_WORKSTREAM_D_EXECUTION_ENABLED }}
-          PROTOCOL_AUTHORITY: 4ad2cebf6c37d21f44e5652a70f5fb4e77da74ae
-          RUN_ATTEMPT: ${{ github.run_attempt }}
-          RUN_ID: ${{ github.run_id }}
-          TRUSTED_REF: ${{ github.ref }}
-          TRUSTED_REPOSITORY: ${{ github.repository }}
-          TRUSTED_SHA: ${{ github.sha }}
+          ATTEMPT_NONCE: ${{ needs.capsule-consumption.outputs.attempt_nonce }}
+          CAPSULE_BODY_SHA256: ${{ needs.capsule-consumption.outputs.capsule_body_sha256 }}
+          CAPSULE_ID: ${{ needs.capsule-consumption.outputs.capsule_id }}
+          CONSUMPTION_RECORD_SHA256: ${{ needs.capsule-consumption.outputs.consumption_record_sha256 }}
+          EXPECTED_CONTROL_SHA: ${{ needs.capsule-consumption.outputs.expected_control_sha }}
+          EXPECTED_PROTOCOL_SHA: ${{ needs.capsule-consumption.outputs.expected_protocol_sha }}
+          EXPECTED_STATE_BASELINE: ${{ needs.capsule-consumption.outputs.expected_state_baseline }}
+          INPUT_OPERATION: ${{ inputs.operation }}
+          OPERATION_PROFILE: ${{ needs.capsule-consumption.outputs.operation_profile }}
+        run: PYTHONPATH=. python3 -m phase2.operator_runtime validate
+
+      - name: Prove exact App inventory and positively revoke inventory token
+        env:
+          ATTEMPT_NONCE: ${{ needs.capsule-consumption.outputs.attempt_nonce }}
+          CAPSULE_BODY_SHA256: ${{ needs.capsule-consumption.outputs.capsule_body_sha256 }}
+          CAPSULE_ID: ${{ needs.capsule-consumption.outputs.capsule_id }}
+          CONSUMPTION_RECORD_SHA256: ${{ needs.capsule-consumption.outputs.consumption_record_sha256 }}
+          EXPECTED_CONTROL_SHA: ${{ needs.capsule-consumption.outputs.expected_control_sha }}
+          EXPECTED_PROTOCOL_SHA: ${{ needs.capsule-consumption.outputs.expected_protocol_sha }}
+          EXPECTED_STATE_BASELINE: ${{ needs.capsule-consumption.outputs.expected_state_baseline }}
+          INPUT_OPERATION: ${{ inputs.operation }}
+          OPERATION_PROFILE: ${{ needs.capsule-consumption.outputs.operation_profile }}
+          PHASE2_ALLOCATOR_APP_ID: ${{ vars.PHASE2_ALLOCATOR_APP_ID }}
+          PHASE2_ALLOCATOR_INSTALLATION_ID: ${{ vars.PHASE2_ALLOCATOR_INSTALLATION_ID }}
+          PHASE2_ALLOCATOR_APP_PRIVATE_KEY: ${{ secrets.PHASE2_ALLOCATOR_APP_PRIVATE_KEY }}
+          PHASE2_STATE_REPOSITORY_ID: ${{ secrets.PHASE2_STATE_REPOSITORY_ID }}
+        run: PYTHONPATH=. python3 -m phase2.operator_runtime preflight
+
+      - name: Preserve the non-mutating preflight boundary
+        if: ${{ always() }}
         run: |
-          python3 - <<'PY'
-          import json
-          import os
-          from phase2.adversarial import AttemptNamespace, validate_live_gate
-
-          run_id = int(os.environ['RUN_ID'])
-          run_attempt = int(os.environ['RUN_ATTEMPT'])
-          namespace = f"wd-{run_id}-{run_attempt}-{os.environ['ATTEMPT_NONCE']}"
-          AttemptNamespace.parse(namespace, run_id=run_id, run_attempt=run_attempt)
-
-          validate_live_gate(
-              repository=os.environ['TRUSTED_REPOSITORY'],
-              ref=os.environ['TRUSTED_REF'],
-              trusted_sha=os.environ['TRUSTED_SHA'],
-              protocol_sha=os.environ['EXPECTED_PROTOCOL_SHA'],
-              expected_trusted_sha=os.environ['EXPECTED_CONTROL_SHA'],
-              expected_protocol_sha=os.environ['PROTOCOL_AUTHORITY'],
-              run_attempt=run_attempt,
-              enabled=os.environ.get('PHASE2_WORKSTREAM_D_EXECUTION_ENABLED') == 'true',
-          )
-
-          print(json.dumps({
-              'attempt_namespace': namespace,
-              'credential_accessed': False,
-              'live_state_mutated': False,
-              'protocol_sha': os.environ['EXPECTED_PROTOCOL_SHA'],
-              'status': 'WORKSTREAM_D_LIVE_AUTHORITY_GATE_PASSED',
-              'trusted_sha': os.environ['TRUSTED_SHA'],
-          }, sort_keys=True, separators=(',', ':')))
-          PY
-
-      - name: Preserve the execution boundary
-        run: |
-          echo 'Workstream D live authority is validated, but live_authority_gate never executes scenarios 1-14.'
-          echo 'Use live_scenario_suite only under fresh post-remediation authority and immediate live revalidation.'
+          echo 'Operator preflight may mint only the installation-wide Metadata-read-only inventory token.'
+          echo 'It must positively revoke that token and never mint the control/state runtime tokens or execute scenarios 1-14.'
+          echo 'No preflight result grants live Workstream D or Workstream E authority.'
 
   live-scenario-suite:
-    needs: contract-check
+    needs: [contract-check, capsule-consumption]
     if: ${{ inputs.operation == 'live_scenario_suite' }}
     runs-on: ubuntu-24.04
     environment: phase-2-allocator
@@ -132,19 +172,20 @@ jobs:
           persist-credentials: false
           fetch-depth: 1
 
-      - name: Fail closed before dependency installation or secret access
+      - name: Validate consumed context before dependency installation or secret access
         env:
-          ATTEMPT_NONCE: ${{ inputs.attempt_nonce }}
-          EXPECTED_CONTROL_SHA: ${{ inputs.expected_control_sha }}
-          EXPECTED_PROTOCOL_SHA: ${{ inputs.expected_protocol_sha }}
+          ATTEMPT_NONCE: ${{ needs.capsule-consumption.outputs.attempt_nonce }}
+          CAPSULE_BODY_SHA256: ${{ needs.capsule-consumption.outputs.capsule_body_sha256 }}
+          CAPSULE_ID: ${{ needs.capsule-consumption.outputs.capsule_id }}
+          CONSUMPTION_RECORD_SHA256: ${{ needs.capsule-consumption.outputs.consumption_record_sha256 }}
+          EXPECTED_CONTROL_SHA: ${{ needs.capsule-consumption.outputs.expected_control_sha }}
+          EXPECTED_PROTOCOL_SHA: ${{ needs.capsule-consumption.outputs.expected_protocol_sha }}
+          EXPECTED_STATE_BASELINE: ${{ needs.capsule-consumption.outputs.expected_state_baseline }}
+          INPUT_OPERATION: ${{ inputs.operation }}
+          OPERATION_PROFILE: ${{ needs.capsule-consumption.outputs.operation_profile }}
           PHASE2_WORKSTREAM_D_EXECUTION_ENABLED: ${{ vars.PHASE2_WORKSTREAM_D_EXECUTION_ENABLED }}
           PHASE2_WORKSTREAM_D_FIXTURE_MODE: workstream-d-synthetic-fixture-v1
-        run: |
-          python3 - <<'PY'
-          import os
-          from phase2.workstream_d_live import context_from_environment
-          context_from_environment(os.environ).validate()
-          PY
+        run: PYTHONPATH=. python3 -m phase2.operator_runtime validate
 
       - name: Install cryptographically pinned Beads and Dolt binaries
         shell: bash
@@ -188,27 +229,34 @@ jobs:
             -r "$RUNNER_TEMP/workstream-d-requirements.txt"
           printf 'RUNTIME_PYTHON=%s\n' "$VENV/bin/python" >> "$GITHUB_ENV"
 
-      - name: Execute fixture-only trusted-main Workstream D scenario suite
+      - name: Execute capsule-gated fixture-only trusted-main Workstream D suite
         env:
-          ATTEMPT_NONCE: ${{ inputs.attempt_nonce }}
-          EXPECTED_CONTROL_SHA: ${{ inputs.expected_control_sha }}
-          EXPECTED_PROTOCOL_SHA: ${{ inputs.expected_protocol_sha }}
+          ATTEMPT_NONCE: ${{ needs.capsule-consumption.outputs.attempt_nonce }}
+          CAPSULE_BODY_SHA256: ${{ needs.capsule-consumption.outputs.capsule_body_sha256 }}
+          CAPSULE_ID: ${{ needs.capsule-consumption.outputs.capsule_id }}
+          CONSUMPTION_RECORD_SHA256: ${{ needs.capsule-consumption.outputs.consumption_record_sha256 }}
+          EXPECTED_CONTROL_SHA: ${{ needs.capsule-consumption.outputs.expected_control_sha }}
+          EXPECTED_PROTOCOL_SHA: ${{ needs.capsule-consumption.outputs.expected_protocol_sha }}
+          EXPECTED_STATE_BASELINE: ${{ needs.capsule-consumption.outputs.expected_state_baseline }}
+          INPUT_OPERATION: ${{ inputs.operation }}
+          OPERATION_PROFILE: ${{ needs.capsule-consumption.outputs.operation_profile }}
           PHASE2_ALLOCATOR_APP_ID: ${{ vars.PHASE2_ALLOCATOR_APP_ID }}
           PHASE2_ALLOCATOR_INSTALLATION_ID: ${{ vars.PHASE2_ALLOCATOR_INSTALLATION_ID }}
           PHASE2_ALLOCATOR_APP_PRIVATE_KEY: ${{ secrets.PHASE2_ALLOCATOR_APP_PRIVATE_KEY }}
           PHASE2_CONTROL_ISSUE_NUMBER: "1"
-          PHASE2_OWNER_INVENTORY_ATTESTATION_B64: ${{ inputs.inventory_attestation_b64 }}
           PHASE2_STATE_REPOSITORY_ID: ${{ secrets.PHASE2_STATE_REPOSITORY_ID }}
           PHASE2_WORKSTREAM_D_EXECUTION_ENABLED: ${{ vars.PHASE2_WORKSTREAM_D_EXECUTION_ENABLED }}
           PHASE2_WORKSTREAM_D_FIXTURE_MODE: workstream-d-synthetic-fixture-v1
         shell: bash
         run: |
           set -euo pipefail
-          PYTHONPATH=. "$RUNTIME_PYTHON" -m phase2.workstream_d_revocation
+          # Delegation target remains: PYTHONPATH=. "$RUNTIME_PYTHON" -m phase2.workstream_d_revocation
+          PYTHONPATH=. "$RUNTIME_PYTHON" -m phase2.operator_runtime live
 
       - name: Preserve post-run governance boundary
         if: ${{ always() }}
         run: |
-          echo 'The live entrypoint emits a non-secret cleanup record only after successful installation-token revocation.'
-          echo 'The repository execution-enable variable remains a governance control: remove it immediately after the authorised live run.'
+          echo 'The operator consumes one authority capsule before protected execution and never permits rerun/reuse.'
+          echo 'The inventory token is Metadata-read-only, installation-wide solely for enumeration, and revoked before control/state token minting.'
+          echo 'The existing control/state token profiles and truthful post-run revocation path remain authoritative.'
           echo 'No result from this workflow authorises production use or Workstream E.'
