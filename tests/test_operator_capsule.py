@@ -131,7 +131,7 @@ class OperatorCapsuleTests(unittest.TestCase):
                 expected_profile=PREFLIGHT_PROFILE,
             )
 
-    def test_unknown_and_duplicate_json_fields_fail_closed(self):
+    def test_unknown_duplicate_and_noncanonical_json_fail_closed(self):
         extra = payload(extra="no")
         with self.assertRaisesRegex(OperatorCapsuleError, "CAPSULE_SCHEMA_MISMATCH"):
             parse_capsule_comment(
@@ -141,11 +141,21 @@ class OperatorCapsuleTests(unittest.TestCase):
                 expected_profile=PREFLIGHT_PROFILE,
             )
 
-        value = comment()
-        value["body"] = CAPSULE_PREFIX + '{"contract":"gitstate-operator/v1","contract":"duplicate"}'
+        duplicate = comment()
+        duplicate["body"] = CAPSULE_PREFIX + '{"contract":"gitstate-operator/v1","contract":"duplicate"}'
         with self.assertRaisesRegex(OperatorCapsuleError, "DUPLICATE_JSON_KEY"):
             parse_capsule_comment(
-                value,
+                duplicate,
+                now=NOW,
+                expected_control_sha=CONTROL_SHA,
+                expected_profile=PREFLIGHT_PROFILE,
+            )
+
+        noncanonical = comment()
+        noncanonical["body"] = CAPSULE_PREFIX + canonical_json(payload()).replace(",", ", ", 1)
+        with self.assertRaisesRegex(OperatorCapsuleError, "CAPSULE_NONCANONICAL_JSON"):
+            parse_capsule_comment(
+                noncanonical,
                 now=NOW,
                 expected_control_sha=CONTROL_SHA,
                 expected_profile=PREFLIGHT_PROFILE,
