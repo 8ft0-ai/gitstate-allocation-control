@@ -159,13 +159,21 @@ def prove_installation_inventory(
     )
     if not isinstance(response, dict):
         raise InventoryProofError("INVENTORY_TOKEN_RESPONSE_INVALID")
-    token = validate_inventory_token_response(response)
+
+    # Once GitHub has returned a token, every later validation/enumeration path
+    # must attempt positive revocation, including a broader-than-requested
+    # permission response. A malformed response with no usable token cannot be
+    # revoked and therefore fails immediately.
+    token = response.get("token")
+    if not isinstance(token, str) or not token:
+        raise InventoryProofError("INVENTORY_TOKEN_MISSING")
     inventory_api = api_factory(token, api_url)
     token = ""
 
     primary_error: Exception | None = None
     repository_ids: tuple[int, ...] | None = None
     try:
+        validate_inventory_token_response(response)
         repository_ids = _list_complete_repository_ids(inventory_api)
         if repository_ids != EXPECTED_REPOSITORY_IDS:
             raise InventoryProofError("INVENTORY_EXACT_SET_MISMATCH")
