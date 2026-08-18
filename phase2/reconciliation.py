@@ -217,7 +217,13 @@ class ReconciliationService:
     def _mutate(self, mutation: Callable[[AllocationStore], bool]) -> None:
         stale_retries = 0
         while True:
-            snapshot = self.repository.bootstrap()
+            try:
+                snapshot = self.repository.bootstrap()
+            except StaleCanonicalBase as exc:
+                if stale_retries >= self.max_stale_retries:
+                    raise ReconciliationError("STALE_ALLOCATOR_RETRY_EXHAUSTED") from exc
+                stale_retries += 1
+                continue
             store = self._store(snapshot)
             try:
                 store.begin()
@@ -233,10 +239,10 @@ class ReconciliationService:
                 raise
             try:
                 self.repository.publish(snapshot.identity.git_ref_sha, snapshot)
-            except StaleCanonicalBase:
+            except StaleCanonicalBase as exc:
                 snapshot.close()
                 if stale_retries >= self.max_stale_retries:
-                    raise ReconciliationError("STALE_ALLOCATOR_RETRY_EXHAUSTED")
+                    raise ReconciliationError("STALE_ALLOCATOR_RETRY_EXHAUSTED") from exc
                 stale_retries += 1
                 continue
             except CanonicalPushFailed as exc:
