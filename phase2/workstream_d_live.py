@@ -88,6 +88,7 @@ PROTOCOL_AUTHORITY = "4ad2cebf6c37d21f44e5652a70f5fb4e77da74ae"
 FIXTURE_MODE = "workstream-d-synthetic-fixture-v1"
 INVENTORY_MAX_AGE_SECONDS = 15 * 60
 CLOSE_TIMED_MAX_SECONDS = 30.0
+POST_ALLOCATION_READ_MAX_STALE_RETRIES = 3
 LIVE_EXECUTABLE_PATHS = (
     ".github/workflows/phase2-adversarial.yml",
     "phase2/adversarial.py",
@@ -1136,6 +1137,17 @@ class LiveFixtureBackend:
             "DELETE", f"/repos/{CONTROL_REPOSITORY}/issues/comments/{comment_id}"
         )
 
+    @staticmethod
+    def _post_allocation_read(read: Callable[[], Any]) -> Any:
+        stale_retries = 0
+        while True:
+            try:
+                return read()
+            except StaleCanonicalBase as exc:
+                if stale_retries >= POST_ALLOCATION_READ_MAX_STALE_RETRIES:
+                    raise LiveExecutorError("STALE_ALLOCATOR_RETRY_EXHAUSTED") from exc
+                stale_retries += 1
+
     def _identity(self):
         snapshot = self.repository.bootstrap()
         try:
@@ -1189,12 +1201,20 @@ class LiveFixtureBackend:
             snapshot.close()
 
     def _request_row(self, request_id: str) -> dict[str, Any] | None:
-        snapshot = self.repository.bootstrap()
-        try:
-            row = self.repository.store(snapshot).get_request(request_id)
-            return None if row is None else dict(row)
-        finally:
-            snapshot.close()
+        def read() -> dict[str, Any] | None:
+            snapshot = self.repository.bootstrap()
+            try:
+                row = self.repository.store(snapshot).get_request(request_id)
+                return None if row is None else dict(row)
+            finally:
+                snapshot.close()
+
+        return self._post_allocation_read(read)
+
+    def _canonical_projection(self, request_id: str, **kwargs: Any) -> CanonicalProjection:
+        return self._post_allocation_read(
+            lambda: self.reconciler._canonical_projection(request_id, **kwargs)
+        )
 
     def _request_row_identity(self, request_id: str) -> str:
         row = self._request_row(request_id)
@@ -1345,7 +1365,7 @@ class LiveFixtureBackend:
             payload_hash=payload_hash,
         )
         if project:
-            projection = self.reconciler._canonical_projection(
+            projection = self._canonical_projection(
                 rid, source_comment_id=source_id
             )
             body = render_projection(projection)
