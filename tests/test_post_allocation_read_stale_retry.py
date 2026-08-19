@@ -1,27 +1,32 @@
+import subprocess
+import threading
 import unittest
 from dataclasses import dataclass
+from pathlib import Path
 from unittest.mock import patch
 
 import phase2.workstream_d_live as live
-from phase2.adversarial import CONTROL_REPOSITORY_ID, STATE_REPOSITORY_ID
-from phase2.allocation_types import AllocationResult, Task, stable_ulid
-from phase2.canonical import CanonicalIdentity, StaleCanonicalBase
+from phase2.adversarial import (
+    CONTROL_REPOSITORY_ID,
+    STATE_REPOSITORY_ID,
+    scenario_by_id,
+)
+from phase2.allocation_store import AllocationStore
+from phase2.allocation_types import Task, stable_ulid
+from phase2.canonical import (
+    CanonicalIdentity,
+    LocalCanonicalRepository,
+    StaleCanonicalBase,
+)
 from phase2.credentials import control_profile, state_profile
 from phase2.inventory import InventoryAttestation
 from phase2.projection import parse_projection
-from phase2.reconciliation import PostedComment, ReconciliationService
+from phase2.reconciliation import PostedComment
 
 
 TRUSTED_SHA = "a" * 40
 PROTOCOL_SHA = live.PROTOCOL_AUTHORITY
 RUN_ID = 32204037283
-
-
-class _History:
-    complete = True
-
-    def accepted_revisions(self):
-        return ()
 
 
 @dataclass
@@ -162,6 +167,132 @@ class _UnusedControlAPI:
     pass
 
 
+class _InMemoryControlAPI:
+    """Credential-free durable issue-comment fixture used by full scenario 1."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._next_comment_id = 1000
+        self.comments = []
+
+    def post(self, path, body):
+        if not path.endswith("/comments") or not isinstance(body, dict):
+            raise AssertionError(f"unexpected control API post: {path}")
+        comment_body = body.get("body")
+        if not isinstance(comment_body, str):
+            raise AssertionError("comment body must be text")
+        with self._lock:
+            self._next_comment_id += 1
+            comment_id = self._next_comment_id
+            item = {
+                "id": comment_id,
+                "body": comment_body,
+                "html_url": f"https://example.invalid/comments/{comment_id}",
+            }
+            self.comments.append(item)
+            return dict(item)
+
+    def get(self, path):
+        if "/comments?" not in path:
+            raise AssertionError(f"unexpected control API get: {path}")
+        page = 1
+        for field in path.split("?", 1)[1].split("&"):
+            if field.startswith("page="):
+                page = int(field.split("=", 1)[1])
+        with self._lock:
+            if page != 1:
+                return []
+            return [dict(item) for item in self.comments]
+
+    def request(self, method, path, body=None):
+        raise AssertionError(f"unexpected control API request: {method} {path}")
+
+    def by_url(self):
+        with self._lock:
+            return {str(item["html_url"]): dict(item) for item in self.comments}
+
+
+class _PostAllocationStaleRepository:
+    """Real local canonical state plus deterministic post-anchor read stales.
+
+    Allocation, anchor and projection-metadata publications all execute through
+    the real LocalCanonicalRepository. Each close-timed worker receives one
+    post-anchor read plan only after its allocation and anchor have both
+    published successfully:
+
+    * one worker fails the immediate request-row evidence bootstrap once;
+    * the other reads the request row successfully, then fails the canonical
+      projection bootstrap once.
+
+    No mutation call is replayed by this wrapper.
+    """
+
+    def __init__(self, inner):
+        self.inner = inner
+        self._thread_state = threading.local()
+        self._plan_lock = threading.Lock()
+        self._publish_lock = threading.Lock()
+        self._plans = [
+            ("request_row", ["stale"]),
+            ("canonical_projection", ["ok", "stale"]),
+        ]
+        self.stale_surfaces = []
+        self.allocation_creation_refs = []
+
+    @property
+    def identity(self):
+        return self.inner.identity
+
+    @staticmethod
+    def store(snapshot):
+        return AllocationStore(snapshot.connection)
+
+    def _state(self):
+        if not threading.current_thread().name.startswith("wd-close"):
+            return None
+        state = getattr(self._thread_state, "value", None)
+        if state is not None:
+            return state
+        with self._plan_lock:
+            if not self._plans:
+                raise AssertionError("unexpected additional close-timed worker")
+            label, steps = self._plans.pop(0)
+        state = {
+            "label": label,
+            "steps": list(steps),
+            "successful_mutation_publishes": 0,
+            "post_anchor_reads_armed": False,
+        }
+        self._thread_state.value = state
+        return state
+
+    def bootstrap(self):
+        state = self._state()
+        if state is not None and state["post_anchor_reads_armed"] and state["steps"]:
+            step = state["steps"].pop(0)
+            if step == "stale":
+                with self._plan_lock:
+                    self.stale_surfaces.append(str(state["label"]))
+                raise StaleCanonicalBase("STALE_EXPECTED_OLD_SHA")
+            if step != "ok":
+                raise AssertionError(f"unknown read plan step: {step}")
+        return self.inner.bootstrap()
+
+    def publish(self, expected_old_sha, snapshot):
+        # Keep the successful-publication witness ordered at the same boundary
+        # as the canonical CAS. Failed stale publications are not counted.
+        with self._publish_lock:
+            accepted = self.inner.publish(expected_old_sha, snapshot)
+            state = self._state()
+            if state is not None:
+                state["successful_mutation_publishes"] += 1
+                if state["successful_mutation_publishes"] == 1:
+                    self.allocation_creation_refs.append(accepted.git_ref_sha)
+                if state["successful_mutation_publishes"] == 2:
+                    state["post_anchor_reads_armed"] = True
+            return accepted
+
+
 def _inventory():
     attestation = InventoryAttestation(
         123,
@@ -198,32 +329,6 @@ def _backend(repository):
     backend.gateway = gateway
     backend.reconciler.gateway = gateway
     return backend, gateway
-
-
-class _AcceptedAllocationService:
-    identities = {}
-
-    def __init__(self, repository, *, clock=None, max_stale_retries=3, **kwargs):
-        self.repository = repository
-
-    def process(self, command, context):
-        git_sha, dolt_commit, _ = self.identities[command.request_id]
-        return AllocationResult(
-            command.request_id,
-            "ALLOCATED",
-            "ALLOCATED",
-            allocation_id=f"allocation-{command.request_id}",
-            task_id=f"task-{command.request_id}",
-            canonical_git_ref_sha=git_sha,
-            canonical_dolt_commit=dolt_commit,
-            ref_advanced=True,
-        )
-
-    def record_anchor(self, request_id, git_sha, dolt_commit):
-        expected_git, expected_dolt, _ = self.identities[request_id]
-        if (git_sha, dolt_commit) != (expected_git, expected_dolt):
-            raise AssertionError("creation identity changed before anchor recording")
-        return AllocationResult(request_id, "ALLOCATED", "ALLOCATED")
 
 
 class PostAllocationReadStaleRetryTests(unittest.TestCase):
@@ -288,82 +393,157 @@ class PostAllocationReadStaleRetryTests(unittest.TestCase):
             live.POST_ALLOCATION_READ_MAX_STALE_RETRIES + 1,
         )
 
-    def test_close_timed_scenario1_post_allocation_reads_absorb_each_proven_stale_surface(self):
-        first_id = stable_ulid("issue-32-close-first")
-        second_id = stable_ulid("issue-32-close-second")
-        identities = {
-            first_id: ("3" * 40, "dolt-first", 201),
-            second_id: ("4" * 40, "dolt-second", 202),
-        }
-        _AcceptedAllocationService.identities = identities
-
-        first_store = _ReadStore(identities, "agent://operator/test")
-        second_store = _ReadStore(identities, "agent://operator/test")
-        # Worker one races while hashing its accepted request row. Worker two
-        # races one step later while reading the canonical projection. Both
-        # successful retries observe a newer snapshot identity, while the
-        # accepted creation identities remain those stored on the request rows.
-        first_repository = _ScheduledReadRepository(
-            first_store, ("stale", "ok", "ok")
+    def test_close_timed_scenario1_reaches_complete_evidence_with_real_mutations(self):
+        inner = LocalCanonicalRepository()
+        repository = _PostAllocationStaleRepository(inner)
+        control_api = _InMemoryControlAPI()
+        namespace = live.AttemptNamespace.parse(
+            f"wd-{RUN_ID}-1-0123456789abcdef", run_id=RUN_ID, run_attempt=1
         )
-        second_repository = _ScheduledReadRepository(
-            second_store, ("ok", "stale", "ok")
+        trusted_sha = subprocess.check_output(
+            ("git", "rev-parse", "HEAD"), text=True
+        ).strip()
+
+        def read_only_remote(root: Path):
+            # LocalCanonicalRepository identities are canonical-state digests,
+            # not Git commit objects. Scenario 1's real Git ancestry helper has
+            # separate functional coverage; this regression isolates only that
+            # unrelated transport adapter while retaining the actual creation
+            # publication order recorded at the canonical CAS boundary.
+            mirror = root / "state-read-only.git"
+            mirror.mkdir()
+            return mirror, repository.identity.git_ref_sha
+
+        backend = live.LiveFixtureBackend(
+            repository,
+            control_api,
+            1,
+            trusted_sha,
+            PROTOCOL_SHA,
+            _token_scopes(),
+            _inventory(),
+            namespace,
+            read_only_remote,
         )
-        first_backend, first_gateway = _backend(first_repository)
-        second_backend, second_gateway = _backend(second_repository)
 
-        with patch.object(live, "AllocationService", _AcceptedAllocationService), patch.object(
-            ReconciliationService, "_record_projection_posted", return_value=False
-        ) as metadata_record:
-            records, spread = live._run_close_timed_calls(
-                (
-                    lambda: first_backend._process(
-                        1,
-                        1,
-                        request_type="ALLOCATE_NEXT",
-                        request_id=first_id,
-                        source_override=(201, "https://example.invalid/source/201"),
-                    ),
-                    lambda: second_backend._process(
-                        1,
-                        2,
-                        request_type="ALLOCATE_NEXT",
-                        request_id=second_id,
-                        source_override=(202, "https://example.invalid/source/202"),
-                    ),
-                )
-            )
+        def creation_order(_mirror, _current_sha, refs):
+            self.assertEqual(set(refs), set(repository.allocation_creation_refs))
+            self.assertEqual(len(repository.allocation_creation_refs), 2)
+            return tuple(repository.allocation_creation_refs)
 
-        by_request = {record.request_id: record for record in records}
-        self.assertEqual(set(by_request), {first_id, second_id})
-        for request_id, (git_sha, dolt_commit, _) in identities.items():
-            record = by_request[request_id]
-            self.assertEqual(record.accepted_ref, git_sha)
-            self.assertEqual(record.dolt_commit, dolt_commit)
-            self.assertTrue(record.canonical_row)
-            self.assertTrue(record.projection_url)
+        with patch.object(
+            live, "_canonical_creation_ref_order", side_effect=creation_order
+        ):
+            evidence = backend.execute(scenario_by_id(1), namespace)
 
-        projected = []
-        for gateway in (first_gateway, second_gateway):
-            self.assertEqual(len(gateway.posts), 1)
-            payload = parse_projection(gateway.posts[0][1])
-            self.assertIsNotNone(payload)
-            projected.append(payload)
-        projected_by_request = {str(item["request_id"]): item for item in projected}
-        for request_id, (git_sha, dolt_commit, _) in identities.items():
+        # The complete scenario contract, not only two helper calls, must pass.
+        evidence.validate()
+        self.assertIs(backend.executed_records[1], evidence)
+        self.assertEqual(
+            sorted(repository.stale_surfaces),
+            ["canonical_projection", "request_row"],
+        )
+
+        connection = inner.inspect()
+        try:
+            requests = [
+                dict(row)
+                for row in connection.execute(
+                    "SELECT * FROM allocation_requests ORDER BY request_id"
+                ).fetchall()
+            ]
+            allocations = [
+                dict(row)
+                for row in connection.execute(
+                    "SELECT * FROM allocations ORDER BY allocation_id"
+                ).fetchall()
+            ]
+            ownership = [
+                dict(row)
+                for row in connection.execute(
+                    "SELECT * FROM active_task_allocations ORDER BY task_id"
+                ).fetchall()
+            ]
+            events = [
+                dict(row)
+                for row in connection.execute(
+                    "SELECT * FROM allocation_events ORDER BY event_id"
+                ).fetchall()
+            ]
+        finally:
+            connection.close()
+
+        self.assertEqual(len(requests), 2)
+        self.assertEqual({row["request_id"] for row in requests}, set(evidence.request_ids))
+        self.assertEqual({row["status"] for row in requests}, {"ALLOCATED"})
+        self.assertEqual({row["anchor_status"] for row in requests}, {"RECORDED"})
+        self.assertEqual({row["projection_status"] for row in requests}, {"POSTED"})
+
+        self.assertEqual(len(allocations), 2)
+        self.assertEqual({row["state"] for row in allocations}, {"ACTIVE"})
+        self.assertEqual(len({row["allocation_id"] for row in allocations}), 2)
+        self.assertEqual(len({row["task_id"] for row in allocations}), 2)
+        self.assertEqual(len(ownership), 2)
+        self.assertEqual(
+            {row["allocation_id"] for row in ownership},
+            {row["allocation_id"] for row in allocations},
+        )
+
+        requests_by_id = {row["request_id"]: row for row in requests}
+        projections_by_url = control_api.by_url()
+        for terminal in evidence.terminal_requests:
+            row = requests_by_id[terminal.request_id]
+            self.assertEqual(row["canonical_git_ref_sha"], terminal.accepted_ref_sha)
+            self.assertEqual(row["canonical_dolt_commit"], terminal.dolt_commit)
+
+            request_events = [
+                event for event in events if event["request_id"] == terminal.request_id
+            ]
             self.assertEqual(
-                projected_by_request[request_id]["canonical_git_ref_sha"], git_sha
+                sum(event["event_type"] == "ALLOCATED" for event in request_events), 1
             )
             self.assertEqual(
-                projected_by_request[request_id]["canonical_dolt_commit"], dolt_commit
+                sum(event["event_type"] == "REQUEST_TERMINAL" for event in request_events),
+                1,
+            )
+            self.assertEqual(
+                sum(event["event_type"] == "ANCHOR_RECORDED" for event in request_events),
+                1,
+            )
+            projection_events = [
+                event
+                for event in request_events
+                if event["event_type"] in {"PROJECTION_POSTED", "PROJECTION_REPAIRED"}
+            ]
+            self.assertEqual(len(projection_events), 1)
+            self.assertEqual(projection_events[0]["event_type"], "PROJECTION_POSTED")
+            self.assertEqual(
+                projection_events[0]["canonical_git_ref_sha"],
+                terminal.accepted_ref_sha,
+            )
+            self.assertEqual(
+                projection_events[0]["canonical_dolt_commit"],
+                terminal.dolt_commit,
             )
 
-        self.assertEqual(first_repository.bootstrap_calls, 3)
-        self.assertEqual(second_repository.bootstrap_calls, 3)
-        self.assertEqual(metadata_record.call_count, 2)
-        self.assertEqual(first_store.mutation_calls, 0)
-        self.assertEqual(second_store.mutation_calls, 0)
-        self.assertLessEqual(spread, live.CLOSE_TIMED_MAX_SECONDS)
+            projected = parse_projection(
+                str(projections_by_url[terminal.projection_url]["body"])
+            )
+            self.assertIsNotNone(projected)
+            self.assertEqual(
+                projected["canonical_git_ref_sha"], terminal.accepted_ref_sha
+            )
+            self.assertEqual(
+                projected["canonical_dolt_commit"], terminal.dolt_commit
+            )
+
+        # One seed publication + two allocation creations + two anchor records
+        # + two real projection-metadata publications. Read retry adds none.
+        self.assertEqual(inner.publish_count, 7)
+        self.assertEqual(
+            set(repository.allocation_creation_refs),
+            set(evidence.accepted_ref_shas),
+        )
 
 
 if __name__ == "__main__":
