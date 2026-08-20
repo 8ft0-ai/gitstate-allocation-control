@@ -1,14 +1,16 @@
-"""Bounded Workstream D installation-token cleanup remediation.
+"""Bounded Workstream D live credential safeguards.
 
-This module is the trusted-main live-suite entry point for the cleanup portion
-of gitstate-lab#15 comment 5310070151.  The independently reviewed scenario
-executor in ``phase2.workstream_d_live`` remains authoritative for scenario
-semantics and for the SQL-server Git-auth remediation merged in PR #9.
+This module is the trusted-main live-suite entry point for installation-token
+cleanup and for the bounded state-authentication controls reviewed under
+gitstate-lab#34.  The independently reviewed scenario executor in
+``phase2.workstream_d_live`` remains authoritative for scenario semantics and
+for the SQL-server Git-auth remediation merged in PR #9.
 
-Only installation-token cleanup truthfulness, cleanup-failure precedence and a
-non-secret positive revocation record are added here.  Nothing in this module
-resets canonical state, authorises another live attempt, or widens Workstream D
-into Workstream E.
+The wrapper preserves truthful token cleanup, proves the exact state token can
+read the intended repository before fixture access, and prevents unrelated Git
+credential helpers from bypassing the bounded askpass path.  Nothing here
+resets canonical state, widens token permissions, authorises another live
+attempt, or widens Workstream D into Workstream E.
 """
 
 from __future__ import annotations
@@ -156,7 +158,7 @@ def _cleanup_record(
 def execute_live_suite(
     values: Mapping[str, str] | None = None,
 ) -> live.LiveSuiteResult:
-    """Delegate the suite while making token cleanup fail closed and observable."""
+    """Delegate with bounded state-access, Git-auth and cleanup safeguards."""
     env = os.environ if values is None else values
     context = live.context_from_environment(env)
     context.validate()
