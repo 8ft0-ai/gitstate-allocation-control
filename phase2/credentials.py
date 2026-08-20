@@ -7,7 +7,7 @@ import subprocess
 import tempfile
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 from .github_api import GitHubAPI, GitHubAPIError
 
@@ -109,6 +109,31 @@ def verify_live_installation(api: GitHubAPI, owner: str, repository: str, expect
 def mint_token(api: GitHubAPI, installation_id: int, profile: TokenProfile) -> str:
     response = api.post(f"/app/installations/{installation_id}/access_tokens", token_request(profile))
     return validate_token_response(response, profile)
+
+
+def require_state_repository_access(
+    token: str,
+    owner: str,
+    repository: str,
+    expected_repository_id: int,
+    api_url: str,
+    *,
+    api_factory: Callable[[str, str], GitHubAPI] = GitHubAPI,
+) -> None:
+    """Prove that the exact state installation token can read its repository."""
+    if not isinstance(expected_repository_id, int) or expected_repository_id <= 0:
+        raise CredentialPolicyError("INVALID_REPOSITORY_SCOPE")
+    expected_name = f"{owner}/{repository}"
+    try:
+        observed = api_factory(token, api_url).get(f"/repos/{owner}/{repository}")
+    except GitHubAPIError as exc:
+        if exc.status in {403, 404}:
+            raise CredentialPolicyError("REST_STATE_REPOSITORY_ACCESS_DENIED") from None
+        raise CredentialPolicyError("REST_STATE_REPOSITORY_ACCESS_UNEXPECTED") from None
+    if not isinstance(observed, dict):
+        raise CredentialPolicyError("REST_STATE_REPOSITORY_IDENTITY_MISMATCH")
+    if observed.get("id") != expected_repository_id or observed.get("full_name") != expected_name:
+        raise CredentialPolicyError("REST_STATE_REPOSITORY_IDENTITY_MISMATCH")
 
 
 def require_cross_repository_denial(token: str, forbidden_repository_id: int, api_url: str) -> None:
