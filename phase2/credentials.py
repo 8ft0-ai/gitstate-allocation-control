@@ -124,12 +124,20 @@ def require_state_repository_access(
     if not isinstance(expected_repository_id, int) or expected_repository_id <= 0:
         raise CredentialPolicyError("INVALID_REPOSITORY_SCOPE")
     expected_name = f"{owner}/{repository}"
+    failure_reason = ""
     try:
         observed = api_factory(token, api_url).get(f"/repos/{owner}/{repository}")
     except GitHubAPIError as exc:
-        if exc.status in {403, 404}:
-            raise CredentialPolicyError("REST_STATE_REPOSITORY_ACCESS_DENIED") from None
-        raise CredentialPolicyError("REST_STATE_REPOSITORY_ACCESS_UNEXPECTED") from None
+        failure_reason = (
+            "REST_STATE_REPOSITORY_ACCESS_DENIED"
+            if exc.status in {403, 404}
+            else "REST_STATE_REPOSITORY_ACCESS_UNEXPECTED"
+        )
+        observed = None
+    if failure_reason:
+        # Raise outside the REST exception scope so its response body is not
+        # retained as this safe policy exception's implicit __context__.
+        raise CredentialPolicyError(failure_reason)
     if not isinstance(observed, dict):
         raise CredentialPolicyError("REST_STATE_REPOSITORY_IDENTITY_MISMATCH")
     if observed.get("id") != expected_repository_id or observed.get("full_name") != expected_name:
