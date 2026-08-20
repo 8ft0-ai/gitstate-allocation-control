@@ -78,3 +78,11 @@ jobs:
           set -euo pipefail
           PYTHONPATH=. "$RUNTIME_PYTHON" tests/integration_workstream_b_runtime.py
           PYTHONPATH=. "$RUNTIME_PYTHON" tests/integration_workstream_b_readiness.py
+
+      - name: Run credential-free Workstream D fixture bootstrap reproduction
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONPATH=. "$RUNTIME_PYTHON" tests/test_workstream_d_live.py \
+            WorkstreamDLiveBoundaryTests.test_credential_free_real_runtime_fixture_bootstrap_against_local_bare_remote \
+            -v

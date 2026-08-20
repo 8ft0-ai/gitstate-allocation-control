@@ -352,6 +352,23 @@ def validate_only(values: Mapping[str, str] | None = None) -> OperatorRunContext
     return context
 
 
+def _blocked_payload(exc: Exception) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "status": "BLOCKED",
+        "credential_material_emitted": False,
+        "workstream_e_authorised": False,
+    }
+    if isinstance(exc, live.CommandFailure):
+        payload["reason_code"] = exc.reason_code
+        payload.update(exc.safe_diagnostic())
+    elif isinstance(exc, live.FixtureBootstrapFailure):
+        payload["reason_code"] = exc.reason_code
+        payload.update(exc.safe_diagnostic())
+    else:
+        payload["reason_code"] = str(exc).split(":", 1)[0] or type(exc).__name__
+    return payload
+
+
 def main() -> int:
     try:
         if len(sys.argv) != 2:
@@ -381,12 +398,7 @@ def main() -> int:
     except Exception as exc:
         print(
             json.dumps(
-                {
-                    "status": "BLOCKED",
-                    "reason_code": str(exc).split(":", 1)[0] or type(exc).__name__,
-                    "credential_material_emitted": False,
-                    "workstream_e_authorised": False,
-                },
+                _blocked_payload(exc),
                 sort_keys=True,
                 separators=(",", ":"),
             )
