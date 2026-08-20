@@ -104,9 +104,79 @@ NETWORK_DESTINATIONS = (
 DURABILITY = ("github_issue", "github_repository", "github_ref", "github_actions")
 NOW = "2026-08-16T00:00:00Z"
 
+_COMMAND_FAILURE_PHASES = frozenset(
+    {
+        "state-baseline-probe",
+        "fixture-git-init",
+        "fixture-git-config-name",
+        "fixture-git-config-email",
+        "fixture-git-add",
+        "fixture-git-commit",
+        "fixture-beads-init",
+        "fixture-dolt-remote-add",
+        "fixture-dolt-commit",
+        "fixture-dolt-push",
+    }
+)
+_FIXTURE_BOOTSTRAP_FAILURE_PHASES = frozenset(
+    {
+        "fixture-canonical-bootstrap",
+        "fixture-canonical-schema",
+        "fixture-canonical-publish",
+    }
+)
+
 
 class LiveExecutorError(RuntimeError):
     pass
+
+
+class CommandFailure(LiveExecutorError):
+    reason_code = "COMMAND_FAILED"
+
+    def __init__(
+        self,
+        failure_phase: str,
+        executable: str,
+        return_code: int,
+        stderr_sha256: str,
+    ) -> None:
+        if failure_phase not in _COMMAND_FAILURE_PHASES:
+            raise ValueError("invalid command failure phase")
+        if executable not in {"git", "bd"}:
+            raise ValueError("invalid command executable")
+        if not isinstance(return_code, int):
+            raise ValueError("invalid command return code")
+        if len(stderr_sha256) != 64 or any(
+            character not in "0123456789abcdef" for character in stderr_sha256
+        ):
+            raise ValueError("invalid stderr digest")
+        super().__init__(self.reason_code)
+        self.failure_phase = failure_phase
+        self.executable = executable
+        self.return_code = return_code
+        self.stderr_sha256 = stderr_sha256
+
+    def safe_diagnostic(self) -> dict[str, object]:
+        return {
+            "failure_phase": self.failure_phase,
+            "executable": self.executable,
+            "return_code": self.return_code,
+            "stderr_sha256": self.stderr_sha256,
+        }
+
+
+class FixtureBootstrapFailure(LiveExecutorError):
+    reason_code = "FIXTURE_BOOTSTRAP_FAILED"
+
+    def __init__(self, failure_phase: str) -> None:
+        if failure_phase not in _FIXTURE_BOOTSTRAP_FAILURE_PHASES:
+            raise ValueError("invalid fixture bootstrap failure phase")
+        super().__init__(self.reason_code)
+        self.failure_phase = failure_phase
+
+    def safe_diagnostic(self) -> dict[str, object]:
+        return {"failure_phase": self.failure_phase}
 
 
 @dataclass(frozen=True)
@@ -322,7 +392,11 @@ def acquire_credentials(
 
 
 def _run(
-    command: Sequence[str], *, cwd: Path, env: Mapping[str, str] | None = None
+    command: Sequence[str],
+    *,
+    cwd: Path,
+    env: Mapping[str, str] | None = None,
+    phase: str | None = None,
 ) -> str:
     completed = subprocess.run(
         list(command),
@@ -334,7 +408,22 @@ def _run(
         stderr=subprocess.PIPE,
     )
     if completed.returncode != 0:
-        raise LiveExecutorError(f"COMMAND_FAILED:{command[0]}:{completed.returncode}")
+        if phase is None:
+            raise LiveExecutorError(f"COMMAND_FAILED:{command[0]}:{completed.returncode}")
+        executable = Path(str(command[0])).name
+        stderr_text = completed.stderr or ""
+        failure = CommandFailure(
+            phase,
+            executable,
+            int(completed.returncode),
+            hashlib.sha256(stderr_text.encode("utf-8", errors="replace")).hexdigest(),
+        )
+        stderr_text = ""
+        completed = None  # type: ignore[assignment]
+        command = ()
+        env = None
+        cwd = Path(".")
+        raise failure
     return completed.stdout.strip()
 
 
@@ -433,6 +522,7 @@ def assert_uninitialised_state(token: str, *, root: Path) -> None:
         ["git", "ls-remote", "--refs", _remote_url()],
         cwd=root,
         env=_state_git_env(root, token),
+        phase="state-baseline-probe",
     )
     expected = (
         f"{STATE_REPOSITORY_BASELINE_SHA}\t{STATE_REPOSITORY_BASELINE_REF}"
@@ -627,24 +717,56 @@ def bootstrap_fixture_repository(
     env = _state_git_env(root, state_token)
     env.update({"BD_NON_INTERACTIVE": "1", "CI": "true", "HOME": str(root / "home")})
     Path(env["HOME"]).mkdir()
-    _run(["git", "init", "--initial-branch=main"], cwd=source)
-    _run(["git", "config", "user.name", "Workstream D Fixture"], cwd=source)
-    _run(["git", "config", "user.email", "workstream-d@example.invalid"], cwd=source)
+    _run(
+        ["git", "init", "--initial-branch=main"],
+        cwd=source,
+        phase="fixture-git-init",
+    )
+    _run(
+        ["git", "config", "user.name", "Workstream D Fixture"],
+        cwd=source,
+        phase="fixture-git-config-name",
+    )
+    _run(
+        ["git", "config", "user.email", "workstream-d@example.invalid"],
+        cwd=source,
+        phase="fixture-git-config-email",
+    )
     (source / "README.md").write_text("Workstream D synthetic fixture state\n")
-    _run(["git", "add", "README.md"], cwd=source)
-    _run(["git", "commit", "-m", "Initial Workstream D fixture state"], cwd=source)
+    _run(["git", "add", "README.md"], cwd=source, phase="fixture-git-add")
+    _run(
+        ["git", "commit", "-m", "Initial Workstream D fixture state"],
+        cwd=source,
+        phase="fixture-git-commit",
+    )
     _run(
         [bd_bin, "init", "--prefix", "wd", "--quiet", "--skip-hooks", "--skip-agents", "--non-interactive"],
         cwd=source,
         env=env,
+        phase="fixture-beads-init",
     )
     remote = _remote_url()
     # GitHub requires a default branch.  The exact remote main ref is a pinned
     # synthetic transport sentinel, not canonical allocator state, and must
     # never be advanced or replaced by the fixture executor.
-    _run([bd_bin, "dolt", "remote", "add", "origin", "git+" + remote], cwd=source, env=env)
-    _run([bd_bin, "dolt", "commit", "-m", "Workstream D pinned Beads baseline"], cwd=source, env=env)
-    _run([bd_bin, "dolt", "push"], cwd=source, env=env)
+    _run(
+        [bd_bin, "dolt", "remote", "add", "origin", "git+" + remote],
+        cwd=source,
+        env=env,
+        phase="fixture-dolt-remote-add",
+    )
+    _run(
+        [bd_bin, "dolt", "commit", "-m", "Workstream D pinned Beads baseline"],
+        cwd=source,
+        env=env,
+        phase="fixture-dolt-commit",
+    )
+    _run(
+        [bd_bin, "dolt", "push"],
+        cwd=source,
+        env=env,
+        phase="fixture-dolt-push",
+    )
 
     def credentialled_run(
         command: Sequence[str], cwd: Path
@@ -666,10 +788,32 @@ def bootstrap_fixture_repository(
         run_command=credentialled_run,
         workspace_root=root,
     )
-    snapshot = repository.bootstrap()
+    snapshot: Any | None = None
+    bootstrap_failed = False
     try:
-        _execute_ddl(snapshot.connection, dolt_schema())
-        repository.publish(snapshot.identity.git_ref_sha, snapshot)
+        snapshot = repository.bootstrap()
+    except Exception:
+        bootstrap_failed = True
+    if bootstrap_failed:
+        raise FixtureBootstrapFailure("fixture-canonical-bootstrap")
+    if snapshot is None:
+        raise FixtureBootstrapFailure("fixture-canonical-bootstrap")
+    try:
+        schema_failed = False
+        try:
+            _execute_ddl(snapshot.connection, dolt_schema())
+        except Exception:
+            schema_failed = True
+        if schema_failed:
+            raise FixtureBootstrapFailure("fixture-canonical-schema")
+
+        publish_failed = False
+        try:
+            repository.publish(snapshot.identity.git_ref_sha, snapshot)
+        except Exception:
+            publish_failed = True
+        if publish_failed:
+            raise FixtureBootstrapFailure("fixture-canonical-publish")
     finally:
         snapshot.close()
     return FixtureRepositoryLease(repository, env, root / "state-askpass.sh")
