@@ -1,5 +1,8 @@
 import hashlib
+import io
+import json
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -189,6 +192,63 @@ class OperatorRuntimeTests(unittest.TestCase):
         self.assertIs(live.acquire_credentials, original_acquire)
         self.assertEqual(live.PROTOCOL_AUTHORITY, original_protocol)
         self.assertIn(runtime.OPERATOR_EXECUTABLE_PATH, live.LIVE_EXECUTABLE_PATHS)
+
+    def _run_main_with_live_error(self, exc):
+        output = io.StringIO()
+        with patch.object(runtime.sys, "argv", ["operator_runtime", "live"]), patch.object(
+            runtime, "execute_live", side_effect=exc
+        ), redirect_stdout(output):
+            self.assertEqual(runtime.main(), 1)
+        text = output.getvalue().strip()
+        return text, json.loads(text)
+
+    def test_structured_command_failure_output_is_whitelisted_and_non_secret(self):
+        digest = hashlib.sha256(b"SECRET_STDERR_VALUE").hexdigest()
+        exc = live.CommandFailure(
+            "fixture-beads-init",
+            "bd",
+            17,
+            digest,
+        )
+        text, payload = self._run_main_with_live_error(exc)
+        self.assertEqual(
+            payload,
+            {
+                "credential_material_emitted": False,
+                "executable": "bd",
+                "failure_phase": "fixture-beads-init",
+                "reason_code": "COMMAND_FAILED",
+                "return_code": 17,
+                "status": "BLOCKED",
+                "stderr_sha256": digest,
+                "workstream_e_authorised": False,
+            },
+        )
+        self.assertNotIn("SECRET_STDERR_VALUE", text)
+        self.assertNotIn("token", text.lower())
+        self.assertNotIn("private-key", text.lower())
+
+    def test_structured_canonical_failure_output_is_phase_only(self):
+        exc = live.FixtureBootstrapFailure("fixture-canonical-schema")
+        text, payload = self._run_main_with_live_error(exc)
+        self.assertEqual(
+            payload,
+            {
+                "credential_material_emitted": False,
+                "failure_phase": "fixture-canonical-schema",
+                "reason_code": "FIXTURE_BOOTSTRAP_FAILED",
+                "status": "BLOCKED",
+                "workstream_e_authorised": False,
+            },
+        )
+        self.assertNotIn("raw-cause", text)
+
+    def test_unrelated_operator_error_retains_existing_reason_code_contract(self):
+        _, payload = self._run_main_with_live_error(
+            runtime.OperatorRuntimeError("OPERATOR_TEST_FAILURE:detail-not-retained")
+        )
+        self.assertEqual(payload["reason_code"], "OPERATOR_TEST_FAILURE")
+        self.assertNotIn("failure_phase", payload)
 
     def test_workflow_has_one_operator_entry_and_no_manual_identity_or_inventory_inputs(self):
         workflow = Path(".github/workflows/phase2-adversarial.yml").read_text(encoding="utf-8")
