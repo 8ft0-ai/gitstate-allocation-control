@@ -1,14 +1,16 @@
-"""Bounded Workstream D installation-token cleanup remediation.
+"""Bounded Workstream D live credential safeguards.
 
-This module is the trusted-main live-suite entry point for the cleanup portion
-of gitstate-lab#15 comment 5310070151.  The independently reviewed scenario
-executor in ``phase2.workstream_d_live`` remains authoritative for scenario
-semantics and for the SQL-server Git-auth remediation merged in PR #9.
+This module is the trusted-main live-suite entry point for installation-token
+cleanup and for the bounded state-authentication controls reviewed under
+gitstate-lab#34.  The independently reviewed scenario executor in
+``phase2.workstream_d_live`` remains authoritative for scenario semantics and
+for the SQL-server Git-auth remediation merged in PR #9.
 
-Only installation-token cleanup truthfulness, cleanup-failure precedence and a
-non-secret positive revocation record are added here.  Nothing in this module
-resets canonical state, authorises another live attempt, or widens Workstream D
-into Workstream E.
+The wrapper preserves truthful token cleanup, proves the exact state token can
+read the intended repository before fixture access, and prevents unrelated Git
+credential helpers from bypassing the bounded askpass path.  Nothing here
+resets canonical state, widens token permissions, authorises another live
+attempt, or widens Workstream D into Workstream E.
 """
 
 from __future__ import annotations
@@ -16,10 +18,12 @@ from __future__ import annotations
 import json
 import os
 import sys
-from typing import Any, ClassVar, Mapping
+from contextlib import contextmanager
+from typing import Any, ClassVar, Iterator, Mapping
 
 from . import workstream_d_anchor_repair as anchor_repair
 from . import workstream_d_live as live
+from .credentials import require_state_repository_access
 
 REMEDIATION_EXECUTABLE_PATH = "phase2/workstream_d_revocation.py"
 REVOCATION_STATUS = "WORKSTREAM_D_INSTALLATION_TOKEN_CLEANUP_SUCCEEDED"
@@ -78,6 +82,63 @@ def _bind_executable_identity() -> None:
         live.LIVE_EXECUTABLE_PATHS = (*paths, REMEDIATION_EXECUTABLE_PATH)
 
 
+@contextmanager
+def _isolated_git_credentials() -> Iterator[None]:
+    """Append an empty credential helper so Git can use only the bounded askpass."""
+    raw_count = os.environ.get("GIT_CONFIG_COUNT", "0")
+    try:
+        count = int(raw_count)
+    except ValueError as exc:
+        raise live.LiveExecutorError("GIT_CREDENTIAL_CONFIG_INVALID") from exc
+    if count < 0:
+        raise live.LiveExecutorError("GIT_CREDENTIAL_CONFIG_INVALID")
+
+    names = (
+        "GIT_CONFIG_COUNT",
+        f"GIT_CONFIG_KEY_{count}",
+        f"GIT_CONFIG_VALUE_{count}",
+    )
+    missing = object()
+    previous: dict[str, object] = {
+        name: os.environ.get(name, missing) for name in names
+    }
+    os.environ["GIT_CONFIG_COUNT"] = str(count + 1)
+    os.environ[f"GIT_CONFIG_KEY_{count}"] = "credential.helper"
+    os.environ[f"GIT_CONFIG_VALUE_{count}"] = ""
+    try:
+        yield
+    finally:
+        for name, value in previous.items():
+            if value is missing:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = str(value)
+
+
+def _state_access_acquire(acquire):
+    def checked(*args: Any, **kwargs: Any):
+        lease, inventory = acquire(*args, **kwargs)
+        owner, repository = live.STATE_REPOSITORY.split("/", 1)
+        try:
+            require_state_repository_access(
+                lease.state_token,
+                owner,
+                repository,
+                live.STATE_REPOSITORY_ID,
+                lease.api_url,
+                api_factory=lease.api_factory,
+            )
+        except Exception as primary_error:
+            try:
+                lease.close()
+            except Exception as cleanup_error:
+                raise cleanup_error from primary_error
+            raise
+        return lease, inventory
+
+    return checked
+
+
 def _cleanup_record(
     context: live.LiveRunContext,
     lease: TruthfulCredentialLease,
@@ -97,23 +158,27 @@ def _cleanup_record(
 def execute_live_suite(
     values: Mapping[str, str] | None = None,
 ) -> live.LiveSuiteResult:
-    """Delegate the suite while making token cleanup fail closed and observable."""
+    """Delegate with bounded state-access, Git-auth and cleanup safeguards."""
     env = os.environ if values is None else values
     context = live.context_from_environment(env)
     context.validate()
     _bind_executable_identity()
 
     previous_lease_class = live.CredentialLease
+    previous_acquire = live.acquire_credentials
     TruthfulCredentialLease.last_instance = None
     live.CredentialLease = TruthfulCredentialLease
+    live.acquire_credentials = _state_access_acquire(previous_acquire)
     primary_error: Exception | None = None
     result: live.LiveSuiteResult | None = None
     try:
         try:
-            result = anchor_repair.execute_live_suite(env)
+            with _isolated_git_credentials():
+                result = anchor_repair.execute_live_suite(env)
         except Exception as exc:
             primary_error = exc
     finally:
+        live.acquire_credentials = previous_acquire
         live.CredentialLease = previous_lease_class
 
     lease = TruthfulCredentialLease.last_instance
