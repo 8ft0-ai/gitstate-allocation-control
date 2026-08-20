@@ -1,6 +1,9 @@
 import base64
+import hashlib
 import inspect
 import json
+import os
+import subprocess
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -387,6 +390,275 @@ class WorkstreamDLiveBoundaryTests(unittest.TestCase):
         self.assertNotIn('"main:main"', bootstrap)
         self.assertNotIn('"fixture-state"', bootstrap)
         self.assertIn('[bd_bin, "dolt", "push"]', bootstrap)
+
+    def test_fixture_start_command_failures_are_phase_specific_and_non_secret(self):
+        phases = (
+            "state-baseline-probe",
+            "fixture-git-init",
+            "fixture-git-config-name",
+            "fixture-git-config-email",
+            "fixture-git-add",
+            "fixture-git-commit",
+            "fixture-beads-init",
+            "fixture-dolt-remote-add",
+            "fixture-dolt-commit",
+            "fixture-dolt-push",
+        )
+        guard = inspect.getsource(live.assert_uninitialised_state)
+        bootstrap = inspect.getsource(live.bootstrap_fixture_repository)
+        self.assertIn('phase="state-baseline-probe"', guard)
+        for phase in phases[1:]:
+            self.assertIn(f'phase="{phase}"', bootstrap)
+
+        raw_stderr = "SECRET_STDERR_VALUE token=SUPER_SECRET_TOKEN"
+        digest = hashlib.sha256(raw_stderr.encode("utf-8")).hexdigest()
+        for index, phase in enumerate(phases, 1):
+            with self.subTest(phase=phase):
+                completed = subprocess.CompletedProcess(
+                    ["/sensitive/path/bd", "--credential=SUPER_SECRET_TOKEN"],
+                    40 + index,
+                    stdout="ignored stdout",
+                    stderr=raw_stderr,
+                )
+                with patch.object(live.subprocess, "run", return_value=completed):
+                    with self.assertRaises(live.CommandFailure) as raised:
+                        live._run(
+                            ["/sensitive/path/bd", "--credential=SUPER_SECRET_TOKEN"],
+                            cwd=Path("."),
+                            env={"PHASE2_STATE_TOKEN": "SUPER_SECRET_TOKEN"},
+                            phase=phase,
+                        )
+                diagnostic = raised.exception.safe_diagnostic()
+                self.assertEqual(
+                    diagnostic,
+                    {
+                        "failure_phase": phase,
+                        "executable": "bd",
+                        "return_code": 40 + index,
+                        "stderr_sha256": digest,
+                    },
+                )
+                serialised = json.dumps(diagnostic, sort_keys=True)
+                self.assertEqual(str(raised.exception), "COMMAND_FAILED")
+                self.assertNotIn(raw_stderr, serialised)
+                self.assertNotIn("SUPER_SECRET_TOKEN", serialised)
+                self.assertNotIn("/sensitive/path", serialised)
+
+    def _bootstrap_with_repository(self, repository_factory, root: Path):
+        fake_env = {
+            "PHASE2_STATE_TOKEN": "fixture-secret-token",
+            "GIT_ASKPASS": str(root / "fixture-askpass"),
+        }
+        with patch.object(live, "assert_uninitialised_state"), patch.object(
+            live, "_state_git_env", return_value=fake_env
+        ), patch.object(live, "_run", return_value=""), patch.object(
+            live, "DoltCanonicalRepository", repository_factory
+        ):
+            return live.bootstrap_fixture_repository(
+                "fixture-secret-token",
+                root=root,
+                bd_bin="/fixture/bin/bd",
+                dolt_bin="/fixture/bin/dolt",
+            )
+
+    def test_canonical_bootstrap_failure_is_phase_only_and_drops_raw_cause(self):
+        secret = "SECRET_CANONICAL_BOOTSTRAP_CAUSE"
+
+        class Repository:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def bootstrap(self):
+                raise RuntimeError(secret)
+
+        with TemporaryDirectory() as directory:
+            with self.assertRaises(live.FixtureBootstrapFailure) as raised:
+                self._bootstrap_with_repository(Repository, Path(directory))
+        exc = raised.exception
+        self.assertEqual(exc.reason_code, "FIXTURE_BOOTSTRAP_FAILED")
+        self.assertEqual(
+            exc.safe_diagnostic(), {"failure_phase": "fixture-canonical-bootstrap"}
+        )
+        self.assertEqual(str(exc), "FIXTURE_BOOTSTRAP_FAILED")
+        self.assertIsNone(exc.__context__)
+        self.assertNotIn(secret, json.dumps(exc.safe_diagnostic()))
+
+    def test_canonical_schema_failure_is_phase_only_and_closes_snapshot(self):
+        secret = "SECRET_CANONICAL_SCHEMA_CAUSE"
+
+        class Snapshot:
+            def __init__(self):
+                self.connection = object()
+                self.identity = type("Identity", (), {"git_ref_sha": "a" * 40})()
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        snapshot = Snapshot()
+
+        class Repository:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def bootstrap(self):
+                return snapshot
+
+            def publish(self, *args, **kwargs):
+                raise AssertionError("publish must not run after schema failure")
+
+        with TemporaryDirectory() as directory, patch.object(
+            live, "_execute_ddl", side_effect=RuntimeError(secret)
+        ):
+            with self.assertRaises(live.FixtureBootstrapFailure) as raised:
+                self._bootstrap_with_repository(Repository, Path(directory))
+        self.assertTrue(snapshot.closed)
+        self.assertEqual(
+            raised.exception.safe_diagnostic(),
+            {"failure_phase": "fixture-canonical-schema"},
+        )
+        self.assertIsNone(raised.exception.__context__)
+        self.assertNotIn(secret, json.dumps(raised.exception.safe_diagnostic()))
+
+    def test_canonical_publish_failure_is_phase_only_and_closes_snapshot(self):
+        secret = "SECRET_CANONICAL_PUBLISH_CAUSE"
+
+        class Snapshot:
+            def __init__(self):
+                self.connection = object()
+                self.identity = type("Identity", (), {"git_ref_sha": "b" * 40})()
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        snapshot = Snapshot()
+
+        class Repository:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def bootstrap(self):
+                return snapshot
+
+            def publish(self, *args, **kwargs):
+                raise RuntimeError(secret)
+
+        with TemporaryDirectory() as directory, patch.object(
+            live, "_execute_ddl", return_value=None
+        ):
+            with self.assertRaises(live.FixtureBootstrapFailure) as raised:
+                self._bootstrap_with_repository(Repository, Path(directory))
+        self.assertTrue(snapshot.closed)
+        self.assertEqual(
+            raised.exception.safe_diagnostic(),
+            {"failure_phase": "fixture-canonical-publish"},
+        )
+        self.assertIsNone(raised.exception.__context__)
+        self.assertNotIn(secret, json.dumps(raised.exception.safe_diagnostic()))
+
+    @unittest.skipUnless(
+        os.environ.get("BD_BIN") and os.environ.get("DOLT_BIN"),
+        "requires repository-native pinned Beads/Dolt runtime",
+    )
+    def test_credential_free_real_runtime_fixture_bootstrap_against_local_bare_remote(self):
+        bd_bin = os.environ["BD_BIN"]
+        dolt_bin = os.environ["DOLT_BIN"]
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            remote = root / "state.git"
+            seed = root / "sentinel-source"
+            fixture_root = root / "fixture"
+            seed.mkdir()
+            fixture_root.mkdir()
+            clean_env = live._credential_free_git_env()
+
+            live._run(
+                ["git", "init", "--bare", "--initial-branch=main", str(remote)],
+                cwd=root,
+                env=clean_env,
+            )
+            live._run(
+                ["git", "init", "--initial-branch=main"], cwd=seed, env=clean_env
+            )
+            live._run(
+                ["git", "config", "user.name", "Workstream D Local Sentinel"],
+                cwd=seed,
+                env=clean_env,
+            )
+            live._run(
+                [
+                    "git",
+                    "config",
+                    "user.email",
+                    "workstream-d-local-sentinel@example.invalid",
+                ],
+                cwd=seed,
+                env=clean_env,
+            )
+            (seed / "README.md").write_text(
+                "Local Workstream D transport sentinel\n", encoding="utf-8"
+            )
+            live._run(["git", "add", "README.md"], cwd=seed, env=clean_env)
+            live._run(
+                ["git", "commit", "-m", "Local Workstream D sentinel"],
+                cwd=seed,
+                env=clean_env,
+            )
+            sentinel_sha = live._run(
+                ["git", "rev-parse", "HEAD"], cwd=seed, env=clean_env
+            )
+            remote_url = remote.as_uri()
+            live._run(
+                ["git", "remote", "add", "origin", remote_url],
+                cwd=seed,
+                env=clean_env,
+            )
+            live._run(["git", "push", "origin", "main"], cwd=seed, env=clean_env)
+
+            isolated_process_env = {
+                "PATH": os.environ.get("PATH", ""),
+                "LANG": os.environ.get("LANG", "C.UTF-8"),
+            }
+            with patch.dict(os.environ, isolated_process_env, clear=True), patch.object(
+                live, "_remote_url", return_value=remote_url
+            ), patch.object(live, "STATE_REPOSITORY_BASELINE_SHA", sentinel_sha):
+                lease = live.bootstrap_fixture_repository(
+                    "",
+                    root=fixture_root,
+                    bd_bin=bd_bin,
+                    dolt_bin=dolt_bin,
+                )
+                try:
+                    main_line = live._run(
+                        ["git", "ls-remote", "--refs", remote_url, "refs/heads/main"],
+                        cwd=root,
+                        env=live._credential_free_git_env(),
+                    )
+                    dolt_line = live._run(
+                        ["git", "ls-remote", "--refs", remote_url, "refs/dolt/data"],
+                        cwd=root,
+                        env=live._credential_free_git_env(),
+                    )
+                    self.assertEqual(
+                        main_line, f"{sentinel_sha}\trefs/heads/main"
+                    )
+                    fields = dolt_line.split()
+                    self.assertEqual(len(fields), 2)
+                    self.assertEqual(fields[1], "refs/dolt/data")
+                    self.assertNotEqual(fields[0], sentinel_sha)
+                finally:
+                    askpass = lease.askpass
+                    credential_env = lease.credential_env
+                    lease.close()
+                self.assertNotIn("PHASE2_STATE_TOKEN", credential_env)
+                self.assertNotIn("GIT_ASKPASS", credential_env)
+                self.assertFalse(askpass.exists())
+
+        self.assertEqual(
+            live.STATE_REPOSITORY_BASELINE_SHA,
+            "fb872aeb52863ce3597ff8337d545cae13292696",
+        )
 
     def test_protocol_fixture_contract_uses_real_parser_hash_and_operator_namespace(self):
         namespace = valid_context().namespace
