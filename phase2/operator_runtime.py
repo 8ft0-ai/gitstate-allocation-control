@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable, Mapping
 
+from . import workstream_d_anchor_repair as anchor_repair
 from . import workstream_d_live as live
 from . import workstream_d_revocation as revocation
 from .credentials import (
@@ -362,6 +363,9 @@ def _blocked_payload(exc: Exception) -> dict[str, object]:
         payload["reason_code"] = exc.reason_code
         payload.update(exc.safe_diagnostic())
     elif isinstance(exc, live.FixtureBootstrapFailure):
+        payload["reason_code"] = exc.reason_code
+        payload.update(exc.safe_diagnostic())
+    elif isinstance(exc, anchor_repair.StalePhaseFailure):
         payload["reason_code"] = exc.reason_code
         payload.update(exc.safe_diagnostic())
     else:
