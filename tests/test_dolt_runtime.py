@@ -80,6 +80,8 @@ class FakeDoltCursor:
                 self.connection.before_push()
             if self.connection.push_error is not None:
                 raise self.connection.push_error
+            if self.connection.after_push is not None:
+                self.connection.after_push()
             self.row = None
         else:
             self.row = None
@@ -100,6 +102,7 @@ class FakeDoltConnection:
         self.commits = 0
         self.closed = False
         self.before_push = None
+        self.after_push = None
         self.push_error = None
 
     def cursor(self):
@@ -213,6 +216,26 @@ class DoltStoreTests(unittest.TestCase):
 
 
 class DoltRepositoryTests(unittest.TestCase):
+    @staticmethod
+    def _identity_runner(commands, remote_sha, *, verified_dolt_commit="dolt-2"):
+        def runner(command, cwd):
+            command = tuple(command)
+            commands.append(command)
+            if command[:2] == ("git", "ls-remote"):
+                stdout = f"{remote_sha[0]}\trefs/dolt/data\n"
+            elif command[:2] == ("git", "--git-dir") and "rev-parse" in command:
+                stdout = remote_sha[0] + "\n"
+            elif command[:2] == ("git", "--git-dir") and "diff-tree" in command:
+                stdout = "manifest\n"
+            elif command[:2] == ("dolt", "sql"):
+                head = verified_dolt_commit if "accepted-identity" in cwd.parts else "dolt-1"
+                stdout = f"commit_hash\n{head}\n"
+            else:
+                stdout = ""
+            return subprocess.CompletedProcess(command, 0, stdout, "")
+
+        return runner
+
     def test_git_remote_urls_are_normalised_like_pinned_beads(self):
         self.assertEqual(
             _normalise_dolt_remote("https://example.invalid/state.git"),
@@ -248,21 +271,10 @@ class DoltRepositoryTests(unittest.TestCase):
             factory_paths.append(database)
             return connection
 
-        def runner(command, cwd):
-            command = tuple(command)
-            commands.append(command)
-            if command[:2] == ("git", "ls-remote"):
-                stdout = f"{remote_sha[0]}\trefs/dolt/data\n"
-            elif command[:2] == ("dolt", "sql"):
-                stdout = "commit_hash\ndolt-1\n"
-            else:
-                stdout = ""
-            return subprocess.CompletedProcess(command, 0, stdout, "")
-
         repository = DoltCanonicalRepository(
             "https://example.invalid/state.git",
             factory,
-            run_command=runner,
+            run_command=self._identity_runner(commands, remote_sha),
         )
         snapshot = repository.bootstrap()
         accepted = repository.publish(old_sha, snapshot)
@@ -272,15 +284,68 @@ class DoltRepositoryTests(unittest.TestCase):
         self.assertEqual(accepted.git_ref_sha, new_sha)
         self.assertEqual(accepted.dolt_commit, "dolt-2")
 
-        clone = next(command for command in commands if command[:2] == ("dolt", "clone"))
-        self.assertEqual(clone[2], "git+https://example.invalid/state.git")
+        clone = next(
+            command
+            for command in commands
+            if command[:2] == ("dolt", "clone")
+            and command[2] == "git+https://example.invalid/state.git"
+        )
         self.assertEqual(clone[3], "canonical")
         git_probe = next(command for command in commands if command[:2] == ("git", "ls-remote"))
         self.assertEqual(git_probe[3], "https://example.invalid/state.git")
+        self.assertTrue(any(command[:2] == ("git", "clone") and "--mirror" in command for command in commands))
+        self.assertTrue(any(command[:2] == ("git", "--git-dir") and "diff-tree" in command for command in commands))
+        self.assertTrue(
+            any(
+                command[:2] == ("dolt", "clone")
+                and str(command[2]).startswith("git+file://")
+                for command in commands
+            )
+        )
         self.assertFalse(any(command[:2] == ("dolt", "push") for command in commands))
         self.assertFalse(any(command[:2] == ("git", "push") for command in commands))
         push_sql = [entry for entry in connection.statements if "DOLT_PUSH" in entry[0]]
         self.assertEqual(push_sql, [("CALL DOLT_PUSH(%s, %s)", ("origin", "main"))])
+        self.assertFalse(any("force" in sql.lower() for sql, _ in connection.statements))
+        snapshot.close()
+
+    def test_later_writer_cannot_mis_correlate_git_sha_with_callers_dolt_commit(self):
+        commands = []
+        old_sha = "a" * 40
+        caller_sha = "b" * 40
+        later_sha = "c" * 40
+        remote_sha = [old_sha]
+        connection = FakeDoltConnection()
+
+        # The caller's normal push succeeds first. Before publish() observes the
+        # remote, a legitimate later writer advances the same canonical ref to a
+        # complete descendant whose Dolt commit is different.
+        connection.before_push = lambda: remote_sha.__setitem__(0, caller_sha)
+        connection.after_push = lambda: remote_sha.__setitem__(0, later_sha)
+
+        repository = DoltCanonicalRepository(
+            "https://example.invalid/state.git",
+            lambda database: connection,
+            run_command=self._identity_runner(
+                commands, remote_sha, verified_dolt_commit="dolt-3"
+            ),
+        )
+        snapshot = repository.bootstrap()
+
+        with self.assertRaisesRegex(StaleCanonicalBase, "STALE_EXPECTED_OLD_SHA"):
+            repository.publish(old_sha, snapshot)
+
+        self.assertEqual(connection.dolt_head, "dolt-2")
+        self.assertEqual(remote_sha[0], later_sha)
+        self.assertTrue(any(command[:2] == ("git", "clone") and "--mirror" in command for command in commands))
+        self.assertTrue(
+            any(
+                command[:2] == ("dolt", "clone")
+                and str(command[2]).startswith("git+file://")
+                for command in commands
+            )
+        )
+        self.assertFalse(any(command[:2] == ("git", "push") for command in commands))
         self.assertFalse(any("force" in sql.lower() for sql, _ in connection.statements))
         snapshot.close()
 
