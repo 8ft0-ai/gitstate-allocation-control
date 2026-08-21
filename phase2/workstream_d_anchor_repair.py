@@ -21,7 +21,7 @@ from typing import Any, Callable, ClassVar, Mapping, Sequence
 
 from . import workstream_d_live as live
 from .allocation_store import AllocationStore
-from .canonical import CanonicalPushFailed
+from .canonical import CanonicalPushFailed, StaleCanonicalBase
 from .dolt_repository import DoltCanonicalRepository
 from .reconciliation import (
     CanonicalHistoryRevision,
@@ -33,6 +33,40 @@ REMEDIATION_EXECUTABLE_PATH = "phase2/workstream_d_anchor_repair.py"
 _ANCHOR_FAILURES = frozenset(
     {"CANONICAL_PUSH_FAILED", "STALE_ALLOCATOR_RETRY_EXHAUSTED"}
 )
+_STALE_FAILURE_PHASES = frozenset(
+    {
+        "allocation-process",
+        "anchor-record",
+        "anchor-repair",
+        "request-row-read",
+        "request-row-identity-read",
+        "projection-read",
+        "projection-metadata-record",
+    }
+)
+
+
+class StalePhaseFailure(live.LiveExecutorError):
+    """Safe phase-only evidence for an otherwise raw canonical stale escape."""
+
+    reason_code = "STALE_EXPECTED_OLD_SHA"
+
+    def __init__(self, failure_phase: str) -> None:
+        if failure_phase not in _STALE_FAILURE_PHASES:
+            raise ValueError("invalid stale failure phase")
+        super().__init__(self.reason_code)
+        self.failure_phase = failure_phase
+
+    def safe_diagnostic(self) -> dict[str, object]:
+        return {"failure_phase": self.failure_phase}
+
+
+def _with_stale_phase(failure_phase: str, operation: Callable[[], Any]) -> Any:
+    """Retain only a whitelisted phase if a raw stale escapes a worker boundary."""
+    try:
+        return operation()
+    except StaleCanonicalBase as exc:
+        raise StalePhaseFailure(failure_phase) from exc
 
 
 def _repository_store(repository: Any, snapshot: Any) -> Any:
@@ -43,12 +77,21 @@ def _repository_store(repository: Any, snapshot: Any) -> Any:
 
 
 def _request_row(repository: Any, request_id: str) -> dict[str, Any] | None:
-    snapshot = repository.bootstrap()
-    try:
-        row = _repository_store(repository, snapshot).get_request(request_id)
-        return None if row is None else dict(row)
-    finally:
-        snapshot.close()
+    """Read one canonical request through the accepted bounded fresh-read policy."""
+    stale_retries = 0
+    while True:
+        try:
+            snapshot = repository.bootstrap()
+        except StaleCanonicalBase as exc:
+            if stale_retries >= live.POST_ALLOCATION_READ_MAX_STALE_RETRIES:
+                raise live.LiveExecutorError("STALE_ALLOCATOR_RETRY_EXHAUSTED") from exc
+            stale_retries += 1
+            continue
+        try:
+            row = _repository_store(repository, snapshot).get_request(request_id)
+            return None if row is None else dict(row)
+        finally:
+            snapshot.close()
 
 
 class DurableAcceptedHistory:
@@ -389,7 +432,9 @@ class AnchorRepairLiveFixtureBackend(live.LiveFixtureBackend):
         # Use Workstream B's accepted/default bounded retry budget. The previous
         # Workstream-D-only max_stale_retries=1 override is deliberately removed.
         service = live.AllocationService(self.repository, clock=lambda: live.NOW)
-        result = service.process(command, context)
+        result = _with_stale_phase(
+            "allocation-process", lambda: service.process(command, context)
+        )
         if not result.canonical_git_ref_sha or not result.canonical_dolt_commit:
             raise live.LiveExecutorError("CANONICAL_RESULT_IDENTITY_MISSING")
 
@@ -399,24 +444,35 @@ class AnchorRepairLiveFixtureBackend(live.LiveFixtureBackend):
             else None
         )
         if result.ref_advanced:
-            anchor = service.record_anchor(
-                rid,
-                result.canonical_git_ref_sha,
-                result.canonical_dolt_commit,
+            anchor = _with_stale_phase(
+                "anchor-record",
+                lambda: service.record_anchor(
+                    rid,
+                    result.canonical_git_ref_sha,
+                    result.canonical_dolt_commit,
+                ),
             )
             if anchor.reason_code in _ANCHOR_FAILURES:
-                row = self._repair_request_anchor(rid)
+                row = _with_stale_phase(
+                    "anchor-repair", lambda: self._repair_request_anchor(rid)
+                )
             else:
-                row = _request_row(self.repository, rid)
+                row = _with_stale_phase(
+                    "request-row-read", lambda: self._request_row(rid)
+                )
         else:
-            row = _request_row(self.repository, rid)
+            row = _with_stale_phase(
+                "request-row-read", lambda: self._request_row(rid)
+            )
 
         # A replay may encounter an earlier accepted request whose anchor is
         # still pending. Never manufacture a current identity from runner memory:
         # reconstruct the original creation identity through accepted history and
         # use Workstream C's repair path.
         if row is not None and row.get("anchor_status") != "RECORDED":
-            row = self._repair_request_anchor(rid)
+            row = _with_stale_phase(
+                "anchor-repair", lambda: self._repair_request_anchor(rid)
+            )
 
         if (
             row is None
@@ -444,19 +500,28 @@ class AnchorRepairLiveFixtureBackend(live.LiveFixtureBackend):
             task_id=result.task_id,
             accepted_ref=accepted_ref,
             dolt_commit=dolt_commit,
-            canonical_row=self._request_row_identity(rid),
+            canonical_row=_with_stale_phase(
+                "request-row-identity-read",
+                lambda: self._request_row_identity(rid),
+            ),
             payload_hash=payload_hash,
         )
         if project:
             # Existing Workstream C projection logic refuses PENDING anchors;
             # therefore ALLOCATED can become execution-authorising only after
             # exact canonical request/allocation/anchor correlation is repaired.
-            projection = self.reconciler._canonical_projection(
-                rid, source_comment_id=source_id
+            projection = _with_stale_phase(
+                "projection-read",
+                lambda: self._canonical_projection(
+                    rid, source_comment_id=source_id
+                ),
             )
             projection_body = live.render_projection(projection)
             posted = self.gateway.post_projection(self.issue_number, projection_body)
-            self.reconciler._record_projection_posted(rid, posted)
+            _with_stale_phase(
+                "projection-metadata-record",
+                lambda: self.reconciler._record_projection_posted(rid, posted),
+            )
             record.projection_url = posted.html_url
             record.projection_body = projection_body
         self.memory[f"s{scenario}:{index}"] = record
