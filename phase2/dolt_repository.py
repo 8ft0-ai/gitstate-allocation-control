@@ -205,6 +205,106 @@ class DoltCanonicalRepository:
             raise CanonicalIdentityMismatch("CANONICAL_DOLT_BRANCH_MISMATCH")
         return connection_head
 
+    def _verified_published_identity(
+        self,
+        snapshot: DoltCanonicalSnapshot,
+        expected_old_sha: str,
+        dolt_commit: str,
+    ) -> CanonicalIdentity:
+        """Bind one post-push Git ref to the caller's exact Dolt commit.
+
+        Git-backed Dolt writes may create transport commits before the manifest
+        commit. A later legitimate writer may also advance ``refs/dolt/data``
+        immediately after this caller's successful ``DOLT_PUSH``. Therefore the
+        current remote SHA alone is not an accepted identity witness.
+
+        Capture the observed ref into an isolated read-only-by-convention mirror,
+        require that the mirror still names that exact SHA and that the SHA is a
+        manifest revision, then reconstruct Dolt from the mirrored ref. Any race
+        or Git/Dolt mismatch is canonical staleness and is handled only by the
+        existing bounded fresh-snapshot retry policy at the caller layer.
+        """
+        observed_git_sha = self._remote_sha(snapshot.workspace)
+        if observed_git_sha == expected_old_sha:
+            raise CanonicalPushFailed("CANONICAL_REF_NOT_ADVANCED")
+
+        mirror = snapshot.workspace / "accepted-identity.git"
+        self._command(
+            (
+                self.git_bin,
+                "clone",
+                "--mirror",
+                self.git_remote_url,
+                str(mirror),
+            ),
+            snapshot.workspace,
+            "CANONICAL_ACCEPTED_IDENTITY_MIRROR_FAILED",
+        )
+        mirrored_git_sha = self._command(
+            (
+                self.git_bin,
+                "--git-dir",
+                str(mirror),
+                "rev-parse",
+                self.state_ref,
+            ),
+            snapshot.workspace,
+            "CANONICAL_ACCEPTED_IDENTITY_REF_FAILED",
+        )
+        verify_canonical_identity(
+            CanonicalIdentity(self.state_ref, mirrored_git_sha, "probe")
+        )
+        if mirrored_git_sha != observed_git_sha:
+            raise StaleCanonicalBase("STALE_EXPECTED_OLD_SHA")
+
+        changed = self._command(
+            (
+                self.git_bin,
+                "--git-dir",
+                str(mirror),
+                "diff-tree",
+                "--root",
+                "--no-commit-id",
+                "--name-only",
+                "-r",
+                mirrored_git_sha,
+            ),
+            snapshot.workspace,
+            "CANONICAL_ACCEPTED_IDENTITY_TREE_FAILED",
+        )
+        changed_paths = {
+            line.strip() for line in changed.splitlines() if line.strip()
+        }
+        if "manifest" not in changed_paths:
+            raise StaleCanonicalBase("STALE_EXPECTED_OLD_SHA")
+
+        verification_root = snapshot.workspace / "accepted-identity"
+        verification_root.mkdir()
+        verification_database = verification_root / "canonical"
+        self._command(
+            (
+                self.dolt_bin,
+                "clone",
+                "git+file://" + str(mirror),
+                verification_database.name,
+            ),
+            verification_root,
+            "CANONICAL_ACCEPTED_IDENTITY_DOLT_CLONE_FAILED",
+        )
+        verified_dolt_commit = self._cli_scalar(
+            verification_database,
+            "SELECT DOLT_HASHOF('HEAD') AS commit_hash",
+            "CANONICAL_ACCEPTED_IDENTITY_DOLT_HEAD_FAILED",
+        )
+        if verified_dolt_commit != dolt_commit:
+            raise StaleCanonicalBase("STALE_EXPECTED_OLD_SHA")
+
+        accepted = CanonicalIdentity(
+            self.state_ref, mirrored_git_sha, verified_dolt_commit
+        )
+        verify_canonical_identity(accepted)
+        return accepted
+
     def bootstrap(self) -> DoltCanonicalSnapshot:
         workspace = Path(
             tempfile.mkdtemp(
@@ -278,9 +378,4 @@ class DoltCanonicalRepository:
                 raise StaleCanonicalBase("STALE_EXPECTED_OLD_SHA") from exc
             raise CanonicalPushFailed("CANONICAL_PUSH_FAILED") from exc
 
-        accepted_git_sha = self._remote_sha(snapshot.workspace)
-        if accepted_git_sha == expected_old_sha:
-            raise CanonicalPushFailed("CANONICAL_REF_NOT_ADVANCED")
-        accepted = CanonicalIdentity(self.state_ref, accepted_git_sha, dolt_commit)
-        verify_canonical_identity(accepted)
-        return accepted
+        return self._verified_published_identity(snapshot, expected_old_sha, dolt_commit)
