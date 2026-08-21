@@ -50,30 +50,44 @@ class AnchorRepairLiveStaleRetryTests(unittest.TestCase):
             live.POST_ALLOCATION_READ_MAX_STALE_RETRIES + 1,
         )
 
-    def test_raw_stale_phase_evidence_is_whitelisted_and_secret_free(self):
+    def test_every_worker_stale_phase_emits_only_whitelisted_secret_free_evidence(self):
         secret = "ghs_fixture_secret_that_must_not_escape"
 
         def raw_stale():
             raise StaleCanonicalBase(f"STALE_EXPECTED_OLD_SHA:{secret}")
 
-        with self.assertRaises(remediation.StalePhaseFailure) as caught:
-            remediation._with_stale_phase("projection-read", raw_stale)
+        expected_phases = {
+            "allocation-process",
+            "anchor-record",
+            "anchor-repair",
+            "request-row-read",
+            "request-row-identity-read",
+            "projection-read",
+            "projection-metadata-record",
+        }
+        self.assertEqual(remediation._STALE_FAILURE_PHASES, expected_phases)
 
-        failure = caught.exception
-        self.assertEqual(str(failure), "STALE_EXPECTED_OLD_SHA")
-        self.assertEqual(failure.safe_diagnostic(), {"failure_phase": "projection-read"})
-        payload = operator_runtime._blocked_payload(failure)
-        self.assertEqual(
-            payload,
-            {
-                "status": "BLOCKED",
-                "reason_code": "STALE_EXPECTED_OLD_SHA",
-                "failure_phase": "projection-read",
-                "credential_material_emitted": False,
-                "workstream_e_authorised": False,
-            },
-        )
-        self.assertNotIn(secret, repr(payload))
+        for phase in sorted(expected_phases):
+            with self.subTest(phase=phase):
+                with self.assertRaises(remediation.StalePhaseFailure) as caught:
+                    remediation._with_stale_phase(phase, raw_stale)
+
+                failure = caught.exception
+                self.assertEqual(str(failure), "STALE_EXPECTED_OLD_SHA")
+                self.assertEqual(failure.safe_diagnostic(), {"failure_phase": phase})
+                payload = operator_runtime._blocked_payload(failure)
+                self.assertEqual(
+                    payload,
+                    {
+                        "status": "BLOCKED",
+                        "reason_code": "STALE_EXPECTED_OLD_SHA",
+                        "failure_phase": phase,
+                        "credential_material_emitted": False,
+                        "workstream_e_authorised": False,
+                    },
+                )
+                self.assertNotIn(secret, repr(payload))
+
         with self.assertRaisesRegex(ValueError, "invalid stale failure phase"):
             remediation.StalePhaseFailure("unreviewed-phase")
 
