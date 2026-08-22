@@ -89,6 +89,8 @@ FIXTURE_MODE = "workstream-d-synthetic-fixture-v1"
 INVENTORY_MAX_AGE_SECONDS = 15 * 60
 CLOSE_TIMED_MAX_SECONDS = 30.0
 POST_ALLOCATION_READ_MAX_STALE_RETRIES = 3
+SCENARIO_3_FIXTURE_PAGE_SIZE = 2
+SCENARIO_3_FILLER_COUNT = 2
 LIVE_EXECUTABLE_PATHS = (
     ".github/workflows/phase2-adversarial.yml",
     "phase2/adversarial.py",
@@ -312,8 +314,6 @@ def acquire_credentials(
     api_factory: Callable[[str, str], GitHubAPI] = GitHubAPI,
     jwt_factory: Callable[[int, str], str] = create_app_jwt,
 ) -> tuple[CredentialLease, ValidatedInventory]:
-    # This is deliberately the first operation.  No private-key lookup may move
-    # above this exact trusted-main/first-attempt/enablement gate.
     context.validate()
     policy = load_policy(values.get("PHASE2_POLICY", "policy/actors.json"))
     if policy.get("control_repository") != CONTROL_REPOSITORY:
@@ -746,9 +746,6 @@ def bootstrap_fixture_repository(
         phase="fixture-beads-init",
     )
     remote = _remote_url()
-    # GitHub requires a default branch.  The exact remote main ref is a pinned
-    # synthetic transport sentinel, not canonical allocator state, and must
-    # never be advanced or replaced by the fixture executor.
     _run(
         [bd_bin, "dolt", "remote", "add", "origin", "git+" + remote],
         cwd=source,
@@ -828,8 +825,6 @@ class _HistoryStub:
 
 @dataclass
 class ScenarioProof:
-    """Fail-closed binding from executed checks to the existing evidence schema."""
-
     spec: ScenarioSpec
     namespace: AttemptNamespace
     assertion_records: dict[str, AssertionEvidence] = field(default_factory=dict)
@@ -946,7 +941,6 @@ def _exercise_authorisation_negative(
     namespace: AttemptNamespace,
     base_policy: Mapping[str, Any],
 ) -> str:
-    """Exercise one identity negative with exactly one targeted invalid fact."""
     policy = _fixture_app_policy(base_policy)
     parsed = _scenario13_parsed_request(namespace)
     valid = {
@@ -996,7 +990,6 @@ def _exercise_authorisation_negative(
 
 
 def _exercise_installation_negative(control: str) -> tuple[str, int, int]:
-    """Return rejection plus explicit zero state-token/canonical-access counters."""
     mint_calls = 0
     canonical_calls = 0
 
@@ -1037,7 +1030,6 @@ def _exercise_installation_negative(control: str) -> tuple[str, int, int]:
 def _run_close_timed_calls(
     calls: Sequence[Callable[[], Any]],
 ) -> tuple[tuple[Any, ...], float]:
-    # Release all fixture calls through one barrier and report actual start spread.
     if len(calls) < 2:
         raise LiveExecutorError("CLOSE_TIMED_CALL_COUNT_INVALID")
     barrier = threading.Barrier(len(calls))
@@ -1063,7 +1055,6 @@ def _run_close_timed_calls(
 
 
 def _cancel_queued_call(call: Callable[[], Any]) -> bool:
-    # Occupy a one-worker executor, queue exactly one fixture call, then cancel it.
     blocker_started = threading.Event()
     release_blocker = threading.Event()
 
@@ -1089,10 +1080,6 @@ def _classify_edited_pre_ingress(
     original_body: str,
     policy: Mapping[str, Any],
 ) -> str:
-    # The live fixture App remains intentionally outside runtime actor policy.
-    # Prove the edited payload itself is syntactically valid and positively
-    # authorisable by the accepted owner/operator policy, then apply the real
-    # discovery edit boundary to the actual edited GitHub comment.
     body = comment.get("body")
     if not isinstance(body, str) or body == original_body:
         raise LiveExecutorError("PRE_INGRESS_EDIT_NOT_OBSERVED")
@@ -1165,11 +1152,16 @@ class LiveFixtureBackend:
     inventory: ValidatedInventory
     namespace: AttemptNamespace
     read_only_remote_factory: Callable[[Path], tuple[Path, str]] | None = None
+    comment_page_size: int = 100
     memory: dict[str, _ResultRecord] = field(default_factory=dict)
     executed_records: dict[int, ScenarioEvidence] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        self.gateway = GitHubIssueGateway(self.control_api, CONTROL_REPOSITORY)
+        self.gateway = GitHubIssueGateway(
+            self.control_api,
+            CONTROL_REPOSITORY,
+            page_size=self.comment_page_size,
+        )
         self.reconciler = ReconciliationService(
             self.repository,
             self.gateway,
@@ -1184,7 +1176,12 @@ class LiveFixtureBackend:
     def agent_id(self) -> str:
         return f"agent://operator/8ft0-ai/session/{self.namespace.value}"
 
-    def _fresh_backend(self, repository: Any | None = None) -> "LiveFixtureBackend":
+    def _fresh_backend(
+        self,
+        repository: Any | None = None,
+        *,
+        comment_page_size: int | None = None,
+    ) -> "LiveFixtureBackend":
         return LiveFixtureBackend(
             repository or self.repository,
             self.control_api,
@@ -1195,6 +1192,7 @@ class LiveFixtureBackend:
             self.inventory,
             self.namespace,
             self.read_only_remote_factory,
+            self.comment_page_size if comment_page_size is None else comment_page_size,
         )
 
     def _fixture_body(self, scenario: int, index: int, operation: str) -> str:
@@ -1509,9 +1507,7 @@ class LiveFixtureBackend:
             payload_hash=payload_hash,
         )
         if project:
-            projection = self._canonical_projection(
-                rid, source_comment_id=source_id
-            )
+            projection = self._canonical_projection(rid, source_comment_id=source_id)
             body = render_projection(projection)
             posted = self.gateway.post_projection(self.issue_number, body)
             self.reconciler._record_projection_posted(rid, posted)
@@ -1523,9 +1519,7 @@ class LiveFixtureBackend:
     def _executable_identities(self) -> tuple[ExecutableIdentity, ...]:
         identities = []
         for path in LIVE_EXECUTABLE_PATHS:
-            entry = _run(
-                ["git", "ls-tree", self.trusted_sha, "--", path], cwd=Path.cwd()
-            )
+            entry = _run(["git", "ls-tree", self.trusted_sha, "--", path], cwd=Path.cwd())
             blob = _run(
                 ["git", "rev-parse", "--verify", f"{self.trusted_sha}:{path}"],
                 cwd=Path.cwd(),
@@ -1743,18 +1737,10 @@ class LiveFixtureBackend:
         values, process_start_spread = _run_close_timed_calls(
             (
                 lambda: workers[0]._process(
-                    1,
-                    1,
-                    request_type="ALLOCATE_NEXT",
-                    request_id=request_ids[0],
-                    source_override=sources[0],
+                    1, 1, request_type="ALLOCATE_NEXT", request_id=request_ids[0], source_override=sources[0]
                 ),
                 lambda: workers[1]._process(
-                    1,
-                    2,
-                    request_type="ALLOCATE_NEXT",
-                    request_id=request_ids[1],
-                    source_override=sources[1],
+                    1, 2, request_type="ALLOCATE_NEXT", request_id=request_ids[1], source_override=sources[1]
                 ),
             )
         )
@@ -1763,9 +1749,7 @@ class LiveFixtureBackend:
         active = tuple(row for row in rows if row.get("state") == "ACTIVE")
         proof.fault(
             "close_timed_requests",
-            visible
-            and source_elapsed <= CLOSE_TIMED_MAX_SECONDS
-            and process_start_spread <= CLOSE_TIMED_MAX_SECONDS,
+            visible and source_elapsed <= CLOSE_TIMED_MAX_SECONDS and process_start_spread <= CLOSE_TIMED_MAX_SECONDS,
             EXPECTED_FAULT_OUTCOMES["close_timed_requests"],
         )
         proof.assertion(0, len(active) == 2, f"active_rows={len(active)}")
@@ -1775,36 +1759,23 @@ class LiveFixtureBackend:
             and len({row.get("allocation_id") for row in active}) == 2,
             "task_ids and allocation_ids are pairwise distinct",
         )
-        proof.assertion(
-            2,
-            self._mirrors_valid(tasks),
-            "both task mirrors satisfy ownership invariant",
-        )
+        proof.assertion(2, self._mirrors_valid(tasks), "both task mirrors satisfy ownership invariant")
         selected = {first.task_id, second.task_id}
         if self.read_only_remote_factory is None:
             raise LiveExecutorError("SCENARIO_1_READ_ONLY_MIRROR_BROKER_MISSING")
-        records_by_ref = {
-            first.accepted_ref: first,
-            second.accepted_ref: second,
-        }
+        records_by_ref = {first.accepted_ref: first, second.accepted_ref: second}
         if len(records_by_ref) != 2:
             raise LiveExecutorError("SCENARIO_1_CREATION_REFS_EQUAL")
         with tempfile.TemporaryDirectory(prefix="wd-scenario-1-order-") as directory:
             mirror, current_ref = self.read_only_remote_factory(Path(directory))
             try:
-                creation_refs = _canonical_creation_ref_order(
-                    mirror,
-                    current_ref,
-                    tuple(records_by_ref),
-                )
+                creation_refs = _canonical_creation_ref_order(mirror, current_ref, tuple(records_by_ref))
             finally:
                 _set_tree_read_only(mirror, read_only=False)
         creation_order = tuple(records_by_ref[ref].task_id for ref in creation_refs)
         proof.assertion(
             3,
-            selected == set(tasks)
-            and expected_order == tasks
-            and creation_order == expected_order,
+            selected == set(tasks) and expected_order == tasks and creation_order == expected_order,
             (
                 f"expected_priority_created_id_order={expected_order} "
                 f"canonical_creation_order={creation_order} "
@@ -1838,20 +1809,10 @@ class LiveFixtureBackend:
         values, process_start_spread = _run_close_timed_calls(
             (
                 lambda: workers[0]._process(
-                    2,
-                    1,
-                    request_type="ALLOCATE_TASK",
-                    task_id=task_id,
-                    request_id=request_ids[0],
-                    source_override=sources[0],
+                    2, 1, request_type="ALLOCATE_TASK", task_id=task_id, request_id=request_ids[0], source_override=sources[0]
                 ),
                 lambda: workers[1]._process(
-                    2,
-                    2,
-                    request_type="ALLOCATE_TASK",
-                    task_id=task_id,
-                    request_id=request_ids[1],
-                    source_override=sources[1],
+                    2, 2, request_type="ALLOCATE_TASK", task_id=task_id, request_id=request_ids[1], source_override=sources[1]
                 ),
             )
         )
@@ -1860,22 +1821,15 @@ class LiveFixtureBackend:
         active = tuple(row for row in rows if row.get("state") == "ACTIVE")
         proof.fault(
             "close_timed_requests",
-            visible
-            and source_elapsed <= CLOSE_TIMED_MAX_SECONDS
-            and process_start_spread <= CLOSE_TIMED_MAX_SECONDS,
+            visible and source_elapsed <= CLOSE_TIMED_MAX_SECONDS and process_start_spread <= CLOSE_TIMED_MAX_SECONDS,
             EXPECTED_FAULT_OUTCOMES["close_timed_requests"],
         )
         proof.assertion(0, len(active) == 1, f"active_rows={len(active)}")
-        proof.assertion(
-            1,
-            self._mirrors_valid((task_id,)),
-            "task mirror agrees with single active allocation",
-        )
+        proof.assertion(1, self._mirrors_valid((task_id,)), "task mirror agrees with single active allocation")
         proof.assertion(
             2,
             len(rows) == 1
-            and sorted((first.reason, second.reason))
-            == ["ALLOCATED", "TASK_ALREADY_ALLOCATED"],
+            and sorted((first.reason, second.reason)) == ["ALLOCATED", "TASK_ALREADY_ALLOCATED"],
             f"allocation_rows={len(rows)} results={first.reason},{second.reason} start_spread={process_start_spread:.6f}",
         )
         return self._evidence(
@@ -1913,27 +1867,17 @@ class LiveFixtureBackend:
 
         queued_cancelled = _cancel_queued_call(queued_third)
         cancelled_before_canonical = (
-            queued_cancelled
-            and not queued_executed["value"]
-            and self._request_row(third_rid) is None
+            queued_cancelled and not queued_executed["value"] and self._request_row(third_rid) is None
         )
 
         workers = (self._fresh_backend(), self._fresh_backend())
         first_two, process_start_spread = _run_close_timed_calls(
             (
                 lambda: workers[0]._process(
-                    3,
-                    1,
-                    request_type="ALLOCATE_NEXT",
-                    request_id=request_ids[0],
-                    source_override=sources[0],
+                    3, 1, request_type="ALLOCATE_NEXT", request_id=request_ids[0], source_override=sources[0]
                 ),
                 lambda: workers[1]._process(
-                    3,
-                    2,
-                    request_type="ALLOCATE_NEXT",
-                    request_id=request_ids[1],
-                    source_override=sources[1],
+                    3, 2, request_type="ALLOCATE_NEXT", request_id=request_ids[1], source_override=sources[1]
                 ),
             )
         )
@@ -1941,13 +1885,13 @@ class LiveFixtureBackend:
 
         filler_ids = tuple(
             self._post_source(3, 1000 + index, "pagination-fixture")[0]
-            for index in range(101)
+            for index in range(SCENARIO_3_FILLER_COUNT)
         )
-        recovery = self._fresh_backend()
-        listed = {
-            item.comment_id
-            for item in recovery.gateway.list_comments(self.issue_number)
-        }
+        recovery = self._fresh_backend(
+            comment_page_size=SCENARIO_3_FIXTURE_PAGE_SIZE
+        )
+        listed_comments = recovery.gateway.list_comments(self.issue_number)
+        listed = {item.comment_id for item in listed_comments}
         retained_after_cancel = sources[2][0] in listed
         recovered: dict[str, _ResultRecord] = {}
 
@@ -1982,8 +1926,10 @@ class LiveFixtureBackend:
         if third is None:
             raise LiveExecutorError("SCENARIO_3_RECONCILIATION_DID_NOT_RECOVER_SOURCE")
         records = (first, second, third)
-        pagination_complete = all(item in listed for item in filler_ids) and all(
-            source[0] in listed for source in sources
+        pagination_complete = (
+            len(listed_comments) > SCENARIO_3_FIXTURE_PAGE_SIZE
+            and all(item in listed for item in filler_ids)
+            and all(source[0] in listed for source in sources)
         )
         accepted_recovery = (
             sources[2][0] in recovery_summary.unprocessed_comments
@@ -2010,14 +1956,11 @@ class LiveFixtureBackend:
         proof.assertion(
             0,
             pagination_complete,
-            f"listed_filler_count={sum(item in listed for item in filler_ids)}",
+            f"fixture_page_size={SCENARIO_3_FIXTURE_PAGE_SIZE} listed_filler_count={sum(item in listed for item in filler_ids)}",
         )
         proof.assertion(
             1,
-            queued_cancelled
-            and cancelled_before_canonical
-            and retained_after_cancel
-            and accepted_recovery,
+            queued_cancelled and cancelled_before_canonical and retained_after_cancel and accepted_recovery,
             "queued third worker was cancelled before execution; accepted full-pagination reconciliation rediscovered and terminated the retained source",
         )
         proof.assertion(
@@ -2082,17 +2025,9 @@ class LiveFixtureBackend:
             before_counts[1],
             after_counts[1],
         )
-        proof_recorder.assertion(
-            0,
-            not repeated.ref_advanced and before_ref == after_ref,
-            f"canonical_ref={after_ref}",
-        )
+        proof_recorder.assertion(0, not repeated.ref_advanced and before_ref == after_ref, f"canonical_ref={after_ref}")
         proof_recorder.assertion(1, before_counts == after_counts, f"counts={after_counts}")
-        proof_recorder.assertion(
-            2,
-            first.projection_body == body,
-            f"projection_sha256={repeated_digest}",
-        )
+        proof_recorder.assertion(2, first.projection_body == body, f"projection_sha256={repeated_digest}")
         identity = self._identity()
         return self._evidence(
             spec,
@@ -2115,16 +2050,8 @@ class LiveFixtureBackend:
         before_counts = self._counts()
         before_allocation = None if not first.allocation_id else self._allocation(first.allocation_id)
         changed_payload = "f" * 64
-        command = AllocationCommand(
-            first.request_id, "ALLOCATE_TASK", changed_payload, self.agent_id, task_id=task_id
-        )
-        context = RequestContext(
-            CONTROL_REPOSITORY,
-            self.issue_number,
-            first.source_id,
-            "fixture:gitstate-phase-2-allocator",
-            self.agent_id,
-        )
+        command = AllocationCommand(first.request_id, "ALLOCATE_TASK", changed_payload, self.agent_id, task_id=task_id)
+        context = RequestContext(CONTROL_REPOSITORY, self.issue_number, first.source_id, "fixture:gitstate-phase-2-allocator", self.agent_id)
         mismatch = AllocationService(self.repository, clock=lambda: NOW).process(command, context)
         after = self._identity()
         after_counts = self._counts()
@@ -2141,25 +2068,9 @@ class LiveFixtureBackend:
         )
         posted = self.gateway.post_projection(self.issue_number, render_projection(projection))
         proof.assertion(0, first.payload_hash != changed_payload, "original and replay payload hashes differ")
-        proof.assertion(
-            1,
-            mismatch.reason_code == "REQUEST_ID_PAYLOAD_MISMATCH" and before.git_ref_sha == after.git_ref_sha,
-            f"reason={mismatch.reason_code} ref={after.git_ref_sha}",
-        )
-        proof.assertion(
-            2,
-            before_counts == after_counts and _sha256(before_allocation) == _sha256(after_allocation),
-            "request/allocation counts and ownership row are unchanged",
-        )
-        return self._evidence(
-            spec,
-            proof,
-            base_refs=(base.git_ref_sha,),
-            accepted_refs=(after.git_ref_sha,),
-            dolt_commits=(after.dolt_commit,),
-            canonical_rows=(first.canonical_row,),
-            projection_urls=(posted.html_url,),
-        )
+        proof.assertion(1, mismatch.reason_code == "REQUEST_ID_PAYLOAD_MISMATCH" and before.git_ref_sha == after.git_ref_sha, f"reason={mismatch.reason_code} ref={after.git_ref_sha}")
+        proof.assertion(2, before_counts == after_counts and _sha256(before_allocation) == _sha256(after_allocation), "request/allocation counts and ownership row are unchanged")
+        return self._evidence(spec, proof, base_refs=(base.git_ref_sha,), accepted_refs=(after.git_ref_sha,), dolt_commits=(after.dolt_commit,), canonical_rows=(first.canonical_row,), projection_urls=(posted.html_url,))
 
     def _scenario_6(self, spec: ScenarioSpec) -> ScenarioEvidence:
         proof_recorder = ScenarioProof(spec, self.namespace)
@@ -2171,12 +2082,8 @@ class LiveFixtureBackend:
         right_store = self.repository.store(right)
         rid1 = stable_ulid(f"{self.namespace.value}:s6:winner")
         rid2 = stable_ulid(f"{self.namespace.value}:s6:stale")
-        _, body1, hash1 = _protocol_request_contract(
-            self.namespace, 6, 1, request_type="ALLOCATE_TASK", task_id=task_id, request_id=rid1
-        )
-        _, body2, hash2 = _protocol_request_contract(
-            self.namespace, 6, 2, request_type="ALLOCATE_TASK", task_id=task_id, request_id=rid2
-        )
+        _, body1, hash1 = _protocol_request_contract(self.namespace, 6, 1, request_type="ALLOCATE_TASK", task_id=task_id, request_id=rid1)
+        _, body2, hash2 = _protocol_request_contract(self.namespace, 6, 2, request_type="ALLOCATE_TASK", task_id=task_id, request_id=rid2)
         source1, _ = self._post_body(body1)
         source2, _ = self._post_body(body2)
         c1 = AllocationCommand(rid1, "ALLOCATE_TASK", hash1, self.agent_id, task_id=task_id)
@@ -2203,51 +2110,22 @@ class LiveFixtureBackend:
             right.close()
         if not winner.allocation_id or not stale.allocation_id:
             raise LiveExecutorError("SCENARIO_6_ALLOCATION_ID_MISSING")
-        anchor = AllocationService(self.repository, clock=lambda: NOW).record_anchor(
-            rid1, accepted.git_ref_sha, accepted.dolt_commit
-        )
+        anchor = AllocationService(self.repository, clock=lambda: NOW).record_anchor(rid1, accepted.git_ref_sha, accepted.dolt_commit)
         if anchor.reason_code in {"CANONICAL_PUSH_FAILED", "STALE_ALLOCATOR_RETRY_EXHAUSTED"}:
             raise LiveExecutorError("SCENARIO_6_WINNER_ANCHOR_FAILED")
         row = self._allocation(winner.allocation_id)
         stale_row = self._allocation_optional(stale.allocation_id)
         final = self._identity()
         row_identity = _sha256(row)
-        allocation = CanonicalAllocationEvidence(
-            winner.allocation_id, row_identity, final.git_ref_sha, "ACTIVE", self.agent_id
-        )
-        final_owner = FinalOwnerEvidence(
-            winner.allocation_id,
-            winner.allocation_id,
-            stale.allocation_id,
-            final.git_ref_sha,
-            final.git_ref_sha,
-        )
+        allocation = CanonicalAllocationEvidence(winner.allocation_id, row_identity, final.git_ref_sha, "ACTIVE", self.agent_id)
+        final_owner = FinalOwnerEvidence(winner.allocation_id, winner.allocation_id, stale.allocation_id, final.git_ref_sha, final.git_ref_sha)
         publish_params = tuple(inspect.signature(DoltCanonicalRepository.publish).parameters)
-        proof_recorder.fault(
-            "delay_publication",
-            stale_rejected,
-            EXPECTED_FAULT_OUTCOMES["delay_publication"],
-        )
+        proof_recorder.fault("delay_publication", stale_rejected, EXPECTED_FAULT_OUTCOMES["delay_publication"])
         proof_recorder.assertion(0, stale_rejected, "second publish raised StaleCanonicalBase")
         proof_recorder.assertion(1, stale_row is None, "stale allocation ID is absent from accepted canonical rows")
         proof_recorder.assertion(2, "force" not in publish_params, f"publish_parameters={publish_params}")
-        proof_recorder.assertion(
-            3,
-            row.get("allocation_id") == winner.allocation_id
-            and self._request_row(rid1) is not None
-            and self._request_row(rid1).get("anchor_status") == "RECORDED",
-            f"final_ref={final.git_ref_sha} creation_ref={accepted.git_ref_sha} winner={winner.allocation_id}",
-        )
-        return self._evidence(
-            spec,
-            proof_recorder,
-            base_refs=(left_base,),
-            accepted_refs=(final.git_ref_sha,),
-            dolt_commits=(final.dolt_commit,),
-            canonical_rows=(row_identity,),
-            allocation_rows=(allocation,),
-            final_owner=final_owner,
-        )
+        proof_recorder.assertion(3, row.get("allocation_id") == winner.allocation_id and self._request_row(rid1) is not None and self._request_row(rid1).get("anchor_status") == "RECORDED", f"final_ref={final.git_ref_sha} creation_ref={accepted.git_ref_sha} winner={winner.allocation_id}")
+        return self._evidence(spec, proof_recorder, base_refs=(left_base,), accepted_refs=(final.git_ref_sha,), dolt_commits=(final.dolt_commit,), canonical_rows=(row_identity,), allocation_rows=(allocation,), final_owner=final_owner)
 
     def _scenario_7(self, spec: ScenarioSpec) -> ScenarioEvidence:
         proof = ScenarioProof(spec, self.namespace)
@@ -2275,25 +2153,10 @@ class LiveFixtureBackend:
         result = AllocationService(FailPublish(), clock=lambda: NOW, max_stale_retries=0).process(command, context)
         after = self._identity()
         after_counts = self._counts()
-        proof.fault(
-            "fail_canonical_push",
-            injected["called"] and result.reason_code == "CANONICAL_PUSH_FAILED",
-            EXPECTED_FAULT_OUTCOMES["fail_canonical_push"],
-        )
-        proof.assertion(
-            0,
-            after.git_ref_sha == base.git_ref_sha and after_counts == before_counts,
-            f"ref={after.git_ref_sha} counts={after_counts}",
-        )
+        proof.fault("fail_canonical_push", injected["called"] and result.reason_code == "CANONICAL_PUSH_FAILED", EXPECTED_FAULT_OUTCOMES["fail_canonical_push"])
+        proof.assertion(0, after.git_ref_sha == base.git_ref_sha and after_counts == before_counts, f"ref={after.git_ref_sha} counts={after_counts}")
         proof.assertion(1, result.reason_code == "CANONICAL_PUSH_FAILED", f"reason={result.reason_code}")
-        return self._evidence(
-            spec,
-            proof,
-            base_refs=(base.git_ref_sha,),
-            accepted_refs=(base.git_ref_sha,),
-            dolt_commits=(base.dolt_commit,),
-            canonical_rows=(_sha256({"ref": base.git_ref_sha, "counts": before_counts}),),
-        )
+        return self._evidence(spec, proof, base_refs=(base.git_ref_sha,), accepted_refs=(base.git_ref_sha,), dolt_commits=(base.dolt_commit,), canonical_rows=(_sha256({"ref": base.git_ref_sha, "counts": before_counts}),))
 
     def _scenario_8(self, spec: ScenarioSpec) -> ScenarioEvidence:
         proof = ScenarioProof(spec, self.namespace)
@@ -2312,22 +2175,14 @@ class LiveFixtureBackend:
             raise LiveExecutorError("SCENARIO_8_PROJECTION_FAILURE_NOT_INJECTED")
         self.reconciler._record_projection_missing(result.request_id)
         recovery = self._fresh_backend()
-        repaired_projection = recovery.reconciler._canonical_projection(
-            result.request_id, source_comment_id=result.source_id
-        )
+        repaired_projection = recovery.reconciler._canonical_projection(result.request_id, source_comment_id=result.source_id)
         repaired_body = render_projection(repaired_projection)
         repaired = recovery.gateway.post_projection(self.issue_number, repaired_body)
         if not recovery.reconciler._record_projection_posted(result.request_id, repaired):
             raise LiveExecutorError("SCENARIO_8_REPAIR_NOT_RECORDED")
         before_orphan_counts = self._counts()
         orphan_request_id = stable_ulid(f"{self.namespace.value}:s8:orphan")
-        orphan_body = render_projection(
-            {
-                **repaired_projection.envelope(),
-                "request_id": orphan_request_id,
-                "source_comment_id": result.source_id + 1000000000,
-            }
-        )
+        orphan_body = render_projection({**repaired_projection.envelope(), "request_id": orphan_request_id, "source_comment_id": result.source_id + 1000000000})
         orphan = self.gateway.post_projection(self.issue_number, orphan_body)
         orphan_comment = DurableComment(orphan.comment_id, orphan_body, orphan.html_url)
         summary = ReconciliationSummary(self.namespace.value)
@@ -2336,39 +2191,13 @@ class LiveFixtureBackend:
         orphan_subject = self.reconciler._orphan_subject(orphan_comment)
         result.projection_url = repaired.html_url
         result.projection_body = repaired_body
-        proof.fault(
-            "fail_projection_post",
-            failing.attempted and failed and repaired.html_url != "",
-            EXPECTED_FAULT_OUTCOMES["fail_projection_post"],
-        )
-        proof.fault(
-            "inject_orphan_projection",
-            orphan.comment_id in summary.orphan_projections_invalidated,
-            EXPECTED_FAULT_OUTCOMES["inject_orphan_projection"],
-        )
-        proof.assertion(
-            0,
-            repaired_projection.canonical_git_ref_sha == result.accepted_ref
-            and repaired_projection.canonical_dolt_commit == result.dolt_commit,
-            f"git={result.accepted_ref} dolt={result.dolt_commit}",
-        )
+        proof.fault("fail_projection_post", failing.attempted and failed and repaired.html_url != "", EXPECTED_FAULT_OUTCOMES["fail_projection_post"])
+        proof.fault("inject_orphan_projection", orphan.comment_id in summary.orphan_projections_invalidated, EXPECTED_FAULT_OUTCOMES["inject_orphan_projection"])
+        proof.assertion(0, repaired_projection.canonical_git_ref_sha == result.accepted_ref and repaired_projection.canonical_dolt_commit == result.dolt_commit, f"git={result.accepted_ref} dolt={result.dolt_commit}")
         expected_subject = f"{CONTROL_REPOSITORY}:issue:{self.issue_number}:projection_comment:{orphan.comment_id}"
         proof.assertion(1, orphan_subject == expected_subject, f"orphan_subject={orphan_subject}")
-        proof.assertion(
-            2,
-            before_orphan_counts == after_orphan_counts and self._request_row(orphan_request_id) is None,
-            "orphan invalidation changed no request/allocation row",
-        )
-        return self._evidence(
-            spec,
-            proof,
-            source_ids=(result.source_id,),
-            base_refs=(base.git_ref_sha,),
-            accepted_refs=(result.accepted_ref,),
-            dolt_commits=(result.dolt_commit,),
-            canonical_rows=(result.canonical_row,),
-            projection_urls=(repaired.html_url,),
-        )
+        proof.assertion(2, before_orphan_counts == after_orphan_counts and self._request_row(orphan_request_id) is None, "orphan invalidation changed no request/allocation row")
+        return self._evidence(spec, proof, source_ids=(result.source_id,), base_refs=(base.git_ref_sha,), accepted_refs=(result.accepted_ref,), dolt_commits=(result.dolt_commit,), canonical_rows=(result.canonical_row,), projection_urls=(repaired.html_url,))
 
     def _scenario_9(self, spec: ScenarioSpec) -> ScenarioEvidence:
         proof = ScenarioProof(spec, self.namespace)
@@ -2376,152 +2205,60 @@ class LiveFixtureBackend:
         base = self._identity()
         pre_counts = self._counts()
         policy = load_policy("policy/actors.json")
-
         pre_edit_request = stable_ulid(f"{self.namespace.value}:s9:pre-edit")
-        original_payload = {
-            "protocol": "beads-allocation/v0.2",
-            "type": "ALLOCATE_TASK",
-            "request_id": pre_edit_request,
-            "agent_id": self.agent_id,
-            "task_id": task_ids[0],
-        }
-        original_body = "/beads-v0.2 " + json.dumps(
-            original_payload, sort_keys=True, separators=(",", ":")
-        )
-        created = self.control_api.post(
-            f"/repos/{CONTROL_REPOSITORY}/issues/{self.issue_number}/comments",
-            {"body": original_body},
-        )
+        original_payload = {"protocol": "beads-allocation/v0.2", "type": "ALLOCATE_TASK", "request_id": pre_edit_request, "agent_id": self.agent_id, "task_id": task_ids[0]}
+        original_body = "/beads-v0.2 " + json.dumps(original_payload, sort_keys=True, separators=(",", ":"))
+        created = self.control_api.post(f"/repos/{CONTROL_REPOSITORY}/issues/{self.issue_number}/comments", {"body": original_body})
         if not isinstance(created, dict) or not isinstance(created.get("id"), int):
             raise LiveExecutorError("SCENARIO_9_PRE_EDIT_CREATE_FAILED")
         pre_edit = int(created["id"])
-
         edited_payload = dict(original_payload)
         edited_payload["task_id"] = task_ids[1]
-        edited_body = "/beads-v0.2 " + json.dumps(
-            edited_payload, sort_keys=True, separators=(",", ":")
-        )
+        edited_body = "/beads-v0.2 " + json.dumps(edited_payload, sort_keys=True, separators=(",", ":"))
         self._edit_comment(pre_edit, edited_body)
-        current_pre_edit = self.control_api.get(
-            f"/repos/{CONTROL_REPOSITORY}/issues/comments/{pre_edit}"
-        )
+        current_pre_edit = self.control_api.get(f"/repos/{CONTROL_REPOSITORY}/issues/comments/{pre_edit}")
         if not isinstance(current_pre_edit, dict):
             raise LiveExecutorError("SCENARIO_9_PRE_EDIT_READ_FAILED")
-        pre_edit_reason = _classify_edited_pre_ingress(
-            current_pre_edit,
-            original_body=original_body,
-            policy=policy,
-        )
+        pre_edit_reason = _classify_edited_pre_ingress(current_pre_edit, original_body=original_body, policy=policy)
         pre_edit_rejected = pre_edit_reason == "SOURCE_COMMENT_EDITED_BEFORE_INGRESS"
-
         pre_delete_request = stable_ulid(f"{self.namespace.value}:s9:pre-delete")
         pre_delete_payload = dict(original_payload)
         pre_delete_payload["request_id"] = pre_delete_request
-        pre_delete_body = "/beads-v0.2 " + json.dumps(
-            pre_delete_payload, sort_keys=True, separators=(",", ":")
-        )
-        pre_delete_created = self.control_api.post(
-            f"/repos/{CONTROL_REPOSITORY}/issues/{self.issue_number}/comments",
-            {"body": pre_delete_body},
-        )
-        if (
-            not isinstance(pre_delete_created, dict)
-            or not isinstance(pre_delete_created.get("id"), int)
-        ):
+        pre_delete_body = "/beads-v0.2 " + json.dumps(pre_delete_payload, sort_keys=True, separators=(",", ":"))
+        pre_delete_created = self.control_api.post(f"/repos/{CONTROL_REPOSITORY}/issues/{self.issue_number}/comments", {"body": pre_delete_body})
+        if not isinstance(pre_delete_created, dict) or not isinstance(pre_delete_created.get("id"), int):
             raise LiveExecutorError("SCENARIO_9_PRE_DELETE_CREATE_FAILED")
         pre_delete = int(pre_delete_created["id"])
         self._delete_comment(pre_delete)
         deleted_view = {item.comment_id for item in self.gateway.list_comments(self.issue_number)}
         pre_delete_absent = pre_delete not in deleted_view
         after_pre_counts = self._counts()
-
         post_edit = self._process(9, 3, request_type="ALLOCATE_TASK", task_id=task_ids[0])
         before_edit = self._allocation(post_edit.allocation_id or "")
-        self._edit_comment(
-            post_edit.source_id,
-            json.dumps({"fixture_mode": FIXTURE_MODE, "post_ingress_edit": True}),
-        )
+        self._edit_comment(post_edit.source_id, json.dumps({"fixture_mode": FIXTURE_MODE, "post_ingress_edit": True}))
         after_edit = self._allocation(post_edit.allocation_id or "")
         post_delete = self._process(9, 4, request_type="ALLOCATE_TASK", task_id=task_ids[1])
         before_delete = self._allocation(post_delete.allocation_id or "")
         self._delete_comment(post_delete.source_id)
         after_delete = self._allocation(post_delete.allocation_id or "")
-
         fresh = self._fresh_backend()
-        mutation_summary = fresh.reconciler.reconcile(
-            f"{self.namespace.value}:scenario-9-source-mutations"
-        )
+        mutation_summary = fresh.reconciler.reconcile(f"{self.namespace.value}:scenario-9-source-mutations")
         edit_marker = f"{post_edit.request_id}:SOURCE_COMMENT_EDITED"
         delete_marker = f"{post_delete.request_id}:SOURCE_COMMENT_DELETED"
-        edit_reported = (
-            edit_marker in mutation_summary.source_mutations
-            and fresh._audit_exists(post_edit.request_id, "SOURCE_COMMENT_EDITED")
-        )
-        delete_reported = (
-            delete_marker in mutation_summary.source_mutations
-            and fresh._audit_exists(post_delete.request_id, "SOURCE_COMMENT_DELETED")
-        )
+        edit_reported = edit_marker in mutation_summary.source_mutations and fresh._audit_exists(post_edit.request_id, "SOURCE_COMMENT_EDITED")
+        delete_reported = delete_marker in mutation_summary.source_mutations and fresh._audit_exists(post_delete.request_id, "SOURCE_COMMENT_DELETED")
         fresh_comments = fresh.gateway.list_comments(self.issue_number)
         durable_urls = {item.html_url for item in fresh_comments}
-        fresh_recovery = (
-            post_edit.projection_url in durable_urls
-            and post_delete.projection_url in durable_urls
-            and not mutation_summary.errors
-        )
-
-        proof.fault(
-            "edit_before_ingress",
-            pre_edit_rejected and pre_counts == after_pre_counts,
-            EXPECTED_FAULT_OUTCOMES["edit_before_ingress"],
-        )
-        proof.fault(
-            "delete_before_ingress",
-            pre_delete_absent and pre_counts == after_pre_counts,
-            EXPECTED_FAULT_OUTCOMES["delete_before_ingress"],
-        )
-        proof.fault(
-            "edit_after_ingress",
-            _sha256(before_edit) == _sha256(after_edit) and edit_reported,
-            EXPECTED_FAULT_OUTCOMES["edit_after_ingress"],
-        )
-        proof.fault(
-            "delete_after_ingress",
-            _sha256(before_delete) == _sha256(after_delete) and delete_reported,
-            EXPECTED_FAULT_OUTCOMES["delete_after_ingress"],
-        )
-        proof.assertion(
-            0,
-            pre_edit_rejected and pre_counts == after_pre_counts,
-            "edited protocol payload parsed and proved authorisable under accepted owner/operator policy; actual edited GitHub source was rejected by the accepted discovery edit boundary",
-        )
-        proof.assertion(
-            1,
-            pre_delete_absent and pre_counts == after_pre_counts,
-            "valid protocol request deleted before discovery is absent and no durable original body is claimed",
-        )
-        proof.assertion(
-            2,
-            _sha256(before_edit) == _sha256(after_edit)
-            and _sha256(before_delete) == _sha256(after_delete)
-            and edit_reported
-            and delete_reported,
-            "post-ingress source mutations left ownership rows byte-identical and accepted reconciliation retained edit/delete audit findings",
-        )
-        proof.assertion(
-            3,
-            fresh_recovery and fresh.memory == {},
-            "fresh backend executed accepted reconciliation and recovered retained projections from GitHub/canonical durability without the original backend memory",
-        )
-        return self._evidence(
-            spec,
-            proof,
-            source_ids=(pre_edit, pre_delete, post_edit.source_id, post_delete.source_id),
-            base_refs=(base.git_ref_sha,),
-            accepted_refs=(post_edit.accepted_ref, post_delete.accepted_ref),
-            dolt_commits=(post_edit.dolt_commit, post_delete.dolt_commit),
-            canonical_rows=(post_edit.canonical_row, post_delete.canonical_row),
-            projection_urls=(post_edit.projection_url, post_delete.projection_url),
-        )
+        fresh_recovery = post_edit.projection_url in durable_urls and post_delete.projection_url in durable_urls and not mutation_summary.errors
+        proof.fault("edit_before_ingress", pre_edit_rejected and pre_counts == after_pre_counts, EXPECTED_FAULT_OUTCOMES["edit_before_ingress"])
+        proof.fault("delete_before_ingress", pre_delete_absent and pre_counts == after_pre_counts, EXPECTED_FAULT_OUTCOMES["delete_before_ingress"])
+        proof.fault("edit_after_ingress", _sha256(before_edit) == _sha256(after_edit) and edit_reported, EXPECTED_FAULT_OUTCOMES["edit_after_ingress"])
+        proof.fault("delete_after_ingress", _sha256(before_delete) == _sha256(after_delete) and delete_reported, EXPECTED_FAULT_OUTCOMES["delete_after_ingress"])
+        proof.assertion(0, pre_edit_rejected and pre_counts == after_pre_counts, "edited protocol payload parsed and proved authorisable under accepted owner/operator policy; actual edited GitHub source was rejected by the accepted discovery edit boundary")
+        proof.assertion(1, pre_delete_absent and pre_counts == after_pre_counts, "valid protocol request deleted before discovery is absent and no durable original body is claimed")
+        proof.assertion(2, _sha256(before_edit) == _sha256(after_edit) and _sha256(before_delete) == _sha256(after_delete) and edit_reported and delete_reported, "post-ingress source mutations left ownership rows byte-identical and accepted reconciliation retained edit/delete audit findings")
+        proof.assertion(3, fresh_recovery and fresh.memory == {}, "fresh backend executed accepted reconciliation and recovered retained projections from GitHub/canonical durability without the original backend memory")
+        return self._evidence(spec, proof, source_ids=(pre_edit, pre_delete, post_edit.source_id, post_delete.source_id), base_refs=(base.git_ref_sha,), accepted_refs=(post_edit.accepted_ref, post_delete.accepted_ref), dolt_commits=(post_edit.dolt_commit, post_delete.dolt_commit), canonical_rows=(post_edit.canonical_row, post_delete.canonical_row), projection_urls=(post_edit.projection_url, post_delete.projection_url))
 
     def _scenario_10(self, spec: ScenarioSpec) -> ScenarioEvidence:
         proof = ScenarioProof(spec, self.namespace)
@@ -2531,40 +2268,17 @@ class LiveFixtureBackend:
         grant_release = self._process(10, 2, request_type="ALLOCATE_TASK", task_id=task_ids[1], project=False)
         if not grant_release.allocation_id:
             raise LiveExecutorError("SCENARIO_10_RELEASE_FIXTURE_GRANT_FAILED")
-        released = self._process(
-            10,
-            3,
-            request_type="RELEASE",
-            allocation_id=grant_release.allocation_id,
-            reason="Workstream D scenario 10 reconstruction release",
-            project=False,
-        )
-        reconstructed, transcript = self._fresh_git_reconstruction(
-            (active.request_id, grant_release.request_id, released.request_id)
-        )
+        released = self._process(10, 3, request_type="RELEASE", allocation_id=grant_release.allocation_id, reason="Workstream D scenario 10 reconstruction release", project=False)
+        reconstructed, transcript = self._fresh_git_reconstruction((active.request_id, grant_release.request_id, released.request_id))
         requests = {str(row.get("request_id")): row for row in reconstructed.get("requests", [])}
-        allocations = {
-            str(row.get("allocation_id")): row for row in reconstructed.get("allocations", [])
-        }
-        history_ok = (
-            active.request_id in requests
-            and released.request_id in requests
-            and active.allocation_id in allocations
-            and grant_release.allocation_id in allocations
-            and allocations[str(active.allocation_id)].get("state") == "ACTIVE"
-            and allocations[str(grant_release.allocation_id)].get("state") == "RELEASED"
-            and transcript.clean_environment
-            and not transcript.prohibited_capabilities_used
-        )
-
+        allocations = {str(row.get("allocation_id")): row for row in reconstructed.get("allocations", [])}
+        history_ok = active.request_id in requests and released.request_id in requests and active.allocation_id in allocations and grant_release.allocation_id in allocations and allocations[str(active.allocation_id)].get("state") == "ACTIVE" and allocations[str(grant_release.allocation_id)].get("state") == "RELEASED" and transcript.clean_environment and not transcript.prohibited_capabilities_used
         mismatch = self.repository.bootstrap()
         try:
             store = self.repository.store(mismatch)
             store.begin()
             try:
-                store.connection.execute(
-                    "UPDATE issues SET assignee = NULL WHERE id = ?", (task_ids[0],)
-                )
+                store.connection.execute("UPDATE issues SET assignee = NULL WHERE id = ?", (task_ids[0],))
                 store.commit()
                 self.repository.publish(mismatch.identity.git_ref_sha, mismatch)
             except Exception:
@@ -2574,71 +2288,26 @@ class LiveFixtureBackend:
             mismatch.close()
         mismatch_detected = not self._mirrors_valid((task_ids[0],))
         mismatch_recovery = self._fresh_backend()
-        mismatch_summary = mismatch_recovery.reconciler.reconcile(
-            f"{self.namespace.value}:scenario-10-mismatch"
-        )
-        audit_retained = mismatch_recovery._audit_exists(
-            active.request_id, "CANONICAL_OWNERSHIP_MISMATCH"
-        )
+        mismatch_summary = mismatch_recovery.reconciler.reconcile(f"{self.namespace.value}:scenario-10-mismatch")
+        audit_retained = mismatch_recovery._audit_exists(active.request_id, "CANONICAL_OWNERSHIP_MISMATCH")
         active_rows = self._allocations_for_tasks((task_ids[0],))
-        retained_fail_closed = (
-            active.request_id in mismatch_summary.ownership_mismatches
-            and audit_retained
-            and not mismatch_summary.errors
-            and not self._mirrors_valid((task_ids[0],))
-        )
-        proof.fault(
-            "inject_mirror_mismatch",
-            mismatch_detected and retained_fail_closed,
-            EXPECTED_FAULT_OUTCOMES["inject_mirror_mismatch"],
-        )
-        proof.assertion(
-            0,
-            history_ok,
-            "credential-free fresh Git-capable client reconstructs active ownership plus released allocation/request history through an exact read-only mirror of the GitHub canonical ref",
-        )
-        proof.assertion(
-            1,
-            mismatch_detected and retained_fail_closed,
-            "durable mirror mismatch was detected by accepted reconciliation and retained CANONICAL_OWNERSHIP_MISMATCH audit evidence without automatic repair",
-        )
-        proof.assertion(
-            2,
-            len(active_rows) == 1 and active_rows[0].get("allocation_id") == active.allocation_id,
-            "singular active allocation row remains authority while the mismatched mirror stays fail-closed",
-        )
+        retained_fail_closed = active.request_id in mismatch_summary.ownership_mismatches and audit_retained and not mismatch_summary.errors and not self._mirrors_valid((task_ids[0],))
+        proof.fault("inject_mirror_mismatch", mismatch_detected and retained_fail_closed, EXPECTED_FAULT_OUTCOMES["inject_mirror_mismatch"])
+        proof.assertion(0, history_ok, "credential-free fresh Git-capable client reconstructs active ownership plus released allocation/request history through an exact read-only mirror of the GitHub canonical ref")
+        proof.assertion(1, mismatch_detected and retained_fail_closed, "durable mirror mismatch was detected by accepted reconciliation and retained CANONICAL_OWNERSHIP_MISMATCH audit evidence without automatic repair")
+        proof.assertion(2, len(active_rows) == 1 and active_rows[0].get("allocation_id") == active.allocation_id, "singular active allocation row remains authority while the mismatched mirror stays fail-closed")
         final = self._identity()
-        return self._evidence(
-            spec,
-            proof,
-            base_refs=(base.git_ref_sha,),
-            accepted_refs=(final.git_ref_sha,),
-            dolt_commits=(final.dolt_commit,),
-            canonical_rows=(_sha256(reconstructed),),
-            clients=(transcript,),
-        )
+        return self._evidence(spec, proof, base_refs=(base.git_ref_sha,), accepted_refs=(final.git_ref_sha,), dolt_commits=(final.dolt_commit,), canonical_rows=(_sha256(reconstructed),), clients=(transcript,))
 
     def _scenario_11(self, spec: ScenarioSpec) -> ScenarioEvidence:
         proof = ScenarioProof(spec, self.namespace)
         task_id = self._seed(11, 1)[0]
         result = self._process(11, 1, request_type="ALLOCATE_TASK", task_id=task_id)
-        projection, transcript = self._consume_projection_api_only(
-            self.gateway, self.issue_number, result.projection_url
-        )
+        projection, transcript = self._consume_projection_api_only(self.gateway, self.issue_number, result.projection_url)
         proof.assertion(0, transcript.prohibited_capabilities_used == (), "API-only helper receives only issue gateway and URL")
         proof.assertion(1, projection.get("execution_may_begin") is True, "execution_may_begin=true")
-        proof.assertion(
-            2,
-            bool(projection.get("release_instruction")) and bool(projection.get("allocation_id")),
-            "release_instruction and allocation_id are present",
-        )
-        return self._evidence(
-            spec,
-            proof,
-            source_ids=(result.source_id,),
-            projection_urls=(result.projection_url,),
-            clients=(transcript,),
-        )
+        proof.assertion(2, bool(projection.get("release_instruction")) and bool(projection.get("allocation_id")), "release_instruction and allocation_id are present")
+        return self._evidence(spec, proof, source_ids=(result.source_id,), projection_urls=(result.projection_url,), clients=(transcript,))
 
     def _scenario_12(self, spec: ScenarioSpec) -> ScenarioEvidence:
         proof = ScenarioProof(spec, self.namespace)
@@ -2647,84 +2316,33 @@ class LiveFixtureBackend:
         granted = self._process(12, 1, request_type="ALLOCATE_TASK", task_id=task_id, project=False)
         if not granted.allocation_id:
             raise LiveExecutorError("SCENARIO_12_GRANT_FAILED")
-        released = self._process(
-            12,
-            2,
-            request_type="RELEASE",
-            allocation_id=granted.allocation_id,
-            reason="Workstream D synthetic fixture release",
-        )
+        released = self._process(12, 2, request_type="RELEASE", allocation_id=granted.allocation_id, reason="Workstream D synthetic fixture release")
         allocation = self._allocation(granted.allocation_id)
         release_request = self._request_row(released.request_id)
         mirror_ok = self._mirrors_valid((task_id,))
         rows = self._allocations_for_tasks((task_id,))
-        proof.assertion(
-            0,
-            release_request is not None
-            and allocation.get("release_request_id") == released.request_id
-            and released.reason == "RELEASED",
-            f"release_request={released.request_id} reason={released.reason}",
-        )
-        proof.assertion(
-            1,
-            len(rows) == 1 and allocation.get("state") == "RELEASED",
-            "grant allocation row remains retained in RELEASED state",
-        )
-        proof.assertion(
-            2,
-            mirror_ok and allocation.get("state") == "RELEASED",
-            "released state and Beads ownership mirror agree after atomic release",
-        )
-        return self._evidence(
-            spec,
-            proof,
-            source_ids=(released.source_id,),
-            base_refs=(base.git_ref_sha,),
-            accepted_refs=(released.accepted_ref,),
-            dolt_commits=(released.dolt_commit,),
-            canonical_rows=(released.canonical_row,),
-            projection_urls=(released.projection_url,),
-            cleanup="released",
-        )
+        proof.assertion(0, release_request is not None and allocation.get("release_request_id") == released.request_id and released.reason == "RELEASED", f"release_request={released.request_id} reason={released.reason}")
+        proof.assertion(1, len(rows) == 1 and allocation.get("state") == "RELEASED", "grant allocation row remains retained in RELEASED state")
+        proof.assertion(2, mirror_ok and allocation.get("state") == "RELEASED", "released state and Beads ownership mirror agree after atomic release")
+        return self._evidence(spec, proof, source_ids=(released.source_id,), base_refs=(base.git_ref_sha,), accepted_refs=(released.accepted_ref,), dolt_commits=(released.dolt_commit,), canonical_rows=(released.canonical_row,), projection_urls=(released.projection_url,), cleanup="released")
 
     def _scenario_13(self, spec: ScenarioSpec) -> ScenarioEvidence:
         proof = ScenarioProof(spec, self.namespace)
         source, _ = self._post_source(13, 1, "authorisation-and-token-scope")
         base_policy = load_policy("policy/actors.json")
-        auth_controls = {
-            "missing_comment_app_attribution",
-            "wrong_comment_app_id",
-            "wrong_comment_app_slug",
-            "wrong_bot_id",
-            "wrong_bot_login",
-            "misleading_event_installation",
-            "human_namespace_impersonation",
-        }
+        auth_controls = {"missing_comment_app_attribution", "wrong_comment_app_id", "wrong_comment_app_slug", "wrong_bot_id", "wrong_bot_login", "misleading_event_installation", "human_namespace_impersonation"}
         installation_controls = {"wrong_installation_mapping", "lost_control_repository_access"}
-        inventory_controls = {
-            "inventory_additional_repository",
-            "inventory_missing_repository",
-            "inventory_stale_after_settings_change",
-        }
-        token_controls = {
-            "token_repository_restriction_omitted",
-            "token_permission_restriction_omitted",
-            "default_token_request",
-            "multi_repository_token_request",
-            "unapproved_permission_request",
-        }
+        inventory_controls = {"inventory_additional_repository", "inventory_missing_repository", "inventory_stale_after_settings_change"}
+        token_controls = {"token_repository_restriction_omitted", "token_permission_restriction_omitted", "default_token_request", "multi_repository_token_request", "unapproved_permission_request"}
         seen_auth: set[str] = set()
         no_state_access: dict[str, bool] = {}
         inventory_rejected: set[str] = set()
         token_rejected: set[str] = set()
         unauthorised_release_no_mutation = False
-
         for control in SCENARIO_13_FAULT_CONTROLS:
             condition = False
             if control in auth_controls:
-                detail = _exercise_authorisation_negative(
-                    control, namespace=self.namespace, base_policy=base_policy
-                )
+                detail = _exercise_authorisation_negative(control, namespace=self.namespace, base_policy=base_policy)
                 seen_auth.add(control)
                 condition = bool(detail)
             elif control in installation_controls:
@@ -2742,21 +2360,9 @@ class LiveFixtureBackend:
                 else:
                     ids = att.repository_ids
                     audited_at = datetime(2000, 1, 1, tzinfo=timezone.utc)
-                bad = InventoryAttestation(
-                    att.app_id,
-                    att.installation_id,
-                    "selected",
-                    tuple(ids),
-                    audited_at,
-                )
+                bad = InventoryAttestation(att.app_id, att.installation_id, "selected", tuple(ids), audited_at)
                 try:
-                    bad.validate(
-                        app_id=att.app_id,
-                        installation_id=att.installation_id,
-                        expected_repository_ids={CONTROL_REPOSITORY_ID, STATE_REPOSITORY_ID},
-                        now=datetime.now(timezone.utc),
-                        max_age_seconds=INVENTORY_MAX_AGE_SECONDS,
-                    )
+                    bad.validate(app_id=att.app_id, installation_id=att.installation_id, expected_repository_ids={CONTROL_REPOSITORY_ID, STATE_REPOSITORY_ID}, now=datetime.now(timezone.utc), max_age_seconds=INVENTORY_MAX_AGE_SECONDS)
                 except InventoryError:
                     inventory_rejected.add(control)
                     condition = True
@@ -2780,14 +2386,7 @@ class LiveFixtureBackend:
             elif control == "returned_scope_mismatch":
                 profile = control_profile(CONTROL_REPOSITORY_ID)
                 try:
-                    validate_token_response(
-                        {
-                            "repositories": [{"id": STATE_REPOSITORY_ID}],
-                            "permissions": profile.permissions,
-                            "token": "fixture",
-                        },
-                        profile,
-                    )
+                    validate_token_response({"repositories": [{"id": STATE_REPOSITORY_ID}], "permissions": profile.permissions, "token": "fixture"}, profile)
                 except CredentialPolicyError:
                     condition = True
             elif control == "control_token_cross_repository_access":
@@ -2798,87 +2397,29 @@ class LiveFixtureBackend:
                 snapshot = self.repository.bootstrap()
                 store = self.repository.store(snapshot)
                 before = _sha256(store.reconstruct())
-                command = AllocationCommand(
-                    stable_ulid(f"{self.namespace.value}:s13:unauthorised-release"),
-                    "RELEASE",
-                    hashlib.sha256(b"s13-unauthorised-release").hexdigest(),
-                    "agent://human/not-authorised/session/s13",
-                    allocation_id=stable_ulid(f"{self.namespace.value}:s13:missing-allocation"),
-                    reason="synthetic unauthorised release",
-                )
-                context = RequestContext(
-                    CONTROL_REPOSITORY,
-                    self.issue_number,
-                    source,
-                    "fixture",
-                    self.agent_id,
-                )
+                command = AllocationCommand(stable_ulid(f"{self.namespace.value}:s13:unauthorised-release"), "RELEASE", hashlib.sha256(b"s13-unauthorised-release").hexdigest(), "agent://human/not-authorised/session/s13", allocation_id=stable_ulid(f"{self.namespace.value}:s13:missing-allocation"), reason="synthetic unauthorised release")
+                context = RequestContext(CONTROL_REPOSITORY, self.issue_number, source, "fixture", self.agent_id)
                 try:
                     store.begin()
-                    result = AllocationService(self.repository, clock=lambda: NOW)._apply(
-                        store, command, context, NOW
-                    )
+                    result = AllocationService(self.repository, clock=lambda: NOW)._apply(store, command, context, NOW)
                     store.rollback()
                     after = _sha256(store.reconstruct())
-                    unauthorised_release_no_mutation = (
-                        result.reason_code == "AGENT_NOT_AUTHORISED" and before == after
-                    )
+                    unauthorised_release_no_mutation = result.reason_code == "AGENT_NOT_AUTHORISED" and before == after
                     condition = unauthorised_release_no_mutation
                 finally:
                     snapshot.close()
             else:
                 raise LiveExecutorError(f"UNHANDLED_SCENARIO_13_CONTROL:{control}")
             proof.fault(control, condition, EXPECTED_FAULT_OUTCOMES[control])
-
         control_profile_record, state_profile_record = self.token_scope_records
-        proof.assertion(
-            0,
-            len(proof.fault_records) == len(SCENARIO_13_FAULT_CONTROLS)
-            and tuple(proof.fault_records) == SCENARIO_13_FAULT_CONTROLS,
-            f"typed_fault_count={len(proof.fault_records)}",
-        )
-        proof.assertion(
-            1,
-            seen_auth == auth_controls,
-            "all static identity negatives executed through pure authorise fixtures with no credential callback",
-        )
-        proof.assertion(
-            2,
-            all(no_state_access.get(control, False) for control in installation_controls),
-            "wrong-installation and lost-access fixtures made zero token-mint and canonical-access calls",
-        )
-        proof.assertion(
-            3,
-            set(self.inventory.attestation.repository_ids)
-            == {CONTROL_REPOSITORY_ID, STATE_REPOSITORY_ID}
-            and len(self.inventory.attestation.repository_ids) == 2,
-            f"repository_ids={self.inventory.attestation.repository_ids}",
-        )
-        proof.assertion(
-            4,
-            control_profile_record.requested_repository_ids == (CONTROL_REPOSITORY_ID,)
-            and state_profile_record.requested_repository_ids == (STATE_REPOSITORY_ID,)
-            and control_profile_record.returned_scope_validated
-            and state_profile_record.returned_scope_validated,
-            "control/state scope records are exact, single-repository and validated",
-        )
-        proof.assertion(
-            5,
-            control_profile_record.cross_repository_denied
-            and state_profile_record.cross_repository_denied,
-            "both live token probes denied cross-repository capability",
-        )
-        proof.assertion(
-            6,
-            token_rejected == token_controls,
-            f"rejected_token_controls={sorted(token_rejected)}",
-        )
-        proof.assertion(
-            7,
-            unauthorised_release_no_mutation
-            and "human_namespace_impersonation" in seen_auth,
-            "unauthorised release and human namespace fixtures produced no ownership mutation",
-        )
+        proof.assertion(0, len(proof.fault_records) == len(SCENARIO_13_FAULT_CONTROLS) and tuple(proof.fault_records) == SCENARIO_13_FAULT_CONTROLS, f"typed_fault_count={len(proof.fault_records)}")
+        proof.assertion(1, seen_auth == auth_controls, "all static identity negatives executed through pure authorise fixtures with no credential callback")
+        proof.assertion(2, all(no_state_access.get(control, False) for control in installation_controls), "wrong-installation and lost-access fixtures made zero token-mint and canonical-access calls")
+        proof.assertion(3, set(self.inventory.attestation.repository_ids) == {CONTROL_REPOSITORY_ID, STATE_REPOSITORY_ID} and len(self.inventory.attestation.repository_ids) == 2, f"repository_ids={self.inventory.attestation.repository_ids}")
+        proof.assertion(4, control_profile_record.requested_repository_ids == (CONTROL_REPOSITORY_ID,) and state_profile_record.requested_repository_ids == (STATE_REPOSITORY_ID,) and control_profile_record.returned_scope_validated and state_profile_record.returned_scope_validated, "control/state scope records are exact, single-repository and validated")
+        proof.assertion(5, control_profile_record.cross_repository_denied and state_profile_record.cross_repository_denied, "both live token probes denied cross-repository capability")
+        proof.assertion(6, token_rejected == token_controls, f"rejected_token_controls={sorted(token_rejected)}")
+        proof.assertion(7, unauthorised_release_no_mutation and "human_namespace_impersonation" in seen_auth, "unauthorised release and human namespace fixtures produced no ownership mutation")
         return self._evidence(spec, proof, source_ids=(source,), scenario13=True)
 
     def _scenario_14(self, spec: ScenarioSpec) -> ScenarioEvidence:
@@ -2888,45 +2429,13 @@ class LiveFixtureBackend:
         base = self._identity()
         result = self._process(14, 1, request_type="ALLOCATE_TASK", task_id=task_id)
         reconstructed, git_transcript = self._fresh_git_reconstruction((result.request_id,))
-        projection, api_transcript = self._consume_projection_api_only(
-            self.gateway, self.issue_number, result.projection_url
-        )
+        projection, api_transcript = self._consume_projection_api_only(self.gateway, self.issue_number, result.projection_url)
         final = self._identity()
-        github_durability = (
-            self._request_row(result.request_id) is not None
-            and projection.get("request_id") == result.request_id
-            and final.git_ref_sha != ""
-        )
-        proof.assertion(
-            0,
-            frozenset(DURABILITY)
-            == frozenset({"github_issue", "github_repository", "github_ref", "github_actions"}),
-            f"durability_records={DURABILITY}",
-        )
-        proof.assertion(
-            1,
-            prior_complete and github_durability,
-            "scenarios 1-13 already returned validated evidence and scenario 14 retained evidence is GitHub-readable",
-        )
-        proof.assertion(
-            2,
-            git_transcript.clean_environment
-            and api_transcript.clean_environment
-            and not git_transcript.prohibited_capabilities_used
-            and not api_transcript.prohibited_capabilities_used,
-            "only canonical GitHub durability is referenced; runner workspace/cache/artifacts are absent from authority records",
-        )
-        return self._evidence(
-            spec,
-            proof,
-            base_refs=(base.git_ref_sha,),
-            accepted_refs=(result.accepted_ref,),
-            dolt_commits=(result.dolt_commit,),
-            canonical_rows=(_sha256(reconstructed),),
-            projection_urls=(result.projection_url,),
-            clients=(git_transcript, api_transcript),
-            network=NETWORK_DESTINATIONS,
-        )
+        github_durability = self._request_row(result.request_id) is not None and projection.get("request_id") == result.request_id and final.git_ref_sha != ""
+        proof.assertion(0, frozenset(DURABILITY) == frozenset({"github_issue", "github_repository", "github_ref", "github_actions"}), f"durability_records={DURABILITY}")
+        proof.assertion(1, prior_complete and github_durability, "scenarios 1-13 already returned validated evidence and scenario 14 retained evidence is GitHub-readable")
+        proof.assertion(2, git_transcript.clean_environment and api_transcript.clean_environment and not git_transcript.prohibited_capabilities_used and not api_transcript.prohibited_capabilities_used, "only canonical GitHub durability is referenced; runner workspace/cache/artifacts are absent from authority records")
+        return self._evidence(spec, proof, base_refs=(base.git_ref_sha,), accepted_refs=(result.accepted_ref,), dolt_commits=(result.dolt_commit,), canonical_rows=(_sha256(reconstructed),), projection_urls=(result.projection_url,), clients=(git_transcript, api_transcript), network=NETWORK_DESTINATIONS)
 
 
 @dataclass(frozen=True)
@@ -2988,12 +2497,7 @@ def execute_live_suite(values: Mapping[str, str] | None = None) -> LiveSuiteResu
         lease, inventory = acquire_credentials(env, context)
         with tempfile.TemporaryDirectory(prefix=f"{namespace.value}-") as directory:
             root = Path(directory)
-            fixture = bootstrap_fixture_repository(
-                lease.state_token,
-                root=root,
-                bd_bin=env["BD_BIN"],
-                dolt_bin=env["DOLT_BIN"],
-            )
+            fixture = bootstrap_fixture_repository(lease.state_token, root=root, bd_bin=env["BD_BIN"], dolt_bin=env["DOLT_BIN"])
             backend = LiveFixtureBackend(
                 fixture.repository,
                 GitHubAPI(lease.control_token, lease.api_url),
@@ -3005,18 +2509,8 @@ def execute_live_suite(values: Mapping[str, str] | None = None) -> LiveSuiteResu
                 namespace,
                 fixture.make_read_only_remote,
             )
-            records = ScenarioDriver(backend).run(
-                SCENARIO_IDS,
-                namespace,
-                expected_trusted_sha=context.trusted_sha,
-                expected_protocol_sha=context.protocol_sha,
-            )
-            summary = evidence_summary(
-                records,
-                attempt_namespace=namespace,
-                expected_trusted_sha=context.trusted_sha,
-                expected_protocol_sha=context.protocol_sha,
-            )
+            records = ScenarioDriver(backend).run(SCENARIO_IDS, namespace, expected_trusted_sha=context.trusted_sha, expected_protocol_sha=context.protocol_sha)
+            summary = evidence_summary(records, attempt_namespace=namespace, expected_trusted_sha=context.trusted_sha, expected_protocol_sha=context.protocol_sha)
             if summary["scenarios"] != 14 or summary["workstream_e_authorised"]:
                 raise LiveExecutorError("UNEXPECTED_WORKSTREAM_D_SUMMARY")
             result = LiveSuiteResult(
@@ -3026,10 +2520,7 @@ def execute_live_suite(values: Mapping[str, str] | None = None) -> LiveSuiteResu
                 context.trusted_sha,
                 context.protocol_sha,
                 len(records),
-                tuple(
-                    hashlib.sha256(record.to_json().encode()).hexdigest()
-                    for record in records
-                ),
+                tuple(hashlib.sha256(record.to_json().encode()).hexdigest() for record in records),
                 inventory.digest,
                 True,
                 True,
@@ -3037,11 +2528,7 @@ def execute_live_suite(values: Mapping[str, str] | None = None) -> LiveSuiteResu
             backend.gateway.post_summary(
                 backend.issue_number,
                 json.dumps(
-                    {
-                        "type": "WORKSTREAM_D_SYNTHETIC_LIVE_RESULT",
-                        "status": "PENDING_CREDENTIAL_REVOCATION_AND_ENABLEMENT_REMOVAL",
-                        **result.payload(),
-                    },
+                    {"type": "WORKSTREAM_D_SYNTHETIC_LIVE_RESULT", "status": "PENDING_CREDENTIAL_REVOCATION_AND_ENABLEMENT_REMOVAL", **result.payload()},
                     sort_keys=True,
                     separators=(",", ":"),
                 ),
@@ -3067,6 +2554,25 @@ def execute_live_suite(values: Mapping[str, str] | None = None) -> LiveSuiteResu
             raise primary_error
 
 
+def _safe_live_failure(exc: Exception) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "status": "BLOCKED",
+        "credential_material_emitted": False,
+        "workstream_e_authorised": False,
+    }
+    if isinstance(exc, GitHubAPIError):
+        payload.update(exc.safe_diagnostic())
+        if exc.rate_limited:
+            payload["reason_code"] = "GITHUB_RATE_LIMITED"
+        elif exc.status == 403:
+            payload["reason_code"] = "GITHUB_API_FORBIDDEN"
+        else:
+            payload["reason_code"] = f"GITHUB_API_HTTP_{exc.status}"
+        return payload
+    payload["reason_code"] = str(exc).split(":", 1)[0] or type(exc).__name__
+    return payload
+
+
 def main() -> int:
     try:
         result = execute_live_suite()
@@ -3076,18 +2582,7 @@ def main() -> int:
         print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
         return 0
     except Exception as exc:
-        print(
-            json.dumps(
-                {
-                    "status": "BLOCKED",
-                    "reason_code": str(exc).split(":", 1)[0] or type(exc).__name__,
-                    "credential_material_emitted": False,
-                    "workstream_e_authorised": False,
-                },
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-        )
+        print(json.dumps(_safe_live_failure(exc), sort_keys=True, separators=(",", ":")))
         return 1
 
 
