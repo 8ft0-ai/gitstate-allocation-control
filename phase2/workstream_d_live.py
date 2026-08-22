@@ -89,6 +89,8 @@ FIXTURE_MODE = "workstream-d-synthetic-fixture-v1"
 INVENTORY_MAX_AGE_SECONDS = 15 * 60
 CLOSE_TIMED_MAX_SECONDS = 30.0
 POST_ALLOCATION_READ_MAX_STALE_RETRIES = 3
+SCENARIO_3_FIXTURE_PAGE_SIZE = 2
+SCENARIO_3_FILLER_COUNT = 2
 LIVE_EXECUTABLE_PATHS = (
     ".github/workflows/phase2-adversarial.yml",
     "phase2/adversarial.py",
@@ -1165,11 +1167,16 @@ class LiveFixtureBackend:
     inventory: ValidatedInventory
     namespace: AttemptNamespace
     read_only_remote_factory: Callable[[Path], tuple[Path, str]] | None = None
+    comment_page_size: int = 100
     memory: dict[str, _ResultRecord] = field(default_factory=dict)
     executed_records: dict[int, ScenarioEvidence] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        self.gateway = GitHubIssueGateway(self.control_api, CONTROL_REPOSITORY)
+        self.gateway = GitHubIssueGateway(
+            self.control_api,
+            CONTROL_REPOSITORY,
+            page_size=self.comment_page_size,
+        )
         self.reconciler = ReconciliationService(
             self.repository,
             self.gateway,
@@ -1184,7 +1191,12 @@ class LiveFixtureBackend:
     def agent_id(self) -> str:
         return f"agent://operator/8ft0-ai/session/{self.namespace.value}"
 
-    def _fresh_backend(self, repository: Any | None = None) -> "LiveFixtureBackend":
+    def _fresh_backend(
+        self,
+        repository: Any | None = None,
+        *,
+        comment_page_size: int | None = None,
+    ) -> "LiveFixtureBackend":
         return LiveFixtureBackend(
             repository or self.repository,
             self.control_api,
@@ -1195,6 +1207,7 @@ class LiveFixtureBackend:
             self.inventory,
             self.namespace,
             self.read_only_remote_factory,
+            self.comment_page_size if comment_page_size is None else comment_page_size,
         )
 
     def _fixture_body(self, scenario: int, index: int, operation: str) -> str:
@@ -1941,13 +1954,13 @@ class LiveFixtureBackend:
 
         filler_ids = tuple(
             self._post_source(3, 1000 + index, "pagination-fixture")[0]
-            for index in range(101)
+            for index in range(SCENARIO_3_FILLER_COUNT)
         )
-        recovery = self._fresh_backend()
-        listed = {
-            item.comment_id
-            for item in recovery.gateway.list_comments(self.issue_number)
-        }
+        recovery = self._fresh_backend(
+            comment_page_size=SCENARIO_3_FIXTURE_PAGE_SIZE
+        )
+        listed_comments = recovery.gateway.list_comments(self.issue_number)
+        listed = {item.comment_id for item in listed_comments}
         retained_after_cancel = sources[2][0] in listed
         recovered: dict[str, _ResultRecord] = {}
 
@@ -1982,8 +1995,10 @@ class LiveFixtureBackend:
         if third is None:
             raise LiveExecutorError("SCENARIO_3_RECONCILIATION_DID_NOT_RECOVER_SOURCE")
         records = (first, second, third)
-        pagination_complete = all(item in listed for item in filler_ids) and all(
-            source[0] in listed for source in sources
+        pagination_complete = (
+            len(listed_comments) > SCENARIO_3_FIXTURE_PAGE_SIZE
+            and all(item in listed for item in filler_ids)
+            and all(source[0] in listed for source in sources)
         )
         accepted_recovery = (
             sources[2][0] in recovery_summary.unprocessed_comments
@@ -2010,7 +2025,10 @@ class LiveFixtureBackend:
         proof.assertion(
             0,
             pagination_complete,
-            f"listed_filler_count={sum(item in listed for item in filler_ids)}",
+            (
+                f"fixture_page_size={SCENARIO_3_FIXTURE_PAGE_SIZE} "
+                f"listed_filler_count={sum(item in listed for item in filler_ids)}"
+            ),
         )
         proof.assertion(
             1,
@@ -3067,6 +3085,25 @@ def execute_live_suite(values: Mapping[str, str] | None = None) -> LiveSuiteResu
             raise primary_error
 
 
+def _safe_live_failure(exc: Exception) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "status": "BLOCKED",
+        "credential_material_emitted": False,
+        "workstream_e_authorised": False,
+    }
+    if isinstance(exc, GitHubAPIError):
+        payload.update(exc.safe_diagnostic())
+        if exc.rate_limited:
+            payload["reason_code"] = "GITHUB_RATE_LIMITED"
+        elif exc.status == 403:
+            payload["reason_code"] = "GITHUB_API_FORBIDDEN"
+        else:
+            payload["reason_code"] = f"GITHUB_API_HTTP_{exc.status}"
+        return payload
+    payload["reason_code"] = str(exc).split(":", 1)[0] or type(exc).__name__
+    return payload
+
+
 def main() -> int:
     try:
         result = execute_live_suite()
@@ -3078,12 +3115,7 @@ def main() -> int:
     except Exception as exc:
         print(
             json.dumps(
-                {
-                    "status": "BLOCKED",
-                    "reason_code": str(exc).split(":", 1)[0] or type(exc).__name__,
-                    "credential_material_emitted": False,
-                    "workstream_e_authorised": False,
-                },
+                _safe_live_failure(exc),
                 sort_keys=True,
                 separators=(",", ":"),
             )
