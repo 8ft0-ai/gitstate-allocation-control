@@ -8,15 +8,59 @@ from typing import Any
 
 
 API_VERSION = "2022-11-28"
+ERROR_BODY_MAX_BYTES = 2048
+ERROR_MESSAGE_MAX_CHARS = 500
+RATE_LIMIT_HEADER_MAX_CHARS = 64
+
+
+def _bounded_header(headers: dict[str, str], name: str) -> str | None:
+    value = headers.get(name)
+    if value is None:
+        return None
+    return str(value)[:RATE_LIMIT_HEADER_MAX_CHARS]
+
+
+def _is_rate_limited(status: int, message: str, headers: dict[str, str]) -> bool:
+    if status == 429:
+        return True
+    if status != 403:
+        return False
+    if headers.get("retry-after"):
+        return True
+    if headers.get("x-ratelimit-remaining") == "0":
+        return True
+    lowered = message.lower()
+    return "rate limit" in lowered or "secondary rate" in lowered
 
 
 @dataclass
 class GitHubAPIError(RuntimeError):
     status: int
     message: str
+    retry_after: str | None = None
+    rate_limit_remaining: str | None = None
+    rate_limit_reset: str | None = None
+    rate_limited: bool = False
 
     def __str__(self) -> str:
         return f"GitHub API returned HTTP {self.status}: {self.message}"
+
+    def safe_diagnostic(self) -> dict[str, object]:
+        diagnostic: dict[str, object] = {
+            "http_status": self.status,
+            "rate_limited": self.rate_limited,
+        }
+        if self.retry_after is not None:
+            diagnostic["retry_after"] = self.retry_after[:RATE_LIMIT_HEADER_MAX_CHARS]
+        if self.rate_limit_remaining is not None:
+            diagnostic["rate_limit_remaining"] = self.rate_limit_remaining[
+                :RATE_LIMIT_HEADER_MAX_CHARS
+            ]
+        if self.rate_limit_reset is not None:
+            diagnostic["rate_limit_reset"] = self.rate_limit_reset[
+                :RATE_LIMIT_HEADER_MAX_CHARS
+            ]
+        return diagnostic
 
 
 class GitHubAPI:
@@ -52,8 +96,21 @@ class GitHubAPI:
                     int(response.status),
                 )
         except urllib.error.HTTPError as exc:
-            payload = exc.read().decode("utf-8", "replace")
-            raise GitHubAPIError(exc.code, payload[:500]) from exc
+            payload = exc.read(ERROR_BODY_MAX_BYTES).decode("utf-8", "replace")
+            message = payload[:ERROR_MESSAGE_MAX_CHARS]
+            response_headers = {
+                key.lower(): value for key, value in (exc.headers.items() if exc.headers else ())
+            }
+            raise GitHubAPIError(
+                exc.code,
+                message,
+                retry_after=_bounded_header(response_headers, "retry-after"),
+                rate_limit_remaining=_bounded_header(
+                    response_headers, "x-ratelimit-remaining"
+                ),
+                rate_limit_reset=_bounded_header(response_headers, "x-ratelimit-reset"),
+                rate_limited=_is_rate_limited(exc.code, message, response_headers),
+            ) from exc
 
     def request(
         self,
