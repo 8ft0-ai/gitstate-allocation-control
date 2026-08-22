@@ -21,7 +21,7 @@ from .credentials import (
     state_profile,
     verify_live_installation,
 )
-from .github_api import GitHubAPI
+from .github_api import GitHubAPI, GitHubAPIError
 from .inventory import InventoryAttestation
 from .operator_capsule import (
     LIVE_PROFILE,
@@ -359,7 +359,15 @@ def _blocked_payload(exc: Exception) -> dict[str, object]:
         "credential_material_emitted": False,
         "workstream_e_authorised": False,
     }
-    if isinstance(exc, live.CommandFailure):
+    if isinstance(exc, GitHubAPIError):
+        payload.update(exc.safe_diagnostic())
+        if exc.rate_limited:
+            payload["reason_code"] = "GITHUB_RATE_LIMITED"
+        elif exc.status == 403:
+            payload["reason_code"] = "GITHUB_API_FORBIDDEN"
+        else:
+            payload["reason_code"] = f"GITHUB_API_HTTP_{exc.status}"
+    elif isinstance(exc, live.CommandFailure):
         payload["reason_code"] = exc.reason_code
         payload.update(exc.safe_diagnostic())
     elif isinstance(exc, live.FixtureBootstrapFailure):

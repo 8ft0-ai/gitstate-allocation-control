@@ -18,14 +18,24 @@ REPOSITORY_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 
 class GitHubIssueGateway:
-    def __init__(self, api: GitHubAPI, repository: str, *, max_pages: int = 1000) -> None:
+    def __init__(
+        self,
+        api: GitHubAPI,
+        repository: str,
+        *,
+        max_pages: int = 1000,
+        page_size: int = 100,
+    ) -> None:
         if not REPOSITORY_RE.fullmatch(repository):
             raise ValueError("invalid repository")
         if max_pages <= 0:
             raise ValueError("max_pages must be positive")
+        if page_size <= 0 or page_size > 100:
+            raise ValueError("page_size must be between 1 and 100")
         self.api = api
         self.repository = repository
         self.max_pages = max_pages
+        self.page_size = page_size
 
     @property
     def _base(self) -> str:
@@ -49,11 +59,11 @@ class GitHubIssueGateway:
         page = 1
         while True:
             value = self.api.get(
-                f"{self._base}/issues/{issue_number}/comments?per_page=100&page={page}"
+                f"{self._base}/issues/{issue_number}/comments?per_page={self.page_size}&page={page}"
             )
             if not isinstance(value, list):
                 raise ValueError("GitHub comments response is not a list")
-            if len(value) > 100:
+            if len(value) > self.page_size:
                 raise ValueError("GitHub comments page exceeds requested size")
             for item in value:
                 if not isinstance(item, dict):
@@ -72,7 +82,7 @@ class GitHubIssueGateway:
                     raise ValueError("GitHub comment pagination is repeated or decreasing")
                 previous_id = comment_id
                 comments.append(DurableComment(comment_id, body, html_url))
-            if len(value) < 100:
+            if len(value) < self.page_size:
                 break
             if page >= self.max_pages:
                 raise ValueError("GitHub comment pagination did not terminate within bound")
