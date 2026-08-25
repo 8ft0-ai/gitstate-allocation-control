@@ -1165,16 +1165,35 @@ def _scenario_3_recovery_matches_current_attempt(
 ) -> bool:
     parsed = parse_request(comment.body.encode("utf-8"))
     agent_id = parsed.payload.get("agent_id")
+    if not isinstance(agent_id, str):
+        raise LiveExecutorError(
+            "SCENARIO_3_RECOVERY_REQUEST_BINDING_MISMATCH"
+        )
+
+    _, observed_separator, observed_namespace = agent_id.rpartition("/session/")
+    _, expected_separator, expected_namespace = expected_agent_id.rpartition(
+        "/session/"
+    )
+    if (
+        observed_separator != "/session/"
+        or expected_separator != "/session/"
+        or not observed_namespace
+        or not expected_namespace
+    ):
+        raise LiveExecutorError(
+            "SCENARIO_3_RECOVERY_REQUEST_BINDING_MISMATCH"
+        )
 
     if comment.comment_id != expected_comment_id:
-        if agent_id == expected_agent_id:
+        if observed_namespace == expected_namespace:
             raise LiveExecutorError(
                 "SCENARIO_3_UNEXPECTED_UNPROCESSED_PROTOCOL_COMMENT"
             )
         return False
 
     if (
-        agent_id != expected_agent_id
+        observed_namespace != expected_namespace
+        or agent_id != expected_agent_id
         or parsed.payload.get("request_id") != expected_request_id
     ):
         raise LiveExecutorError(

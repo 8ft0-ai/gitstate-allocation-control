@@ -249,6 +249,50 @@ class PaginationSeamTests(unittest.TestCase):
                 ),
             )
 
+    def test_scenario_3_recovery_rejects_different_valid_agent_in_current_attempt(self):
+        current = live.AttemptNamespace.parse(
+            "wd-32636614281-1-current1",
+            run_id=32636614281,
+            run_attempt=1,
+        )
+
+        target_rid, _, _ = live._protocol_request_contract(
+            current, 3, 3, request_type="ALLOCATE_NEXT"
+        )
+        _, unexpected_body, _ = live._protocol_request_contract(
+            current, 3, 4, request_type="ALLOCATE_NEXT"
+        )
+        unexpected_body = unexpected_body.replace(
+            "agent://operator/8ft0-ai/session/",
+            "agent://human/8ft0-ai/session/",
+            1,
+        )
+
+        parsed = live.parse_request(unexpected_body.encode("utf-8"))
+        self.assertEqual(
+            parsed.payload["agent_id"],
+            f"agent://human/8ft0-ai/session/{current.value}",
+        )
+
+        unexpected = DurableComment(
+            31,
+            unexpected_body,
+            "https://github.example/example/control/issues/1#issuecomment-31",
+        )
+
+        with self.assertRaisesRegex(
+            live.LiveExecutorError,
+            "SCENARIO_3_UNEXPECTED_UNPROCESSED_PROTOCOL_COMMENT",
+        ):
+            live._scenario_3_recovery_matches_current_attempt(
+                unexpected,
+                expected_comment_id=30,
+                expected_request_id=target_rid,
+                expected_agent_id=(
+                    f"agent://operator/8ft0-ai/session/{current.value}"
+                ),
+            )
+
     def test_scenario_3_recovery_keeps_exact_target_binding(self):
         current = live.AttemptNamespace.parse(
             "wd-32636614281-1-current1",
