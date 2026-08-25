@@ -11,6 +11,7 @@ from unittest.mock import patch
 import phase2.github_api as github_api
 import phase2.workstream_d_live as live
 from phase2.projection_github import GitHubIssueGateway
+from phase2.reconciliation import DurableComment
 
 
 CONTROL_REPOSITORY = "example/control"
@@ -148,6 +149,197 @@ class PaginationSeamTests(unittest.TestCase):
         self.assertEqual(live.SCENARIO_3_FIXTURE_PAGE_SIZE, 2)
         self.assertEqual(live.SCENARIO_3_FILLER_COUNT, 2)
         self.assertLess(live.SCENARIO_3_FILLER_COUNT, 80)
+
+    def test_scenario_3_recovery_ignores_historical_attempt_but_keeps_it_visible(self):
+        current = live.AttemptNamespace.parse(
+            "wd-32636614281-1-current1",
+            run_id=32636614281,
+            run_attempt=1,
+        )
+        historical = live.AttemptNamespace.parse(
+            "wd-32548072030-1-history1",
+            run_id=32548072030,
+            run_attempt=1,
+        )
+
+        target_rid, target_body, _ = live._protocol_request_contract(
+            current, 3, 3, request_type="ALLOCATE_NEXT"
+        )
+        _, historical_body, _ = live._protocol_request_contract(
+            historical, 3, 3, request_type="ALLOCATE_NEXT"
+        )
+
+        api = PageAPI(
+            {
+                1: [
+                    comment(10, historical_body),
+                    comment(20, "pagination-fixture"),
+                ],
+                2: [comment(30, target_body)],
+            }
+        )
+        listed = GitHubIssueGateway(
+            api,
+            CONTROL_REPOSITORY,
+            page_size=2,
+        ).list_comments(ISSUE)
+
+        expected_agent = (
+            f"agent://operator/8ft0-ai/session/{current.value}"
+        )
+
+        protocol_comments = tuple(
+            item
+            for item in listed
+            if item.body.startswith("/beads-v0.2 ")
+        )
+
+        accepted = tuple(
+            item.comment_id
+            for item in protocol_comments
+            if live._scenario_3_recovery_matches_current_attempt(
+                item,
+                expected_comment_id=30,
+                expected_request_id=target_rid,
+                expected_agent_id=expected_agent,
+            )
+        )
+
+        self.assertEqual(
+            tuple(item.comment_id for item in listed),
+            (10, 20, 30),
+        )
+        self.assertEqual(
+            tuple(item.comment_id for item in protocol_comments),
+            (10, 30),
+        )
+        self.assertEqual(accepted, (30,))
+        self.assertEqual(api.calls, [(2, 1), (2, 2)])
+
+    def test_scenario_3_recovery_rejects_extra_current_attempt_request(self):
+        current = live.AttemptNamespace.parse(
+            "wd-32636614281-1-current1",
+            run_id=32636614281,
+            run_attempt=1,
+        )
+
+        target_rid, _, _ = live._protocol_request_contract(
+            current, 3, 3, request_type="ALLOCATE_NEXT"
+        )
+        _, unexpected_body, _ = live._protocol_request_contract(
+            current, 3, 4, request_type="ALLOCATE_NEXT"
+        )
+
+        unexpected = DurableComment(
+            31,
+            unexpected_body,
+            "https://github.example/example/control/issues/1#issuecomment-31",
+        )
+
+        with self.assertRaisesRegex(
+            live.LiveExecutorError,
+            "SCENARIO_3_UNEXPECTED_UNPROCESSED_PROTOCOL_COMMENT",
+        ):
+            live._scenario_3_recovery_matches_current_attempt(
+                unexpected,
+                expected_comment_id=30,
+                expected_request_id=target_rid,
+                expected_agent_id=(
+                    f"agent://operator/8ft0-ai/session/{current.value}"
+                ),
+            )
+
+    def test_scenario_3_recovery_rejects_different_valid_agent_in_current_attempt(self):
+        current = live.AttemptNamespace.parse(
+            "wd-32636614281-1-current1",
+            run_id=32636614281,
+            run_attempt=1,
+        )
+
+        target_rid, _, _ = live._protocol_request_contract(
+            current, 3, 3, request_type="ALLOCATE_NEXT"
+        )
+        _, unexpected_body, _ = live._protocol_request_contract(
+            current, 3, 4, request_type="ALLOCATE_NEXT"
+        )
+        unexpected_body = unexpected_body.replace(
+            "agent://operator/8ft0-ai/session/",
+            "agent://human/8ft0-ai/session/",
+            1,
+        )
+
+        parsed = live.parse_request(unexpected_body.encode("utf-8"))
+        self.assertEqual(
+            parsed.payload["agent_id"],
+            f"agent://human/8ft0-ai/session/{current.value}",
+        )
+
+        unexpected = DurableComment(
+            31,
+            unexpected_body,
+            "https://github.example/example/control/issues/1#issuecomment-31",
+        )
+
+        with self.assertRaisesRegex(
+            live.LiveExecutorError,
+            "SCENARIO_3_UNEXPECTED_UNPROCESSED_PROTOCOL_COMMENT",
+        ):
+            live._scenario_3_recovery_matches_current_attempt(
+                unexpected,
+                expected_comment_id=30,
+                expected_request_id=target_rid,
+                expected_agent_id=(
+                    f"agent://operator/8ft0-ai/session/{current.value}"
+                ),
+            )
+
+    def test_scenario_3_recovery_keeps_exact_target_binding(self):
+        current = live.AttemptNamespace.parse(
+            "wd-32636614281-1-current1",
+            run_id=32636614281,
+            run_attempt=1,
+        )
+        historical = live.AttemptNamespace.parse(
+            "wd-32548072030-1-history1",
+            run_id=32548072030,
+            run_attempt=1,
+        )
+
+        target_rid, _, _ = live._protocol_request_contract(
+            current, 3, 3, request_type="ALLOCATE_NEXT"
+        )
+        _, wrong_request_body, _ = live._protocol_request_contract(
+            current, 3, 4, request_type="ALLOCATE_NEXT"
+        )
+        _, wrong_namespace_body, _ = live._protocol_request_contract(
+            historical,
+            3,
+            3,
+            request_type="ALLOCATE_NEXT",
+            request_id=target_rid,
+        )
+
+        expected_agent = (
+            f"agent://operator/8ft0-ai/session/{current.value}"
+        )
+
+        for body in (wrong_request_body, wrong_namespace_body):
+            target = DurableComment(
+                30,
+                body,
+                "https://github.example/example/control/issues/1#issuecomment-30",
+            )
+
+            with self.assertRaisesRegex(
+                live.LiveExecutorError,
+                "SCENARIO_3_RECOVERY_REQUEST_BINDING_MISMATCH",
+            ):
+                live._scenario_3_recovery_matches_current_attempt(
+                    target,
+                    expected_comment_id=30,
+                    expected_request_id=target_rid,
+                    expected_agent_id=expected_agent,
+                )
 
 
 class RateLimitDiagnosticTests(unittest.TestCase):
