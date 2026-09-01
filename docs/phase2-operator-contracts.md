@@ -28,8 +28,8 @@ The manifest binds the decision-critical execution inputs without carrying secre
 - state-baseline commit and digest;
 - canonical operator-history and workflow-history baselines;
 - allocator App identity, installation, repository-selection, selected repository IDs and permission-profile digest;
-- any explicitly bounded owner-observation dependency;
-- protected-environment identity/policy and execution-enable absence expectation;
+- any explicitly bounded owner-observation dependency and its RFC-3339 freshness boundary;
+- protected-environment identity/policy and exact execution-enable variable absence expectation;
 - `single_use: true`;
 - `workstream_e_authorised: false`.
 
@@ -56,7 +56,7 @@ The supported record types are:
 - `consumption`;
 - `terminal`.
 
-Every parsed machine record is owner-authenticated, immutable by created/updated timestamp equality, and bound by GitHub comment ID plus exact comment-body SHA-256. Duplicate record IDs, duplicate reserved lines, malformed reserved records and body-digest mismatches fail closed. Ordinary comments carry no machine semantics.
+Every parsed machine record is owner-authenticated, timestamp-valid, immutable by created/updated timestamp equality, and bound by GitHub comment ID plus exact comment-body SHA-256. Duplicate comment IDs, duplicate record IDs, duplicate reserved lines, malformed reserved records and body-digest mismatches fail closed. Subject record IDs and comment bindings are deterministically ordered and unique. Ordinary comments carry no machine semantics.
 
 ### Subject identity and the pre-manifest boundary
 
@@ -69,21 +69,34 @@ B1 therefore models the accepted design's “normally manifest SHA-256” subjec
 - pre-manifest `proposal`, `readiness` and `authority` records bind an immutable opaque `lineage_id`, prior typed record IDs and exact prior comment bindings;
 - post-manifest records bind the exact `manifest_sha256`, plus the relevant typed record IDs/comment bindings.
 
-The pure evaluator requires the manifest-bound proposal/readiness/authority comments to resolve to one consistent lineage. It never infers authority from prose, numerical latest-comment position or unrelated later comments.
+The pure evaluator requires the manifest-bound proposal/readiness/authority comments to resolve to one consistent lineage and requires readiness/authority to bind the exact prior comment bodies, not merely their record IDs. It never infers authority from prose, numerical latest-comment position or unrelated later comments.
 
-A later typed `revocation` or `supersession` that names a relevant record invalidates it. A matching typed `consumption` invalidates one-use authority. More than one simultaneously active authority on the same lineage is `GOVERNANCE_AMBIGUOUS`.
+A later typed `revocation` or `supersession` targeting the bound proposal, readiness or authority invalidates the lineage. A matching typed `consumption` invalidates one-use authority. More than one simultaneously active, correctly bound authority on the same lineage is `GOVERNANCE_AMBIGUOUS`.
 
-B1 represents the later public-invalidation binding as a typed governance detail but does not implement the public projection/invalidation transport. That transport belongs to B2/B3.
+A live-stage `manifest_approval` must target the exact manifest digest, name the bound authority record and include the exact authority comment/body binding. B1 represents the later public-invalidation binding as a typed governance detail but does not implement the public projection/invalidation transport. That transport belongs to B2/B3.
 
 ## Historical V1 operator history
 
 Existing `gitstate-operator/v1` capsule and `gitstate-consumption/v1` comments remain historical inputs. B1 does not rewrite or reinterpret the active V1 execution path.
 
-For complete validated V1 records ordered by numeric comment ID, canonical history is:
+Before a V1 record is admitted to canonical history, B1 statically validates its historical contract: exact fields, canonical JSON, owner identity, comment immutability/timestamps, V1 governance contract, opaque IDs/digests, trusted SHA fields, single-use requirement, bounded capsule lifetime and Workstream-E exclusion. Consumption records additionally validate capsule binding, run identity/attempt, trusted SHA, operation and consumption timestamp.
+
+For a complete **closed** V1 history ordered by numeric comment ID, canonical history is:
 
 `<comment-id>\t<record-kind>\t<body-sha256>\n`
 
-The SHA-256 baseline covers the complete concatenated UTF-8 sequence including the final newline. Validation rejects malformed/edited reserved records, duplicate capsule IDs, orphan consumptions, multiple consumptions, capsule/consumption binding mismatches, trusted-SHA/operation mismatches, live reruns and Workstream-E-bearing records.
+The SHA-256 baseline covers the complete concatenated UTF-8 sequence including the final newline. Validation rejects:
+
+- malformed or edited reserved records;
+- duplicate capsule IDs;
+- unconsumed capsules;
+- orphan consumptions;
+- more than one consumption for a capsule;
+- capsule/comment/body/trusted-SHA/operation mismatches;
+- live reruns or duplicate run/attempt identities;
+- Workstream-E-bearing records.
+
+A requested history prefix must itself be closed. A prefix ending after a capsule but before its matching consumption is not a valid baseline merely because a later full history is closed.
 
 The resulting baseline is represented by `(through_id, history_sha256)` for later preflight/live comparison.
 
@@ -100,6 +113,8 @@ B2 will define the bounded preflight-run suffix semantics. B3 will define the ex
 ## Pure semantic guard evaluator
 
 `phase2.operator_guard` accepts an immutable parsed manifest plus a typed observation object and returns `PASS` or one typed failure. It imports no GitHub API, credential, token-mint, workflow-dispatch, ref-update or Workstream-D live execution provider.
+
+A complete observation is shape-validated before semantic comparison. It binds the exact operation, control repository/commit/tree/workflow/module identities, protocol and state identities, operator/workflow baselines, App boundary, environment policy and exact execution-enable variable name/absence. Malformed complete observations are `OBSERVATION_SHAPE_UNSUPPORTED`; unavailable/rate-limited/ambiguous acquisition is kept in the distinct observation-incomplete lane.
 
 Failure classes follow the reviewed Slice A design.
 
