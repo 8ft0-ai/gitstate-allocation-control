@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Mapping, Sequence
 
 
@@ -12,8 +13,10 @@ GOVERNANCE_CONTRACT = "gitstate-execution-governance/v1"
 GOVERNANCE_PREFIX = "/gitstate-governance-v1 "
 V1_CAPSULE_CONTRACT = "gitstate-operator/v1"
 V1_CONSUMPTION_CONTRACT = "gitstate-consumption/v1"
+V1_GOVERNANCE_CONTRACT = "gitstate-private-governance/v1"
 V1_CAPSULE_PREFIX = "/gitstate-operator-v1 "
 V1_CONSUMPTION_PREFIX = "/gitstate-consumption-v1 "
+V1_MAX_CAPSULE_LIFETIME = timedelta(hours=1)
 
 GOVERNANCE_RECORD_TYPES = frozenset(
     {
@@ -127,12 +130,12 @@ class OperatorContractError(RuntimeError):
 
 
 def _duplicate_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    value: dict[str, Any] = {}
-    for key, item in pairs:
-        if key in value:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
             raise OperatorContractError("DUPLICATE_JSON_KEY")
-        value[key] = item
-    return value
+        result[key] = value
+    return result
 
 
 def _reject_float(_: str) -> float:
@@ -184,9 +187,7 @@ def _strict_json(raw: str, reason: str) -> dict[str, Any]:
 def _require_supported_json(value: Any) -> None:
     if value is None or isinstance(value, float):
         raise OperatorContractError("UNSUPPORTED_JSON_VALUE")
-    if isinstance(value, (str, bool)):
-        return
-    if type(value) is int:
+    if isinstance(value, (str, bool)) or type(value) is int:
         return
     if isinstance(value, list):
         for item in value:
@@ -227,6 +228,18 @@ def _require_hex(value: Any, pattern: re.Pattern[str], reason: str) -> str:
 def _require_bool(value: Any, expected: bool, reason: str) -> None:
     if value is not expected:
         raise OperatorContractError(reason)
+
+
+def _parse_time(value: Any, reason: str) -> datetime:
+    if not isinstance(value, str) or not value.endswith("Z"):
+        raise OperatorContractError(reason)
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError as exc:
+        raise OperatorContractError(reason) from exc
+    if parsed.tzinfo is None:
+        raise OperatorContractError(reason)
+    return parsed.astimezone(timezone.utc)
 
 
 def _require_comment_binding(value: Any, reason: str) -> dict[str, Any]:
@@ -270,16 +283,18 @@ def _require_history_baseline(value: Any, reason: str) -> dict[str, Any]:
 def _require_owner_observation(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict) or "required" not in value:
         raise OperatorContractError("MANIFEST_OWNER_OBSERVATION_INVALID")
-    required = value.get("required")
-    if required is False:
+    if value.get("required") is False:
         _require_exact_keys(value, frozenset({"required"}), "MANIFEST_OWNER_OBSERVATION_INVALID")
         return value
-    if required is True:
-        expected = frozenset({"required", "observation_id", "observation_sha256", "valid_through"})
-        _require_exact_keys(value, expected, "MANIFEST_OWNER_OBSERVATION_INVALID")
+    if value.get("required") is True:
+        _require_exact_keys(
+            value,
+            frozenset({"required", "observation_id", "observation_sha256", "valid_through"}),
+            "MANIFEST_OWNER_OBSERVATION_INVALID",
+        )
         _require_string(value.get("observation_id"), "MANIFEST_OWNER_OBSERVATION_INVALID")
         _require_hex(value.get("observation_sha256"), SHA256, "MANIFEST_OWNER_OBSERVATION_INVALID")
-        _require_string(value.get("valid_through"), "MANIFEST_OWNER_OBSERVATION_INVALID")
+        _parse_time(value.get("valid_through"), "MANIFEST_OWNER_OBSERVATION_INVALID")
         return value
     raise OperatorContractError("MANIFEST_OWNER_OBSERVATION_INVALID")
 
@@ -342,7 +357,10 @@ class ExecutionManifest:
 
     @property
     def module_blobs(self) -> tuple[ModuleBlob, ...]:
-        return tuple(ModuleBlob(str(v["path"]), str(v["blob_sha"])) for v in self.payload["executor"]["module_blobs"])
+        return tuple(
+            ModuleBlob(str(item["path"]), str(item["blob_sha"]))
+            for item in self.payload["executor"]["module_blobs"]
+        )
 
 
 def parse_execution_manifest(raw: str, *, expected_sha256: str | None = None) -> ExecutionManifest:
@@ -456,43 +474,43 @@ class GovernanceRecord:
 
     @property
     def subject_record_ids(self) -> tuple[str, ...]:
-        return tuple(str(v) for v in self.payload["subject"]["record_ids"])
+        return tuple(str(value) for value in self.payload["subject"]["record_ids"])
 
     @property
     def comment_bindings(self) -> tuple[CommentBinding, ...]:
         return tuple(
-            CommentBinding(int(v["comment_id"]), str(v["body_sha256"]))
-            for v in self.payload["subject"]["comment_bindings"]
+            CommentBinding(int(value["comment_id"]), str(value["body_sha256"]))
+            for value in self.payload["subject"]["comment_bindings"]
         )
 
 
 def _require_subject(record_type: str, value: Any) -> None:
     if not isinstance(value, dict):
         raise OperatorContractError("GOVERNANCE_SUBJECT_INVALID")
-    lineage_types = {"proposal", "readiness", "authority"}
-    if record_type in lineage_types:
+    if record_type in {"proposal", "readiness", "authority"}:
         _require_exact_keys(value, LINEAGE_SUBJECT_FIELDS, "GOVERNANCE_SUBJECT_INVALID")
         _require_hex(value.get("lineage_id"), OPAQUE_ID, "GOVERNANCE_SUBJECT_INVALID")
     else:
         _require_exact_keys(value, MANIFEST_SUBJECT_FIELDS, "GOVERNANCE_SUBJECT_INVALID")
         _require_hex(value.get("manifest_sha256"), SHA256, "GOVERNANCE_SUBJECT_INVALID")
+
     record_ids = value.get("record_ids")
     if not isinstance(record_ids, list):
         raise OperatorContractError("GOVERNANCE_SUBJECT_INVALID")
     for record_id in record_ids:
         _require_hex(record_id, OPAQUE_ID, "GOVERNANCE_SUBJECT_INVALID")
-    if len(record_ids) != len(set(record_ids)):
+    if record_ids != sorted(record_ids) or len(record_ids) != len(set(record_ids)):
         raise OperatorContractError("GOVERNANCE_SUBJECT_INVALID")
+
     bindings = value.get("comment_bindings")
     if not isinstance(bindings, list):
         raise OperatorContractError("GOVERNANCE_SUBJECT_INVALID")
-    seen: set[int] = set()
+    comment_ids: list[int] = []
     for binding in bindings:
         parsed = _require_comment_binding(binding, "GOVERNANCE_SUBJECT_INVALID")
-        comment_id = int(parsed["comment_id"])
-        if comment_id in seen:
-            raise OperatorContractError("GOVERNANCE_SUBJECT_INVALID")
-        seen.add(comment_id)
+        comment_ids.append(int(parsed["comment_id"]))
+    if comment_ids != sorted(comment_ids) or len(comment_ids) != len(set(comment_ids)):
+        raise OperatorContractError("GOVERNANCE_SUBJECT_INVALID")
 
 
 def _require_public_invalidation(value: Any) -> None:
@@ -591,16 +609,17 @@ def parse_governance_comment(
         raise OperatorContractError("GOVERNANCE_WRONG_OWNER")
     created = comment.get("created_at")
     updated = comment.get("updated_at")
-    if not isinstance(created, str) or created != updated:
+    _parse_time(created, "GOVERNANCE_COMMENT_TIME_INVALID")
+    if created != updated:
         raise OperatorContractError("GOVERNANCE_SOURCE_EDITED")
+
     body_digest = sha256_text(body)
     if expected_body_sha256 is not None:
         _require_hex(expected_body_sha256, SHA256, "GOVERNANCE_EXPECTED_DIGEST_INVALID")
         if body_digest != expected_body_sha256:
             raise OperatorContractError("GOVERNANCE_BODY_DIGEST_MISMATCH")
 
-    raw = machine_lines[0][len(GOVERNANCE_PREFIX) :]
-    value = _strict_json(raw, "GOVERNANCE_JSON_INVALID")
+    value = _strict_json(machine_lines[0][len(GOVERNANCE_PREFIX) :], "GOVERNANCE_JSON_INVALID")
     _require_exact_keys(value, GOVERNANCE_FIELDS, "GOVERNANCE_SCHEMA_MISMATCH")
     if value.get("contract") != GOVERNANCE_CONTRACT:
         raise OperatorContractError("GOVERNANCE_CONTRACT_MISMATCH")
@@ -626,11 +645,12 @@ def parse_governance_comments(
 ) -> tuple[GovernanceRecord, ...]:
     records: list[GovernanceRecord] = []
     record_ids: set[str] = set()
+    comment_ids: set[int] = set()
     for comment in comments:
-        cid = comment.get("id")
+        comment_id = comment.get("id")
         expected_digest = None
-        if type(cid) is int and expected_body_sha256_by_comment is not None:
-            expected_digest = expected_body_sha256_by_comment.get(cid)
+        if type(comment_id) is int and expected_body_sha256_by_comment is not None:
+            expected_digest = expected_body_sha256_by_comment.get(comment_id)
         record = parse_governance_comment(
             comment,
             expected_owner=expected_owner,
@@ -639,11 +659,14 @@ def parse_governance_comments(
         )
         if record is None:
             continue
+        if record.comment_id in comment_ids:
+            raise OperatorContractError("GOVERNANCE_DUPLICATE_COMMENT_ID")
         if record.record_id in record_ids:
             raise OperatorContractError("GOVERNANCE_DUPLICATE_RECORD_ID")
+        comment_ids.add(record.comment_id)
         record_ids.add(record.record_id)
         records.append(record)
-    records.sort(key=lambda item: item.comment_id)
+    records.sort(key=lambda record: record.comment_id)
     return tuple(records)
 
 
@@ -659,6 +682,19 @@ class OperatorHistoryRecord:
     capsule_body_sha256: str | None = None
     run_id: int | None = None
     run_attempt: int | None = None
+
+
+def _v1_comment_identity(comment: Mapping[str, Any]) -> tuple[int, str, str]:
+    comment_id = _require_int(comment.get("id"), "OPERATOR_HISTORY_COMMENT_INVALID")
+    created = comment.get("created_at")
+    updated = comment.get("updated_at")
+    _parse_time(created, "OPERATOR_HISTORY_COMMENT_TIME_INVALID")
+    if created != updated:
+        raise OperatorContractError("OPERATOR_HISTORY_SOURCE_EDITED")
+    user = comment.get("user")
+    if not isinstance(user, Mapping) or not isinstance(user.get("login"), str):
+        raise OperatorContractError("OPERATOR_HISTORY_WRONG_OWNER")
+    return comment_id, str(user["login"]), str(created)
 
 
 def parse_v1_operator_history_comment(
@@ -677,86 +713,105 @@ def parse_v1_operator_history_comment(
         return None
     if not (is_capsule or is_consumption) or "\n" in body:
         raise OperatorContractError("OPERATOR_HISTORY_RESERVED_RECORD_INVALID")
-    comment_id = _require_int(comment.get("id"), "OPERATOR_HISTORY_COMMENT_INVALID")
-    created = comment.get("created_at")
-    if not isinstance(created, str) or created != comment.get("updated_at"):
-        raise OperatorContractError("OPERATOR_HISTORY_SOURCE_EDITED")
-    user = comment.get("user")
-    if not isinstance(user, Mapping):
-        raise OperatorContractError("OPERATOR_HISTORY_WRONG_OWNER")
-    raw = body[len(V1_CAPSULE_PREFIX) :] if is_capsule else body[len(V1_CONSUMPTION_PREFIX) :]
-    value = _strict_json(raw, "OPERATOR_HISTORY_JSON_INVALID")
+
+    comment_id, login, comment_created = _v1_comment_identity(comment)
+    prefix = V1_CAPSULE_PREFIX if is_capsule else V1_CONSUMPTION_PREFIX
+    value = _strict_json(body[len(prefix) :], "OPERATOR_HISTORY_JSON_INVALID")
+
     if is_capsule:
-        if user.get("login") != capsule_owner:
+        if login != capsule_owner:
             raise OperatorContractError("OPERATOR_HISTORY_WRONG_OWNER")
         _require_exact_keys(value, V1_CAPSULE_FIELDS, "OPERATOR_HISTORY_SCHEMA_MISMATCH")
         if value.get("contract") != V1_CAPSULE_CONTRACT:
             raise OperatorContractError("OPERATOR_HISTORY_CONTRACT_MISMATCH")
+        if value.get("governance_contract") != V1_GOVERNANCE_CONTRACT:
+            raise OperatorContractError("OPERATOR_HISTORY_GOVERNANCE_CONTRACT_MISMATCH")
         _require_hex(value.get("capsule_id"), OPAQUE_ID, "OPERATOR_HISTORY_CAPSULE_INVALID")
-        _require_hex(value.get("expected_control_sha"), SHA40, "OPERATOR_HISTORY_TRUSTED_SHA_INVALID")
+        for key in ("governance_record_id", "review_record_id", "authority_record_id"):
+            _require_hex(value.get(key), OPAQUE_ID, "OPERATOR_HISTORY_PROVENANCE_INVALID")
+        for key in ("review_record_sha256", "authority_record_sha256"):
+            _require_hex(value.get(key), SHA256, "OPERATOR_HISTORY_PROVENANCE_INVALID")
+        for key in ("expected_control_sha", "expected_protocol_sha", "expected_state_baseline"):
+            _require_hex(value.get(key), SHA40, "OPERATOR_HISTORY_TRUSTED_SHA_INVALID")
         _require_string(value.get("operation"), "OPERATOR_HISTORY_OPERATION_INVALID")
         _require_bool(value.get("single_use"), True, "OPERATOR_HISTORY_SINGLE_USE_REQUIRED")
         _require_bool(value.get("workstream_e_authorised"), False, "WORKSTREAM_E_NOT_AUTHORISED")
+        created = _parse_time(value.get("created_at"), "OPERATOR_HISTORY_CAPSULE_TIME_INVALID")
+        expires = _parse_time(value.get("expires_at"), "OPERATOR_HISTORY_CAPSULE_TIME_INVALID")
+        if expires <= created or expires - created > V1_MAX_CAPSULE_LIFETIME:
+            raise OperatorContractError("OPERATOR_HISTORY_CAPSULE_TIME_INVALID")
+        comment_time = _parse_time(comment_created, "OPERATOR_HISTORY_COMMENT_TIME_INVALID")
+        if comment_time > expires:
+            raise OperatorContractError("OPERATOR_HISTORY_CAPSULE_TIME_INVALID")
         return OperatorHistoryRecord(
-            comment_id,
-            V1_CAPSULE_CONTRACT,
-            sha256_text(body),
-            str(value["capsule_id"]),
-            str(value["expected_control_sha"]),
-            str(value["operation"]),
+            comment_id=comment_id,
+            record_kind=V1_CAPSULE_CONTRACT,
+            body_sha256=sha256_text(body),
+            capsule_id=str(value["capsule_id"]),
+            trusted_sha=str(value["expected_control_sha"]),
+            operation=str(value["operation"]),
         )
-    if user.get("login") != consumption_owner:
+
+    if login != consumption_owner:
         raise OperatorContractError("OPERATOR_HISTORY_WRONG_OWNER")
     _require_exact_keys(value, V1_CONSUMPTION_FIELDS, "OPERATOR_HISTORY_SCHEMA_MISMATCH")
     if value.get("contract") != V1_CONSUMPTION_CONTRACT:
         raise OperatorContractError("OPERATOR_HISTORY_CONTRACT_MISMATCH")
     _require_hex(value.get("capsule_id"), OPAQUE_ID, "OPERATOR_HISTORY_CAPSULE_INVALID")
     capsule_comment_id = _require_int(
-        value.get("capsule_comment_id"),
-        "OPERATOR_HISTORY_CAPSULE_COMMENT_INVALID",
+        value.get("capsule_comment_id"), "OPERATOR_HISTORY_CAPSULE_COMMENT_INVALID"
     )
     capsule_body_sha256 = _require_hex(
-        value.get("capsule_body_sha256"),
-        SHA256,
-        "OPERATOR_HISTORY_CAPSULE_DIGEST_INVALID",
+        value.get("capsule_body_sha256"), SHA256, "OPERATOR_HISTORY_CAPSULE_DIGEST_INVALID"
     )
     run_id = _require_int(value.get("run_id"), "OPERATOR_HISTORY_RUN_INVALID")
     run_attempt = _require_int(value.get("run_attempt"), "OPERATOR_HISTORY_RUN_INVALID")
     _require_hex(value.get("trusted_sha"), SHA40, "OPERATOR_HISTORY_TRUSTED_SHA_INVALID")
     _require_string(value.get("operation"), "OPERATOR_HISTORY_OPERATION_INVALID")
+    _parse_time(value.get("consumed_at"), "OPERATOR_HISTORY_CONSUMPTION_TIME_INVALID")
     _require_bool(value.get("workstream_e_authorised"), False, "WORKSTREAM_E_NOT_AUTHORISED")
     return OperatorHistoryRecord(
-        comment_id,
-        V1_CONSUMPTION_CONTRACT,
-        sha256_text(body),
-        str(value["capsule_id"]),
-        str(value["trusted_sha"]),
-        str(value["operation"]),
-        capsule_comment_id,
-        capsule_body_sha256,
-        run_id,
-        run_attempt,
+        comment_id=comment_id,
+        record_kind=V1_CONSUMPTION_CONTRACT,
+        body_sha256=sha256_text(body),
+        capsule_id=str(value["capsule_id"]),
+        trusted_sha=str(value["trusted_sha"]),
+        operation=str(value["operation"]),
+        capsule_comment_id=capsule_comment_id,
+        capsule_body_sha256=capsule_body_sha256,
+        run_id=run_id,
+        run_attempt=run_attempt,
     )
 
 
 def parse_v1_operator_history(
     comments: Iterable[Mapping[str, Any]],
 ) -> tuple[OperatorHistoryRecord, ...]:
-    records: list[OperatorHistoryRecord] = []
-    for comment in comments:
-        record = parse_v1_operator_history_comment(comment)
-        if record is not None:
-            records.append(record)
-    records.sort(key=lambda item: item.comment_id)
+    records = tuple(
+        sorted(
+            (
+                record
+                for comment in comments
+                if (record := parse_v1_operator_history_comment(comment)) is not None
+            ),
+            key=lambda record: record.comment_id,
+        )
+    )
     validate_operator_history(records)
-    return tuple(records)
+    return records
+
+
+def _ordered_history(records: Sequence[OperatorHistoryRecord]) -> tuple[OperatorHistoryRecord, ...]:
+    return tuple(sorted(records, key=lambda record: record.comment_id))
 
 
 def validate_operator_history(records: Sequence[OperatorHistoryRecord]) -> None:
     comment_ids: set[int] = set()
     capsules: dict[str, OperatorHistoryRecord] = {}
     consumptions: set[str] = set()
-    for record in records:
+    run_attempts: set[tuple[int, int]] = set()
+
+    for record in _ordered_history(records):
         if record.comment_id in comment_ids:
             raise OperatorContractError("OPERATOR_HISTORY_DUPLICATE_COMMENT")
         comment_ids.add(record.comment_id)
@@ -778,9 +833,18 @@ def validate_operator_history(records: Sequence[OperatorHistoryRecord]) -> None:
             or record.trusted_sha != capsule.trusted_sha
             or record.operation != capsule.operation
             or record.run_attempt != 1
+            or record.run_id is None
         ):
             raise OperatorContractError("OPERATOR_HISTORY_CONSUMPTION_MISMATCH")
+        run_key = (record.run_id, record.run_attempt)
+        if run_key in run_attempts:
+            raise OperatorContractError("OPERATOR_HISTORY_DUPLICATE_RUN_ATTEMPT")
+        run_attempts.add(run_key)
         consumptions.add(record.capsule_id)
+
+    unconsumed = set(capsules) - consumptions
+    if unconsumed:
+        raise OperatorContractError("OPERATOR_HISTORY_UNCONSUMED_CAPSULE")
 
 
 def canonical_operator_history(
@@ -788,12 +852,12 @@ def canonical_operator_history(
     *,
     through_comment_id: int | None = None,
 ) -> str:
-    validate_operator_history(records)
-    selected = [
+    selected = tuple(
         record
-        for record in records
+        for record in _ordered_history(records)
         if through_comment_id is None or record.comment_id <= through_comment_id
-    ]
+    )
+    validate_operator_history(selected)
     return "".join(
         f"{record.comment_id}\t{record.record_kind}\t{record.body_sha256}\n"
         for record in selected
@@ -805,13 +869,13 @@ def operator_history_baseline(
     *,
     through_comment_id: int | None = None,
 ) -> HistoryBaseline:
-    selected = [
+    selected = tuple(
         record
-        for record in records
+        for record in _ordered_history(records)
         if through_comment_id is None or record.comment_id <= through_comment_id
-    ]
+    )
+    canonical = canonical_operator_history(selected)
     through = max((record.comment_id for record in selected), default=0)
-    canonical = canonical_operator_history(records, through_comment_id=through_comment_id)
     return HistoryBaseline(through, sha256_text(canonical))
 
 
@@ -825,7 +889,7 @@ class WorkflowHistoryRecord:
 
 
 def canonical_workflow_history(records: Sequence[WorkflowHistoryRecord]) -> str:
-    ordered = sorted(records, key=lambda item: (item.run_id, item.run_attempt))
+    ordered = sorted(records, key=lambda record: (record.run_id, record.run_attempt))
     seen: set[tuple[int, int]] = set()
     lines: list[str] = []
     for record in ordered:
@@ -837,8 +901,8 @@ def canonical_workflow_history(records: Sequence[WorkflowHistoryRecord]) -> str:
         if key in seen:
             raise OperatorContractError("WORKFLOW_HISTORY_DUPLICATE_RUN_ATTEMPT")
         seen.add(key)
-        # Conclusion is deliberately excluded. B1 binds dispatch identity, not a
-        # stale historical interpretation of terminal status.
+        # Terminal conclusion is intentionally not part of the B1 authority/history
+        # identity. If it becomes decision-critical it must be modelled explicitly.
         lines.append(
             f"{record.run_id}\t{record.run_attempt}\t{record.trusted_sha}\t{record.operation}\n"
         )
