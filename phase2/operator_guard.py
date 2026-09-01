@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Sequence
 
@@ -43,6 +44,9 @@ FAILURE_CATEGORY = {
 
 STAGES = frozenset({"preflight", "live_l1", "live_l2"})
 READ_STATUSES = frozenset({"complete", "unavailable", "rate_limited", "ambiguous"})
+SHA40 = re.compile(r"^[0-9a-f]{40}$")
+SHA256 = re.compile(r"^[0-9a-f]{64}$")
+REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 
 @dataclass(frozen=True)
@@ -56,6 +60,8 @@ class OwnerObservation:
 class GuardObservation:
     stage: str
     read_status: str
+    operation: str
+    control_repository: str
     control_commit_sha: str
     control_tree_sha: str
     workflow_blob_sha: str
@@ -73,6 +79,7 @@ class GuardObservation:
     owner_observation: OwnerObservation | None
     environment_name: str
     environment_policy_sha256: str
+    execution_variable: str
     execution_variable_absent: bool
     governance_records: tuple[GovernanceRecord, ...]
     manifest_approval: CommentBinding | None = None
@@ -93,8 +100,118 @@ class GuardResult:
         return cls(False, code, FAILURE_CATEGORY.get(code, IMPLEMENTATION_DEFECT))
 
 
+def _valid_string(value: object) -> bool:
+    return isinstance(value, str) and bool(value)
+
+
+def _valid_positive_int(value: object) -> bool:
+    return type(value) is int and value > 0
+
+
+def _valid_hex(value: object, pattern: re.Pattern[str]) -> bool:
+    return isinstance(value, str) and pattern.fullmatch(value) is not None
+
+
+def _valid_binding(value: object) -> bool:
+    return (
+        isinstance(value, CommentBinding)
+        and _valid_positive_int(value.comment_id)
+        and _valid_hex(value.body_sha256, SHA256)
+    )
+
+
+def _valid_history(value: object) -> bool:
+    return (
+        isinstance(value, HistoryBaseline)
+        and type(value.through_id) is int
+        and value.through_id >= 0
+        and _valid_hex(value.history_sha256, SHA256)
+    )
+
+
+def _valid_module_blobs(value: object) -> bool:
+    if not isinstance(value, tuple) or not value:
+        return False
+    paths: list[str] = []
+    for item in value:
+        if not isinstance(item, ModuleBlob):
+            return False
+        if not _valid_string(item.path) or item.path.startswith("/") or ".." in item.path.split("/"):
+            return False
+        if not _valid_hex(item.blob_sha, SHA40):
+            return False
+        paths.append(item.path)
+    return paths == sorted(paths) and len(paths) == len(set(paths))
+
+
+def _valid_owner_observation(value: object) -> bool:
+    if value is None:
+        return True
+    return (
+        isinstance(value, OwnerObservation)
+        and _valid_string(value.observation_id)
+        and _valid_hex(value.observation_sha256, SHA256)
+        and type(value.valid) is bool
+    )
+
+
+def _valid_complete_observation(observation: GuardObservation) -> bool:
+    if not _valid_string(observation.operation):
+        return False
+    if not _valid_string(observation.control_repository) or REPOSITORY.fullmatch(observation.control_repository) is None:
+        return False
+    for value in (
+        observation.control_commit_sha,
+        observation.control_tree_sha,
+        observation.workflow_blob_sha,
+        observation.protocol_sha,
+        observation.state_commit_sha,
+    ):
+        if not _valid_hex(value, SHA40):
+            return False
+    if not _valid_hex(observation.state_digest_sha256, SHA256):
+        return False
+    if not _valid_module_blobs(observation.module_blobs):
+        return False
+    if not _valid_history(observation.operator_history) or not _valid_history(observation.workflow_history):
+        return False
+    if not _valid_positive_int(observation.app_id) or not _valid_positive_int(observation.installation_id):
+        return False
+    if observation.repository_selection != "selected":
+        return False
+    if (
+        not isinstance(observation.selected_repository_ids, tuple)
+        or not observation.selected_repository_ids
+        or any(not _valid_positive_int(item) for item in observation.selected_repository_ids)
+        or observation.selected_repository_ids != tuple(sorted(observation.selected_repository_ids))
+        or len(observation.selected_repository_ids) != len(set(observation.selected_repository_ids))
+    ):
+        return False
+    if not _valid_hex(observation.permission_profile_sha256, SHA256):
+        return False
+    if not _valid_owner_observation(observation.owner_observation):
+        return False
+    if not _valid_string(observation.environment_name):
+        return False
+    if not _valid_hex(observation.environment_policy_sha256, SHA256):
+        return False
+    if not _valid_string(observation.execution_variable) or type(observation.execution_variable_absent) is not bool:
+        return False
+    if not isinstance(observation.governance_records, tuple) or any(
+        not isinstance(record, GovernanceRecord) for record in observation.governance_records
+    ):
+        return False
+    if observation.manifest_approval is not None and not _valid_binding(observation.manifest_approval):
+        return False
+    return True
+
+
 def _same_binding(record: GovernanceRecord, binding: CommentBinding) -> bool:
     return record.comment_id == binding.comment_id and record.body_sha256 == binding.body_sha256
+
+
+def _contains_binding(record: GovernanceRecord, binding: CommentBinding) -> bool:
+    return binding in record.comment_bindings
 
 
 def _relevant_records(
@@ -144,6 +261,22 @@ def _exact_record(
     return matches[0]
 
 
+def _valid_lineage_authority(
+    record: GovernanceRecord,
+    *,
+    proposal: GovernanceRecord,
+    readiness: GovernanceRecord,
+) -> bool:
+    return (
+        record.lineage_id == proposal.lineage_id
+        and set(record.subject_record_ids) == {proposal.record_id, readiness.record_id}
+        and set(record.comment_bindings) == {
+            CommentBinding(proposal.comment_id, proposal.body_sha256),
+            CommentBinding(readiness.comment_id, readiness.body_sha256),
+        }
+    )
+
+
 def _evaluate_governance(
     manifest: ExecutionManifest,
     observation: GuardObservation,
@@ -155,15 +288,24 @@ def _evaluate_governance(
     authority = _exact_record(records, record_type="authority", binding=manifest.authority)
     if proposal is None or readiness is None or authority is None:
         return GuardResult.failure("GOVERNANCE_RECORD_INVALID")
+
+    proposal_binding = CommentBinding(proposal.comment_id, proposal.body_sha256)
+    readiness_binding = CommentBinding(readiness.comment_id, readiness.body_sha256)
     if (
         proposal.lineage_id is None
+        or proposal.subject_record_ids
+        or proposal.comment_bindings
         or readiness.lineage_id != proposal.lineage_id
-        or authority.lineage_id != proposal.lineage_id
-        or proposal.record_id not in readiness.subject_record_ids
-        or proposal.record_id not in authority.subject_record_ids
-        or readiness.record_id not in authority.subject_record_ids
+        or set(readiness.subject_record_ids) != {proposal.record_id}
+        or set(readiness.comment_bindings) != {proposal_binding}
+        or not _valid_lineage_authority(authority, proposal=proposal, readiness=readiness)
     ):
         return GuardResult.failure("GOVERNANCE_RECORD_INVALID")
+
+    for record in (proposal, readiness, authority):
+        if _is_invalidated(record.record_id, records):
+            return GuardResult.failure("GOVERNANCE_SUPERSEDED")
+
     if readiness.payload["details"]["disposition"] != "ready":
         return GuardResult.failure("AUTHORITY_NOT_GRANTED")
     if authority.payload["details"]["disposition"] != "granted":
@@ -178,10 +320,13 @@ def _evaluate_governance(
         and not _is_invalidated(record.record_id, records)
         and not _is_consumed(record.record_id, records)
     ]
+    if any(
+        not _valid_lineage_authority(record, proposal=proposal, readiness=readiness)
+        for record in active_authorities
+    ):
+        return GuardResult.failure("GOVERNANCE_RECORD_INVALID")
     if len(active_authorities) > 1:
         return GuardResult.failure("GOVERNANCE_AMBIGUOUS")
-    if _is_invalidated(authority.record_id, records):
-        return GuardResult.failure("GOVERNANCE_SUPERSEDED")
     if _is_consumed(authority.record_id, records):
         return GuardResult.failure("AUTHORITY_CONSUMED")
     if not active_authorities or active_authorities[0].record_id != authority.record_id:
@@ -199,7 +344,9 @@ def _evaluate_governance(
             return GuardResult.failure("GOVERNANCE_RECORD_INVALID")
         if approval.payload["details"]["disposition"] != "approved":
             return GuardResult.failure("AUTHORITY_NOT_GRANTED")
-        if authority.record_id not in approval.subject_record_ids:
+        if authority.record_id not in approval.subject_record_ids or not _contains_binding(
+            approval, CommentBinding(authority.comment_id, authority.body_sha256)
+        ):
             return GuardResult.failure("GOVERNANCE_RECORD_INVALID")
         if _is_invalidated(approval.record_id, records):
             return GuardResult.failure("GOVERNANCE_SUPERSEDED")
@@ -208,6 +355,10 @@ def _evaluate_governance(
 
 def _compare_control(manifest: ExecutionManifest, observation: GuardObservation) -> GuardResult | None:
     executor = manifest.payload["executor"]
+    if observation.operation != manifest.operation:
+        return GuardResult.failure("AUTHORITY_NOT_GRANTED")
+    if observation.control_repository != executor["repository"]:
+        return GuardResult.failure("CONTROL_IDENTITY_CHANGED")
     if (
         observation.control_commit_sha != executor["commit_sha"]
         or observation.control_tree_sha != executor["tree_sha"]
@@ -253,6 +404,8 @@ def evaluate_guards(
     manifest: ExecutionManifest,
     observation: GuardObservation,
 ) -> GuardResult:
+    if not isinstance(observation, GuardObservation):
+        return GuardResult.failure("OBSERVATION_SHAPE_UNSUPPORTED")
     if observation.stage not in STAGES or observation.read_status not in READ_STATUSES:
         return GuardResult.failure("OBSERVATION_SHAPE_UNSUPPORTED")
     if observation.read_status == "unavailable":
@@ -261,6 +414,8 @@ def evaluate_guards(
         return GuardResult.failure("READ_EVIDENCE_RATE_LIMITED")
     if observation.read_status == "ambiguous":
         return GuardResult.failure("READ_EVIDENCE_AMBIGUOUS")
+    if not _valid_complete_observation(observation):
+        return GuardResult.failure("OBSERVATION_SHAPE_UNSUPPORTED")
 
     if manifest.payload.get("workstream_e_authorised") is not False:
         return GuardResult.failure("WORKSTREAM_E_NOT_AUTHORISED")
@@ -295,6 +450,7 @@ def evaluate_guards(
     if (
         observation.environment_name != environment["name"]
         or observation.environment_policy_sha256 != environment["policy_sha256"]
+        or observation.execution_variable != environment["execution_variable"]
     ):
         return GuardResult.failure("ENVIRONMENT_BOUNDARY_CHANGED")
     if environment["execution_variable_expected_absent"] and not observation.execution_variable_absent:
