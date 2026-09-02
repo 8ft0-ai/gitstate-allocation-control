@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 import inspect
 import unittest
 
@@ -35,6 +36,7 @@ AUTHORITY_ID = "7" * 32
 APPROVAL_ID = "8" * 32
 REVOCATION_ID = "9" * 32
 CONSUMPTION_ID = "a" * 32
+EVALUATED_AT = datetime(2026, 9, 2, 12, 0, 0, tzinfo=timezone.utc)
 
 
 def binding(comment):
@@ -166,6 +168,7 @@ def observation_for(manifest, records, *, owner_observation=None):
     return GuardObservation(
         stage="preflight",
         read_status="complete",
+        evaluated_at=EVALUATED_AT,
         operation=OPERATION,
         control_repository=CONTROL_REPOSITORY,
         control_commit_sha=CONTROL_SHA,
@@ -319,6 +322,106 @@ class OperatorGuardTests(unittest.TestCase):
         result = evaluate_guards(manifest, with_observation(observation, governance_records=records))
         self.assertEqual(result.code, "AUTHORITY_CONSUMED")
 
+    def test_manifest_lifecycle_records_cannot_be_schema_valid_noops(self):
+        _, _, authority, manifest, comments, observation = make_state()
+        terminal = governance_comment(
+            104,
+            governance_payload(
+                "terminal",
+                "b" * 32,
+                manifest_subject(manifest.sha256, record_ids=(AUTHORITY_ID,)),
+                {"conclusion": "failure", "run_id": 12345, "run_attempt": 1},
+            ),
+        )
+
+        cases = []
+        for record_type in ("revocation", "supersession"):
+            details = {"reason": "bounded invalidation", "public_invalidation": {"required": False}}
+            cases.extend(
+                [
+                    governance_comment(
+                        105,
+                        governance_payload(
+                            record_type,
+                            REVOCATION_ID,
+                            manifest_subject(manifest.sha256),
+                            details,
+                        ),
+                    ),
+                    governance_comment(
+                        105,
+                        governance_payload(
+                            record_type,
+                            REVOCATION_ID,
+                            manifest_subject(manifest.sha256, record_ids=("b" * 32,)),
+                            details,
+                        ),
+                    ),
+                ]
+            )
+
+        for lifecycle in cases:
+            with self.subTest(record_type=lifecycle["body"].split('"record_type":"', 1)[1].split('"', 1)[0]):
+                records = parse_governance_comments(
+                    comments + [terminal, lifecycle], expected_owner="8ft0-ai", expected_issue=40
+                )
+                result = evaluate_guards(
+                    manifest, with_observation(observation, governance_records=records)
+                )
+                self.assertEqual(result.code, "GOVERNANCE_RECORD_INVALID")
+
+        for targets in ((), (PROPOSAL_ID,), (PROPOSAL_ID, AUTHORITY_ID)):
+            with self.subTest(consumption_targets=targets):
+                consumption = governance_comment(
+                    105,
+                    governance_payload(
+                        "consumption",
+                        CONSUMPTION_ID,
+                        manifest_subject(manifest.sha256, record_ids=targets),
+                        {"run_id": 12345, "run_attempt": 1},
+                    ),
+                )
+                records = parse_governance_comments(
+                    comments + [consumption], expected_owner="8ft0-ai", expected_issue=40
+                )
+                result = evaluate_guards(
+                    manifest, with_observation(observation, governance_records=records)
+                )
+                self.assertEqual(result.code, "GOVERNANCE_RECORD_INVALID")
+
+        approval = governance_comment(
+            104,
+            governance_payload(
+                "manifest_approval",
+                APPROVAL_ID,
+                manifest_subject(
+                    manifest.sha256,
+                    record_ids=(AUTHORITY_ID,),
+                    comment_bindings=(binding(authority),),
+                ),
+                {"disposition": "approved"},
+            ),
+        )
+        revoked_approval = governance_comment(
+            105,
+            governance_payload(
+                "revocation",
+                REVOCATION_ID,
+                manifest_subject(manifest.sha256, record_ids=(APPROVAL_ID,)),
+                {"reason": "approval revoked", "public_invalidation": {"required": False}},
+            ),
+        )
+        records = parse_governance_comments(
+            comments + [approval, revoked_approval], expected_owner="8ft0-ai", expected_issue=40
+        )
+        live = with_observation(
+            observation,
+            stage="live_l1",
+            governance_records=records,
+            manifest_approval=binding_object(approval),
+        )
+        self.assertEqual(evaluate_guards(manifest, live).code, "GOVERNANCE_SUPERSEDED")
+
     def test_second_simultaneously_active_authority_is_ambiguous(self):
         proposal, readiness, _, manifest, comments, observation = make_state()
         second = governance_comment(
@@ -426,6 +529,7 @@ class OperatorGuardTests(unittest.TestCase):
     def test_malformed_complete_observation_is_implementation_defect(self):
         _, _, _, manifest, _, observation = make_state()
         for changes in (
+            {"evaluated_at": datetime(2026, 9, 2, 12, 0, 0)},
             {"control_commit_sha": "not-a-sha"},
             {"selected_repository_ids": (200, 100)},
             {"module_blobs": ()},
@@ -458,11 +562,22 @@ class OperatorGuardTests(unittest.TestCase):
         self.assertEqual(evaluate_guards(manifest, observation).code, "READ_EVIDENCE_UNAVAILABLE")
         valid = with_observation(
             observation,
+            evaluated_at=datetime(2026, 9, 2, 23, 59, 58, tzinfo=timezone.utc),
             owner_observation=OwnerObservation("owner-observation-1", "a" * 64, True),
         )
         self.assertTrue(evaluate_guards(manifest, valid).passed)
+        at_deadline = with_observation(
+            valid,
+            evaluated_at=datetime(2026, 9, 2, 23, 59, 59, tzinfo=timezone.utc),
+        )
+        self.assertEqual(evaluate_guards(manifest, at_deadline).code, "APP_BOUNDARY_CHANGED")
+        after_deadline = with_observation(
+            valid,
+            evaluated_at=datetime(2026, 9, 3, 0, 0, 0, tzinfo=timezone.utc),
+        )
+        self.assertEqual(evaluate_guards(manifest, after_deadline).code, "APP_BOUNDARY_CHANGED")
         stale = with_observation(
-            observation,
+            valid,
             owner_observation=OwnerObservation("other", "a" * 64, True),
         )
         self.assertEqual(evaluate_guards(manifest, stale).code, "APP_BOUNDARY_CHANGED")

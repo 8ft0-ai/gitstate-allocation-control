@@ -73,6 +73,8 @@ The pure evaluator requires the manifest-bound proposal/readiness/authority comm
 
 A later typed `revocation` or `supersession` targeting the bound proposal, readiness or authority invalidates the lineage. A matching typed `consumption` invalidates one-use authority. More than one simultaneously active, correctly bound authority on the same lineage is `GOVERNANCE_AMBIGUOUS`.
 
+Manifest-scoped lifecycle records are fail-closed as a complete semantic unit rather than accepted as inert syntax. A `manifest_approval` must name the exact bound authority and its exact comment/body binding. A `revocation` or `supersession` must contain at least one resolvable prior target from the bound proposal/readiness/authority lineage or the manifest's approval records; an empty, unknown, unrelated or forward target is `GOVERNANCE_RECORD_INVALID`. A `consumption` must target exactly the bound active authority, and more than one matching consumption is invalid. Optional lifecycle comment bindings may only refer to the records named by that lifecycle subject. A lifecycle record for the current manifest is therefore either semantically valid and effective, or it fails governance validation; it is never silently ignored because its subject is malformed.
+
 A live-stage `manifest_approval` must target the exact manifest digest, name the bound authority record and include the exact authority comment/body binding. B1 represents the later public-invalidation binding as a typed governance detail but does not implement the public projection/invalidation transport. That transport belongs to B2/B3.
 
 ## Historical V1 operator history
@@ -114,7 +116,9 @@ B2 will define the bounded preflight-run suffix semantics. B3 will define the ex
 
 `phase2.operator_guard` accepts an immutable parsed manifest plus a typed observation object and returns `PASS` or one typed failure. It imports no GitHub API, credential, token-mint, workflow-dispatch, ref-update or Workstream-D live execution provider.
 
-A complete observation is shape-validated before semantic comparison. It binds the exact operation, control repository/commit/tree/workflow/module identities, protocol and state identities, operator/workflow baselines, App boundary, environment policy and exact execution-enable variable name/absence. Malformed complete observations are `OBSERVATION_SHAPE_UNSUPPORTED`; unavailable/rate-limited/ambiguous acquisition is kept in the distinct observation-incomplete lane.
+A complete observation is shape-validated before semantic comparison. It binds an explicit timezone-aware UTC `evaluated_at` instant plus the exact operation, control repository/commit/tree/workflow/module identities, protocol and state identities, operator/workflow baselines, App boundary, environment policy and exact execution-enable variable name/absence. Malformed complete observations are `OBSERVATION_SHAPE_UNSUPPORTED`; unavailable/rate-limited/ambiguous acquisition is kept in the distinct observation-incomplete lane.
+
+When an owner observation is required, the common evaluator owns its freshness decision. Matching observation identity/digest and any caller-supplied validity state cannot override the manifest's `valid_through` boundary: the observation is stale and produces `APP_BOUNDARY_CHANGED` when `evaluated_at >= valid_through`. This keeps the freshness rule inside the same semantic guard used by future preflight/L1/L2 callers rather than delegating the deadline decision to those adapters.
 
 Failure classes follow the reviewed Slice A design.
 

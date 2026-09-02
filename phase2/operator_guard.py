@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Sequence
 
 from .operator_manifest import (
@@ -60,6 +61,7 @@ class OwnerObservation:
 class GuardObservation:
     stage: str
     read_status: str
+    evaluated_at: datetime
     operation: str
     control_repository: str
     control_commit_sha: str
@@ -155,7 +157,29 @@ def _valid_owner_observation(value: object) -> bool:
     )
 
 
+def _valid_utc_datetime(value: object) -> bool:
+    return (
+        isinstance(value, datetime)
+        and value.tzinfo is not None
+        and value.utcoffset() == timedelta(0)
+    )
+
+
+def _parse_manifest_utc_time(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value.endswith("Z"):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(timezone.utc)
+
+
 def _valid_complete_observation(observation: GuardObservation) -> bool:
+    if not _valid_utc_datetime(observation.evaluated_at):
+        return False
     if not _valid_string(observation.operation):
         return False
     if not _valid_string(observation.control_repository) or REPOSITORY.fullmatch(observation.control_repository) is None:
@@ -277,6 +301,62 @@ def _valid_lineage_authority(
     )
 
 
+def _validate_manifest_lifecycle_records(
+    records: Sequence[GovernanceRecord],
+    *,
+    proposal: GovernanceRecord,
+    readiness: GovernanceRecord,
+    authority: GovernanceRecord,
+) -> GuardResult | None:
+    approvals = tuple(record for record in records if record.record_type == "manifest_approval")
+    allowed_targets = {
+        proposal.record_id: proposal,
+        readiness.record_id: readiness,
+        authority.record_id: authority,
+        **{record.record_id: record for record in approvals},
+    }
+    authority_binding = CommentBinding(authority.comment_id, authority.body_sha256)
+    consumptions = 0
+
+    for record in records:
+        if record.record_type == "manifest_approval":
+            if (
+                tuple(record.subject_record_ids) != (authority.record_id,)
+                or set(record.comment_bindings) != {authority_binding}
+            ):
+                return GuardResult.failure("GOVERNANCE_RECORD_INVALID")
+            continue
+
+        if record.record_type in {"revocation", "supersession"}:
+            if not record.subject_record_ids:
+                return GuardResult.failure("GOVERNANCE_RECORD_INVALID")
+            targets = []
+            for record_id in record.subject_record_ids:
+                target = allowed_targets.get(record_id)
+                if target is None or target.comment_id >= record.comment_id:
+                    return GuardResult.failure("GOVERNANCE_RECORD_INVALID")
+                targets.append(target)
+            target_bindings = {
+                CommentBinding(target.comment_id, target.body_sha256) for target in targets
+            }
+            if any(binding not in target_bindings for binding in record.comment_bindings):
+                return GuardResult.failure("GOVERNANCE_RECORD_INVALID")
+            continue
+
+        if record.record_type == "consumption":
+            consumptions += 1
+            if consumptions > 1:
+                return GuardResult.failure("GOVERNANCE_RECORD_INVALID")
+            if tuple(record.subject_record_ids) != (authority.record_id,):
+                return GuardResult.failure("GOVERNANCE_RECORD_INVALID")
+            if record.comment_id <= authority.comment_id:
+                return GuardResult.failure("GOVERNANCE_RECORD_INVALID")
+            if any(binding != authority_binding for binding in record.comment_bindings):
+                return GuardResult.failure("GOVERNANCE_RECORD_INVALID")
+
+    return None
+
+
 def _evaluate_governance(
     manifest: ExecutionManifest,
     observation: GuardObservation,
@@ -301,6 +381,15 @@ def _evaluate_governance(
         or not _valid_lineage_authority(authority, proposal=proposal, readiness=readiness)
     ):
         return GuardResult.failure("GOVERNANCE_RECORD_INVALID")
+
+    lifecycle = _validate_manifest_lifecycle_records(
+        records,
+        proposal=proposal,
+        readiness=readiness,
+        authority=authority,
+    )
+    if lifecycle is not None:
+        return lifecycle
 
     for record in (proposal, readiness, authority):
         if _is_invalidated(record.record_id, records):
@@ -396,6 +485,11 @@ def _compare_app(manifest: ExecutionManifest, observation: GuardObservation) -> 
             actual.observation_id != expected_owner["observation_id"]
             or actual.observation_sha256 != expected_owner["observation_sha256"]
         ):
+            return GuardResult.failure("APP_BOUNDARY_CHANGED")
+        valid_through = _parse_manifest_utc_time(expected_owner["valid_through"])
+        if valid_through is None:
+            return GuardResult.failure("MANIFEST_SCHEMA_UNSUPPORTED")
+        if observation.evaluated_at >= valid_through:
             return GuardResult.failure("APP_BOUNDARY_CHANGED")
     return None
 
