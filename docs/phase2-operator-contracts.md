@@ -1,6 +1,6 @@
 # Phase 2 stable operator contracts — B1
 
-This document describes the inert B1 contract surface for the governed stable-operator redesign. B1 introduces only repository-versioned data contracts, canonical history models and a pure semantic guard evaluator. It does not activate a successor execution path, change the protected workflow, dispatch a workflow, access credentials, mint tokens, mutate state or authorise Workstream E.
+This document describes the inert B1 contract surface for the governed stable-operator redesign. B1 introduces only repository-versioned data contracts, canonical history models and pure semantic guard/reducer code. It does not activate a successor execution path, change the protected workflow, dispatch a workflow, access credentials, mint tokens, mutate state or authorise Workstream E.
 
 ## Execution manifest
 
@@ -24,15 +24,35 @@ Supported record types are `proposal`, `readiness`, `authority`, `manifest_appro
 
 Every parsed machine record is owner-authenticated, timestamp-valid, immutable by created/updated timestamp equality, and bound by GitHub comment ID plus exact comment-body SHA-256. Duplicate comment IDs, duplicate record IDs, malformed reserved records and body-digest mismatches fail closed. Parsed governance payloads are deeply immutable after validation.
 
+### Durable governance history
+
+GitHub comments are governance transport and evidence; they are not by themselves the durable authority for irreversible lifecycle state. A fresh enumeration of currently visible comments is therefore not a conforming source for B1 live integration.
+
+The common guard now consumes a `GovernanceHistory` value. It contains:
+
+- the exact manifest SHA-256 to which the snapshot applies;
+- a canonical `HistoryBaseline` over the complete supplied governance-record sequence; and
+- the immutable ordered governance records used by the reducer.
+
+The canonical history form is:
+
+`<comment-id>\t<record-id>\t<record-type>\t<body-sha256>\n`
+
+The baseline covers the complete concatenated UTF-8 sequence including the final newline. The guard requires the snapshot to bind the exact manifest, requires canonical record ordering and uniqueness, recomputes the baseline, and returns `GOVERNANCE_HISTORY_CHANGED` on a manifest mismatch, record shrink/edit inconsistency or baseline mismatch.
+
+B1 deliberately does not implement the live history provider. A later separately reviewed integration slice must obtain `GovernanceHistory` from the governed private append-only/deletion-resistant authority and must retain irreversible transitions even if their GitHub transport comments are later deleted. The provider may extend history but must never reconstruct a shorter authoritative history from currently visible comments. This is a required trust-boundary property of later activation, not an optional caller convention.
+
 ### Lineage and manifest scopes
 
 Proposal, readiness and authority exist before the manifest, so they bind an immutable lineage ID plus exact prior record/comment-body bindings. Post-manifest records additionally bind a manifest SHA-256.
 
 Authority lifecycle is deliberately not scoped away by manifest replacement. A typed consumption, revocation or supersession that targets a bound proposal/readiness/authority remains effective for any successor manifest that attempts to reuse the same lineage authority. In particular, a one-use authority consumed under manifest A cannot become usable again merely because manifest B has a different digest.
 
-Manifest approvals remain manifest-scoped. Revocation of an approval for manifest A does not by itself invalidate a distinct approval for manifest B. Live-stage evaluation requires the exact current manifest approval bound to the exact current authority comment/body identity.
+Manifest approvals remain manifest-scoped. Revocation of an approval for manifest A does not by itself invalidate a distinct approval for manifest B.
 
-Current-manifest lifecycle records cannot be schema-valid no-ops. Revocation/supersession targets must be non-empty, resolvable prior records. Consumption must target exactly the active authority. Duplicate consumption for one authority fails governance validation.
+Approval selection is not a caller input. The governance reducer derives the effective approval from durable history. At a live stage, zero active approvals or one active `rejected` approval produces `AUTHORITY_NOT_GRANTED`; exactly one active `approved` approval is usable; more than one active approval is `GOVERNANCE_AMBIGUOUS`. Replacing an approval therefore requires an explicit prior revocation or supersession; implicit last-comment-wins semantics are forbidden.
+
+Lifecycle target provenance is exact rather than subset-based. Revocation and supersession records must bind every targeted prior record by exact comment ID and body SHA-256, with no missing or additional binding. Consumption must target exactly the active authority and carry exactly that authority's comment/body binding. Under-bound lifecycle records are `GOVERNANCE_RECORD_INVALID`.
 
 A terminal record is also semantically constrained rather than merely parsed: it must target the exact preceding consumption record for the same manifest, include the exact consumption comment/body binding, occur after that consumption, and carry the same run ID and run attempt. Orphan, duplicate, forward-bound or run-mismatched terminal records are `GOVERNANCE_RECORD_INVALID`.
 
@@ -56,15 +76,17 @@ B1 defines deterministic workflow-dispatch identity using:
 
 Terminal conclusion is intentionally excluded from this baseline. If terminal evidence becomes decision-critical, it must be modelled explicitly rather than inherited as a stale historical literal.
 
-## Pure semantic guard evaluator
+## Pure governance reducer and semantic guard
 
-`phase2.operator_guard` accepts an immutable parsed manifest plus a typed observation object and returns `PASS` or one typed failure. It imports no GitHub API, credential, token-mint, workflow-dispatch, ref-update or Workstream-D live execution provider.
+`phase2.governance_state` is the single pure reducer for governance lifecycle semantics. Given an exact manifest plus a manifest-bound durable `GovernanceHistory`, it validates causal lineage, lifecycle targets, consumption/terminal structure and active authority, then derives a `GovernanceState` including the effective manifest-approval status.
 
-A complete observation is shape-validated before semantic comparison. It binds an explicit timezone-aware UTC evaluation instant plus exact operation, control repository/commit/tree/workflow/module identities, protocol/state identities, operator/workflow baselines, App boundary, environment policy and exact execution-enable variable name/absence.
+`phase2.operator_guard` accepts the immutable parsed manifest plus a typed observation object and returns `PASS` or one typed failure. It imports no GitHub API, credential, token-mint, workflow-dispatch, ref-update or Workstream-D live execution provider. The guard does not accept a caller-selected manifest approval.
+
+A complete observation is shape-validated before semantic comparison. It binds an explicit timezone-aware UTC evaluation instant plus exact operation, control repository/commit/tree/workflow/module identities, protocol/state identities, operator/workflow baselines, App boundary, environment policy, exact execution-enable variable name/absence and the manifest-bound durable governance history.
 
 When an owner observation is required, the common evaluator owns its freshness decision. Caller-supplied validity cannot override the manifest's `valid_through` boundary; `evaluated_at >= valid_through` produces `APP_BOUNDARY_CHANGED`.
 
-Authority/security failures are `GOVERNANCE_RECORD_INVALID`, `GOVERNANCE_AMBIGUOUS`, `GOVERNANCE_SUPERSEDED`, `AUTHORITY_NOT_GRANTED`, `AUTHORITY_CONSUMED` and `WORKSTREAM_E_NOT_AUTHORISED`.
+Authority/security failures are `GOVERNANCE_HISTORY_CHANGED`, `GOVERNANCE_RECORD_INVALID`, `GOVERNANCE_AMBIGUOUS`, `GOVERNANCE_SUPERSEDED`, `AUTHORITY_NOT_GRANTED`, `AUTHORITY_CONSUMED` and `WORKSTREAM_E_NOT_AUTHORISED`.
 
 Mutable invalidators are `CONTROL_IDENTITY_CHANGED`, `WORKFLOW_IDENTITY_CHANGED`, `PROTOCOL_IDENTITY_CHANGED`, `STATE_BASELINE_CHANGED`, `OPERATOR_HISTORY_CHANGED`, `WORKFLOW_HISTORY_CHANGED`, `APP_BOUNDARY_CHANGED`, `ENVIRONMENT_BOUNDARY_CHANGED` and `EXECUTION_ENABLEMENT_CHANGED`.
 
@@ -76,6 +98,6 @@ Every non-PASS result is diagnostic only. Nothing in B1 authorises automatic ref
 
 ## Activation boundary
 
-B1 is intentionally inert. It does not modify the protected workflow, the existing V1 capsule/runtime implementation, credential or App-token providers, Workstream-D live/recovery helpers, public operator-history state, environment/App/repository settings or retained state. Later integration slices remain separately governed and require separate fresh review before activation.
+B1 is intentionally inert. It does not modify the protected workflow, the existing V1 capsule/runtime implementation, credential or App-token providers, Workstream-D live/recovery helpers, public operator-history state, environment/App/repository settings or retained state. The durable governance-history provider and any successor workflow integration remain separately governed later slices and require separate fresh review before activation.
 
 No B1 result creates merge, live execution, workflow-dispatch, credential, state-mutation, recovery or Workstream-E authority.

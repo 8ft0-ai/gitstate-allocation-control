@@ -9,7 +9,6 @@ from test_operator_guard import (
     PROPOSAL_ID,
     READINESS_ID,
     binding,
-    binding_object,
     governance_comment,
     governance_payload,
     lineage_subject,
@@ -17,7 +16,7 @@ from test_operator_guard import (
     manifest_subject,
     make_state,
     observation_for,
-    with_observation,
+    with_records,
 )
 
 
@@ -126,12 +125,7 @@ class OperatorGuardOrderingTests(unittest.TestCase):
             expected_owner="8ft0-ai",
             expected_issue=ISSUE,
         )
-        live = with_observation(
-            observation,
-            stage="live_l1",
-            governance_records=records,
-            manifest_approval=binding_object(approval),
-        )
+        live = with_records(observation, manifest, records, stage="live_l1")
         self.assertEqual(evaluate_guards(manifest, live).code, "GOVERNANCE_RECORD_INVALID")
 
 

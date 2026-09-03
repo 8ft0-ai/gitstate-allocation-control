@@ -3,15 +3,9 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Sequence
 
-from .operator_manifest import (
-    CommentBinding,
-    ExecutionManifest,
-    GovernanceRecord,
-    HistoryBaseline,
-    ModuleBlob,
-)
+from .governance_state import GovernanceHistory, GovernanceStateError, reduce_governance_history
+from .operator_manifest import ExecutionManifest, HistoryBaseline, ModuleBlob
 
 
 AUTHORITY_SECURITY = "authority_security"
@@ -20,6 +14,7 @@ OBSERVATION_INCOMPLETE = "observation_incomplete"
 IMPLEMENTATION_DEFECT = "implementation_defect"
 
 FAILURE_CATEGORY = {
+    "GOVERNANCE_HISTORY_CHANGED": AUTHORITY_SECURITY,
     "GOVERNANCE_RECORD_INVALID": AUTHORITY_SECURITY,
     "GOVERNANCE_AMBIGUOUS": AUTHORITY_SECURITY,
     "GOVERNANCE_SUPERSEDED": AUTHORITY_SECURITY,
@@ -83,8 +78,7 @@ class GuardObservation:
     environment_policy_sha256: str
     execution_variable: str
     execution_variable_absent: bool
-    governance_records: tuple[GovernanceRecord, ...]
-    manifest_approval: CommentBinding | None = None
+    governance_history: GovernanceHistory
 
 
 @dataclass(frozen=True)
@@ -112,14 +106,6 @@ def _valid_positive_int(value: object) -> bool:
 
 def _valid_hex(value: object, pattern: re.Pattern[str]) -> bool:
     return isinstance(value, str) and pattern.fullmatch(value) is not None
-
-
-def _valid_binding(value: object) -> bool:
-    return (
-        isinstance(value, CommentBinding)
-        and _valid_positive_int(value.comment_id)
-        and _valid_hex(value.body_sha256, SHA256)
-    )
 
 
 def _valid_history(value: object) -> bool:
@@ -182,7 +168,10 @@ def _valid_complete_observation(observation: GuardObservation) -> bool:
         return False
     if not _valid_string(observation.operation):
         return False
-    if not _valid_string(observation.control_repository) or REPOSITORY.fullmatch(observation.control_repository) is None:
+    if (
+        not _valid_string(observation.control_repository)
+        or REPOSITORY.fullmatch(observation.control_repository) is None
+    ):
         return False
     for value in (
         observation.control_commit_sha,
@@ -197,9 +186,13 @@ def _valid_complete_observation(observation: GuardObservation) -> bool:
         return False
     if not _valid_module_blobs(observation.module_blobs):
         return False
-    if not _valid_history(observation.operator_history) or not _valid_history(observation.workflow_history):
+    if not _valid_history(observation.operator_history) or not _valid_history(
+        observation.workflow_history
+    ):
         return False
-    if not _valid_positive_int(observation.app_id) or not _valid_positive_int(observation.installation_id):
+    if not _valid_positive_int(observation.app_id) or not _valid_positive_int(
+        observation.installation_id
+    ):
         return False
     if observation.repository_selection != "selected":
         return False
@@ -219,292 +212,44 @@ def _valid_complete_observation(observation: GuardObservation) -> bool:
         return False
     if not _valid_hex(observation.environment_policy_sha256, SHA256):
         return False
-    if not _valid_string(observation.execution_variable) or type(observation.execution_variable_absent) is not bool:
-        return False
-    if not isinstance(observation.governance_records, tuple) or any(
-        not isinstance(record, GovernanceRecord) for record in observation.governance_records
+    if (
+        not _valid_string(observation.execution_variable)
+        or type(observation.execution_variable_absent) is not bool
     ):
         return False
-    if observation.manifest_approval is not None and not _valid_binding(observation.manifest_approval):
+    if not isinstance(observation.governance_history, GovernanceHistory):
         return False
     return True
-
-
-def _same_binding(record: GovernanceRecord, binding: CommentBinding) -> bool:
-    return record.comment_id == binding.comment_id and record.body_sha256 == binding.body_sha256
-
-
-def _exact_record(
-    records: Sequence[GovernanceRecord],
-    *,
-    record_type: str,
-    binding: CommentBinding,
-) -> GovernanceRecord | None:
-    matches = [
-        record
-        for record in records
-        if record.record_type == record_type and _same_binding(record, binding)
-    ]
-    if len(matches) != 1:
-        return None
-    return matches[0]
-
-
-def _valid_lineage_authority(
-    record: GovernanceRecord,
-    *,
-    proposal: GovernanceRecord,
-    readiness: GovernanceRecord,
-) -> bool:
-    return (
-        proposal.comment_id < readiness.comment_id < record.comment_id
-        and record.lineage_id == proposal.lineage_id
-        and set(record.subject_record_ids) == {proposal.record_id, readiness.record_id}
-        and set(record.comment_bindings) == {
-            CommentBinding(proposal.comment_id, proposal.body_sha256),
-            CommentBinding(readiness.comment_id, readiness.body_sha256),
-        }
-    )
-
-
-def _same_issue_operation(
-    manifest: ExecutionManifest,
-    records: Sequence[GovernanceRecord],
-) -> tuple[GovernanceRecord, ...]:
-    return tuple(
-        record
-        for record in records
-        if record.governing_issue == manifest.governing_issue
-        and record.operation == manifest.operation
-    )
-
-
-def _semantic_lifecycle_records(
-    manifest: ExecutionManifest,
-    records: Sequence[GovernanceRecord],
-    *,
-    lineage_record_ids: frozenset[str],
-) -> tuple[GovernanceRecord, ...]:
-    result: list[GovernanceRecord] = []
-    for record in records:
-        if record.record_type in {"proposal", "readiness", "authority"}:
-            result.append(record)
-            continue
-        if record.manifest_sha256 == manifest.sha256:
-            result.append(record)
-            continue
-        if (
-            record.record_type in {"revocation", "supersession", "consumption"}
-            and lineage_record_ids.intersection(record.subject_record_ids)
-        ):
-            result.append(record)
-    return tuple(result)
-
-
-def _is_invalidated(record_id: str, records: Sequence[GovernanceRecord]) -> bool:
-    return any(
-        record.record_type in {"revocation", "supersession"}
-        and record_id in record.subject_record_ids
-        for record in records
-    )
-
-
-def _is_consumed(record_id: str, records: Sequence[GovernanceRecord]) -> bool:
-    return any(
-        record.record_type == "consumption" and record_id in record.subject_record_ids
-        for record in records
-    )
-
-
-def _validate_manifest_lifecycle_records(
-    manifest: ExecutionManifest,
-    records: Sequence[GovernanceRecord],
-    *,
-    proposal: GovernanceRecord,
-    readiness: GovernanceRecord,
-    authority: GovernanceRecord,
-) -> GuardResult | None:
-    current_approvals = tuple(
-        record
-        for record in records
-        if record.record_type == "manifest_approval" and record.manifest_sha256 == manifest.sha256
-    )
-    allowed_targets = {
-        proposal.record_id: proposal,
-        readiness.record_id: readiness,
-        authority.record_id: authority,
-        **{record.record_id: record for record in current_approvals},
-    }
-    authority_binding = CommentBinding(authority.comment_id, authority.body_sha256)
-    consumptions: list[GovernanceRecord] = []
-    current_consumptions: list[GovernanceRecord] = []
-    current_terminals: list[GovernanceRecord] = []
-
-    for record in records:
-        if record.record_type == "manifest_approval":
-            if record.manifest_sha256 != manifest.sha256:
-                continue
-            if (
-                tuple(record.subject_record_ids) != (authority.record_id,)
-                or set(record.comment_bindings) != {authority_binding}
-                or record.comment_id <= authority.comment_id
-            ):
-                return GuardResult.failure("GOVERNANCE_RECORD_INVALID")
-            continue
-
-        if record.record_type in {"revocation", "supersession"}:
-            if not record.subject_record_ids:
-                return GuardResult.failure("GOVERNANCE_RECORD_INVALID")
-            targets: list[GovernanceRecord] = []
-            for record_id in record.subject_record_ids:
-                target = allowed_targets.get(record_id)
-                if target is None or target.comment_id >= record.comment_id:
-                    return GuardResult.failure("GOVERNANCE_RECORD_INVALID")
-                targets.append(target)
-            target_bindings = {
-                CommentBinding(target.comment_id, target.body_sha256) for target in targets
-            }
-            if any(binding not in target_bindings for binding in record.comment_bindings):
-                return GuardResult.failure("GOVERNANCE_RECORD_INVALID")
-            continue
-
-        if record.record_type == "consumption":
-            consumptions.append(record)
-            if tuple(record.subject_record_ids) != (authority.record_id,):
-                return GuardResult.failure("GOVERNANCE_RECORD_INVALID")
-            if record.comment_id <= authority.comment_id:
-                return GuardResult.failure("GOVERNANCE_RECORD_INVALID")
-            if any(binding != authority_binding for binding in record.comment_bindings):
-                return GuardResult.failure("GOVERNANCE_RECORD_INVALID")
-            if record.manifest_sha256 == manifest.sha256:
-                current_consumptions.append(record)
-            continue
-
-        if record.record_type == "terminal":
-            if record.manifest_sha256 != manifest.sha256:
-                continue
-            current_terminals.append(record)
-
-    if len(consumptions) > 1:
-        return GuardResult.failure("GOVERNANCE_RECORD_INVALID")
-    if len(current_terminals) > 1:
-        return GuardResult.failure("GOVERNANCE_RECORD_INVALID")
-
-    if current_terminals:
-        if len(current_consumptions) != 1:
-            return GuardResult.failure("GOVERNANCE_RECORD_INVALID")
-        terminal = current_terminals[0]
-        consumption = current_consumptions[0]
-        consumption_binding = CommentBinding(consumption.comment_id, consumption.body_sha256)
-        if (
-            tuple(terminal.subject_record_ids) != (consumption.record_id,)
-            or set(terminal.comment_bindings) != {consumption_binding}
-            or terminal.comment_id <= consumption.comment_id
-            or terminal.details["run_id"] != consumption.details["run_id"]
-            or terminal.details["run_attempt"] != consumption.details["run_attempt"]
-        ):
-            return GuardResult.failure("GOVERNANCE_RECORD_INVALID")
-
-    return None
 
 
 def _evaluate_governance(
     manifest: ExecutionManifest,
     observation: GuardObservation,
 ) -> GuardResult | None:
-    all_records = _same_issue_operation(manifest, observation.governance_records)
+    try:
+        state = reduce_governance_history(manifest, observation.governance_history)
+    except GovernanceStateError as exc:
+        return GuardResult.failure(exc.code)
 
-    proposal = _exact_record(all_records, record_type="proposal", binding=manifest.proposal)
-    readiness = _exact_record(all_records, record_type="readiness", binding=manifest.readiness)
-    authority = _exact_record(all_records, record_type="authority", binding=manifest.authority)
-    if proposal is None or readiness is None or authority is None:
-        return GuardResult.failure("GOVERNANCE_RECORD_INVALID")
-
-    proposal_binding = CommentBinding(proposal.comment_id, proposal.body_sha256)
-    readiness_binding = CommentBinding(readiness.comment_id, readiness.body_sha256)
-    if (
-        proposal.lineage_id is None
-        or proposal.subject_record_ids
-        or proposal.comment_bindings
-        or readiness.lineage_id != proposal.lineage_id
-        or set(readiness.subject_record_ids) != {proposal.record_id}
-        or set(readiness.comment_bindings) != {proposal_binding}
-        or not _valid_lineage_authority(authority, proposal=proposal, readiness=readiness)
-    ):
-        return GuardResult.failure("GOVERNANCE_RECORD_INVALID")
-
-    lineage_record_ids = frozenset({proposal.record_id, readiness.record_id, authority.record_id})
-    records = _semantic_lifecycle_records(
-        manifest,
-        all_records,
-        lineage_record_ids=lineage_record_ids,
-    )
-
-    lifecycle = _validate_manifest_lifecycle_records(
-        manifest,
-        records,
-        proposal=proposal,
-        readiness=readiness,
-        authority=authority,
-    )
-    if lifecycle is not None:
-        return lifecycle
-
-    for record in (proposal, readiness, authority):
-        if _is_invalidated(record.record_id, records):
-            return GuardResult.failure("GOVERNANCE_SUPERSEDED")
-
-    if readiness.details["disposition"] != "ready":
-        return GuardResult.failure("AUTHORITY_NOT_GRANTED")
-    if authority.details["disposition"] != "granted":
-        return GuardResult.failure("AUTHORITY_NOT_GRANTED")
-
-    active_authorities = [
-        record
-        for record in records
-        if record.record_type == "authority"
-        and record.lineage_id == authority.lineage_id
-        and record.details.get("disposition") == "granted"
-        and not _is_invalidated(record.record_id, records)
-        and not _is_consumed(record.record_id, records)
-    ]
-    if any(
-        not _valid_lineage_authority(record, proposal=proposal, readiness=readiness)
-        for record in active_authorities
-    ):
-        return GuardResult.failure("GOVERNANCE_RECORD_INVALID")
-    if len(active_authorities) > 1:
-        return GuardResult.failure("GOVERNANCE_AMBIGUOUS")
-    if _is_consumed(authority.record_id, records):
+    if state.authority_status == "superseded":
+        return GuardResult.failure("GOVERNANCE_SUPERSEDED")
+    if state.authority_status == "consumed":
         return GuardResult.failure("AUTHORITY_CONSUMED")
-    if not active_authorities or active_authorities[0].record_id != authority.record_id:
+    if state.authority_status != "active":
         return GuardResult.failure("AUTHORITY_NOT_GRANTED")
 
     if observation.stage != "preflight":
-        if observation.manifest_approval is None:
+        if state.approval_status == "ambiguous":
+            return GuardResult.failure("GOVERNANCE_AMBIGUOUS")
+        if state.approval_status != "approved":
             return GuardResult.failure("AUTHORITY_NOT_GRANTED")
-        approval = _exact_record(
-            records,
-            record_type="manifest_approval",
-            binding=observation.manifest_approval,
-        )
-        if approval is None or approval.manifest_sha256 != manifest.sha256:
-            return GuardResult.failure("GOVERNANCE_RECORD_INVALID")
-        if approval.details["disposition"] != "approved":
-            return GuardResult.failure("AUTHORITY_NOT_GRANTED")
-        if (
-            tuple(approval.subject_record_ids) != (authority.record_id,)
-            or set(approval.comment_bindings) != {
-                CommentBinding(authority.comment_id, authority.body_sha256)
-            }
-        ):
-            return GuardResult.failure("GOVERNANCE_RECORD_INVALID")
-        if _is_invalidated(approval.record_id, records):
-            return GuardResult.failure("GOVERNANCE_SUPERSEDED")
     return None
 
 
-def _compare_control(manifest: ExecutionManifest, observation: GuardObservation) -> GuardResult | None:
+def _compare_control(
+    manifest: ExecutionManifest,
+    observation: GuardObservation,
+) -> GuardResult | None:
     executor = manifest.payload["executor"]
     if observation.operation != manifest.operation:
         return GuardResult.failure("AUTHORITY_NOT_GRANTED")
@@ -522,7 +267,10 @@ def _compare_control(manifest: ExecutionManifest, observation: GuardObservation)
     return None
 
 
-def _compare_app(manifest: ExecutionManifest, observation: GuardObservation) -> GuardResult | None:
+def _compare_app(
+    manifest: ExecutionManifest,
+    observation: GuardObservation,
+) -> GuardResult | None:
     app = manifest.payload["allocator_app"]
     if (
         observation.app_id != app["app_id"]
