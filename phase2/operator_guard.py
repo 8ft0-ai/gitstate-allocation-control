@@ -257,7 +257,8 @@ def _valid_lineage_authority(
     readiness: GovernanceRecord,
 ) -> bool:
     return (
-        record.lineage_id == proposal.lineage_id
+        proposal.comment_id < readiness.comment_id < record.comment_id
+        and record.lineage_id == proposal.lineage_id
         and set(record.subject_record_ids) == {proposal.record_id, readiness.record_id}
         and set(record.comment_bindings) == {
             CommentBinding(proposal.comment_id, proposal.body_sha256),
