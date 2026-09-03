@@ -4,15 +4,20 @@ import unittest
 
 import phase2.governance_state as governance_state_module
 import phase2.operator_guard as guard_module
-from phase2.governance_state import GovernanceHistory, build_governance_history
+from phase2.governance_state import (
+    GovernanceHistory,
+    build_governance_history,
+    governance_history_baseline,
+    parse_guarded_execution_manifest,
+)
 from phase2.operator_guard import GuardObservation, OwnerObservation, evaluate_guards
 from phase2.operator_manifest import (
     GOVERNANCE_CONTRACT,
     GOVERNANCE_PREFIX,
     MANIFEST_CONTRACT,
     ModuleBlob,
+    OperatorContractError,
     canonical_json,
-    parse_execution_manifest,
     parse_governance_comments,
     sha256_text,
 )
@@ -115,9 +120,24 @@ def lineage_comments(*, readiness_disposition="ready"):
     return proposal, readiness, authority
 
 
-def manifest_payload(proposal, readiness, authority, *, owner_observation=None, state_digest=STATE_DIGEST):
+def parsed_records(comments):
+    return parse_governance_comments(comments, expected_owner="8ft0-ai", expected_issue=ISSUE)
+
+
+def manifest_payload(
+    proposal,
+    readiness,
+    authority,
+    *,
+    governance_records=None,
+    owner_observation=None,
+    state_digest=STATE_DIGEST,
+):
     if owner_observation is None:
         owner_observation = {"required": False}
+    if governance_records is None:
+        governance_records = parsed_records([proposal, readiness, authority])
+    history = governance_history_baseline(governance_records)
     return {
         "contract": MANIFEST_CONTRACT,
         "operation": OPERATION,
@@ -133,6 +153,10 @@ def manifest_payload(proposal, readiness, authority, *, owner_observation=None, 
         "proposal": binding(proposal),
         "readiness": binding(readiness),
         "authority": binding(authority),
+        "governance_history": {
+            "through_id": history.through_id,
+            "history_sha256": history.history_sha256,
+        },
         "state_baseline": {"commit_sha": STATE_SHA, "digest_sha256": state_digest},
         "operator_history": {"through_id": 0, "history_sha256": sha256_text("")},
         "workflow_history": {"through_id": 0, "history_sha256": sha256_text("")},
@@ -153,6 +177,20 @@ def manifest_payload(proposal, readiness, authority, *, owner_observation=None, 
         "single_use": True,
         "workstream_e_authorised": False,
     }
+
+
+def parse_manifest(proposal, readiness, authority, *, governance_records=None, **changes):
+    return parse_guarded_execution_manifest(
+        canonical_json(
+            manifest_payload(
+                proposal,
+                readiness,
+                authority,
+                governance_records=governance_records,
+                **changes,
+            )
+        )
+    )
 
 
 def observation_for(manifest, records, *, owner_observation=None):
@@ -187,19 +225,16 @@ def observation_for(manifest, records, *, owner_observation=None):
 
 def make_state(*, readiness_disposition="ready", owner_observation=None, state_digest=STATE_DIGEST):
     proposal, readiness, authority = lineage_comments(readiness_disposition=readiness_disposition)
-    manifest = parse_execution_manifest(
-        canonical_json(
-            manifest_payload(
-                proposal,
-                readiness,
-                authority,
-                owner_observation=owner_observation,
-                state_digest=state_digest,
-            )
-        )
-    )
     comments = [proposal, readiness, authority]
-    records = parse_governance_comments(comments, expected_owner="8ft0-ai", expected_issue=ISSUE)
+    records = parsed_records(comments)
+    manifest = parse_manifest(
+        proposal,
+        readiness,
+        authority,
+        governance_records=records,
+        owner_observation=owner_observation,
+        state_digest=state_digest,
+    )
     return proposal, readiness, authority, manifest, comments, observation_for(manifest, records)
 
 
@@ -218,6 +253,22 @@ def with_records(observation, manifest, records, **changes):
 
 
 class OperatorGuardTests(unittest.TestCase):
+    def test_guarded_manifest_is_canonical_digest_bound_and_requires_history_anchor(self):
+        proposal, readiness, authority = lineage_comments()
+        records = parsed_records([proposal, readiness, authority])
+        raw = canonical_json(
+            manifest_payload(proposal, readiness, authority, governance_records=records)
+        )
+        manifest = parse_guarded_execution_manifest(raw)
+        self.assertEqual(manifest.sha256, sha256_text(raw))
+        self.assertEqual(manifest.governance_history, governance_history_baseline(records))
+        with self.assertRaisesRegex(OperatorContractError, "MANIFEST_IDENTITY_MISMATCH"):
+            parse_guarded_execution_manifest(raw, expected_sha256="0" * 64)
+        missing = dict(manifest_payload(proposal, readiness, authority, governance_records=records))
+        del missing["governance_history"]
+        with self.assertRaisesRegex(OperatorContractError, "MANIFEST_SCHEMA_MISMATCH"):
+            parse_guarded_execution_manifest(canonical_json(missing))
+
     def test_preflight_passes_with_semantic_governance_and_ordinary_later_comment(self):
         _, _, _, manifest, comments, observation = make_state()
         comments.append(
@@ -229,7 +280,7 @@ class OperatorGuardTests(unittest.TestCase):
                 "updated_at": "2026-09-02T01:00:00Z",
             }
         )
-        records = parse_governance_comments(comments, expected_owner="8ft0-ai", expected_issue=ISSUE)
+        records = parsed_records(comments)
         self.assertTrue(evaluate_guards(manifest, with_records(observation, manifest, records)).passed)
 
     def test_stale_readiness_binding_and_bad_lineage_fail_closed(self):
@@ -243,19 +294,14 @@ class OperatorGuardTests(unittest.TestCase):
                 {"disposition": "not_ready"},
             ),
         )
-        records = parse_governance_comments(
-            [proposal, stale_readiness, authority], expected_owner="8ft0-ai", expected_issue=ISSUE
-        )
+        records = parsed_records([proposal, stale_readiness, authority])
         self.assertEqual(
             evaluate_guards(manifest, with_records(observation, manifest, records)).code,
-            "GOVERNANCE_RECORD_INVALID",
+            "GOVERNANCE_HISTORY_CHANGED",
         )
 
     def test_consumed_authority_remains_consumed_across_successor_manifest(self):
         proposal, readiness, authority, first, comments, _ = make_state()
-        successor = parse_execution_manifest(
-            canonical_json(manifest_payload(proposal, readiness, authority, state_digest="9" * 64))
-        )
         consumption = governance_comment(
             104,
             governance_payload(
@@ -269,16 +315,33 @@ class OperatorGuardTests(unittest.TestCase):
                 {"run_id": 12345, "run_attempt": 1},
             ),
         )
-        records = parse_governance_comments(
-            comments + [consumption], expected_owner="8ft0-ai", expected_issue=ISSUE
+        records = parsed_records(comments + [consumption])
+        successor = parse_manifest(
+            proposal,
+            readiness,
+            authority,
+            governance_records=records,
+            state_digest="9" * 64,
         )
         self.assertEqual(evaluate_guards(successor, observation_for(successor, records)).code, "AUTHORITY_CONSUMED")
 
+        self_consistent_shrunk = build_governance_history(
+            successor.sha256,
+            parsed_records(comments),
+        )
+        self.assertEqual(
+            evaluate_guards(
+                successor,
+                with_observation(
+                    observation_for(successor, records),
+                    governance_history=self_consistent_shrunk,
+                ),
+            ).code,
+            "GOVERNANCE_HISTORY_CHANGED",
+        )
+
     def test_revoked_authority_remains_revoked_across_successor_manifest(self):
         proposal, readiness, authority, first, comments, _ = make_state()
-        successor = parse_execution_manifest(
-            canonical_json(manifest_payload(proposal, readiness, authority, state_digest="9" * 64))
-        )
         revocation = governance_comment(
             104,
             governance_payload(
@@ -292,10 +355,18 @@ class OperatorGuardTests(unittest.TestCase):
                 {"reason": "owner revoked", "public_invalidation": {"required": False}},
             ),
         )
-        records = parse_governance_comments(
-            comments + [revocation], expected_owner="8ft0-ai", expected_issue=ISSUE
+        records = parsed_records(comments + [revocation])
+        successor = parse_manifest(
+            proposal,
+            readiness,
+            authority,
+            governance_records=records,
+            state_digest="9" * 64,
         )
-        self.assertEqual(evaluate_guards(successor, observation_for(successor, records)).code, "GOVERNANCE_SUPERSEDED")
+        self.assertEqual(
+            evaluate_guards(successor, observation_for(successor, records)).code,
+            "GOVERNANCE_SUPERSEDED",
+        )
 
     def test_old_manifest_approval_invalidation_does_not_poison_successor_manifest(self):
         proposal, readiness, authority, first, comments, _ = make_state()
@@ -325,65 +396,62 @@ class OperatorGuardTests(unittest.TestCase):
                 {"reason": "manifest superseded", "public_invalidation": {"required": False}},
             ),
         )
-        successor = parse_execution_manifest(
-            canonical_json(manifest_payload(proposal, readiness, authority, state_digest="9" * 64))
-        )
-        records = parse_governance_comments(
-            comments + [old_approval, old_revocation], expected_owner="8ft0-ai", expected_issue=ISSUE
+        records = parsed_records(comments + [old_approval, old_revocation])
+        successor = parse_manifest(
+            proposal,
+            readiness,
+            authority,
+            governance_records=records,
+            state_digest="9" * 64,
         )
         self.assertTrue(evaluate_guards(successor, observation_for(successor, records)).passed)
 
     def test_lifecycle_targets_require_exact_record_and_body_bindings(self):
         proposal, _, authority, manifest, comments, observation = make_state()
-        empty_target_revocation = governance_comment(
-            104,
-            governance_payload(
-                "revocation",
-                REVOCATION_ID,
-                manifest_subject(manifest.sha256),
-                {"reason": "bad", "public_invalidation": {"required": False}},
-            ),
-        )
-        empty_binding_consumption = governance_comment(
-            104,
-            governance_payload(
-                "consumption",
-                CONSUMPTION_ID,
-                manifest_subject(manifest.sha256, record_ids=(AUTHORITY_ID,)),
-                {"run_id": 12345, "run_attempt": 1},
-            ),
-        )
-        partial_binding_revocation = governance_comment(
-            104,
-            governance_payload(
-                "revocation",
-                REVOCATION_ID,
-                manifest_subject(
-                    manifest.sha256,
-                    record_ids=(PROPOSAL_ID, AUTHORITY_ID),
-                    comment_bindings=(binding(proposal),),
+        malformed = (
+            governance_comment(
+                104,
+                governance_payload(
+                    "revocation",
+                    REVOCATION_ID,
+                    manifest_subject(manifest.sha256),
+                    {"reason": "bad", "public_invalidation": {"required": False}},
                 ),
-                {"reason": "partial binding", "public_invalidation": {"required": False}},
+            ),
+            governance_comment(
+                104,
+                governance_payload(
+                    "consumption",
+                    CONSUMPTION_ID,
+                    manifest_subject(manifest.sha256, record_ids=(AUTHORITY_ID,)),
+                    {"run_id": 12345, "run_attempt": 1},
+                ),
+            ),
+            governance_comment(
+                104,
+                governance_payload(
+                    "revocation",
+                    REVOCATION_ID,
+                    manifest_subject(
+                        manifest.sha256,
+                        record_ids=(PROPOSAL_ID, AUTHORITY_ID),
+                        comment_bindings=(binding(proposal),),
+                    ),
+                    {"reason": "partial binding", "public_invalidation": {"required": False}},
+                ),
+            ),
+            governance_comment(
+                104,
+                governance_payload(
+                    "consumption",
+                    CONSUMPTION_ID,
+                    manifest_subject(manifest.sha256, record_ids=(PROPOSAL_ID,)),
+                    {"run_id": 12345, "run_attempt": 1},
+                ),
             ),
         )
-        wrong_target_consumption = governance_comment(
-            104,
-            governance_payload(
-                "consumption",
-                CONSUMPTION_ID,
-                manifest_subject(manifest.sha256, record_ids=(PROPOSAL_ID,)),
-                {"run_id": 12345, "run_attempt": 1},
-            ),
-        )
-        for lifecycle in (
-            empty_target_revocation,
-            empty_binding_consumption,
-            partial_binding_revocation,
-            wrong_target_consumption,
-        ):
-            records = parse_governance_comments(
-                comments + [lifecycle], expected_owner="8ft0-ai", expected_issue=ISSUE
-            )
+        for lifecycle in malformed:
+            records = parsed_records(comments + [lifecycle])
             self.assertEqual(
                 evaluate_guards(manifest, with_records(observation, manifest, records)).code,
                 "GOVERNANCE_RECORD_INVALID",
@@ -402,9 +470,7 @@ class OperatorGuardTests(unittest.TestCase):
                 {"reason": "exact targets", "public_invalidation": {"required": False}},
             ),
         )
-        exact_records = parse_governance_comments(
-            comments + [exact_revocation], expected_owner="8ft0-ai", expected_issue=ISSUE
-        )
+        exact_records = parsed_records(comments + [exact_revocation])
         self.assertEqual(
             evaluate_guards(manifest, with_records(observation, manifest, exact_records)).code,
             "GOVERNANCE_SUPERSEDED",
@@ -438,9 +504,7 @@ class OperatorGuardTests(unittest.TestCase):
                 {"conclusion": "failure", "run_id": 12345, "run_attempt": 1},
             ),
         )
-        valid_records = parse_governance_comments(
-            comments + [consumption, valid_terminal], expected_owner="8ft0-ai", expected_issue=ISSUE
-        )
+        valid_records = parsed_records(comments + [consumption, valid_terminal])
         self.assertEqual(
             evaluate_guards(manifest, with_records(observation, manifest, valid_records)).code,
             "AUTHORITY_CONSUMED",
@@ -459,9 +523,7 @@ class OperatorGuardTests(unittest.TestCase):
                 {"conclusion": "failure", "run_id": 99999, "run_attempt": 1},
             ),
         )
-        wrong_records = parse_governance_comments(
-            comments + [consumption, wrong_run], expected_owner="8ft0-ai", expected_issue=ISSUE
-        )
+        wrong_records = parsed_records(comments + [consumption, wrong_run])
         self.assertEqual(
             evaluate_guards(manifest, with_records(observation, manifest, wrong_records)).code,
             "GOVERNANCE_RECORD_INVALID",
@@ -476,9 +538,7 @@ class OperatorGuardTests(unittest.TestCase):
                 {"conclusion": "failure", "run_id": 12345, "run_attempt": 1},
             ),
         )
-        orphan_records = parse_governance_comments(
-            comments + [orphan], expected_owner="8ft0-ai", expected_issue=ISSUE
-        )
+        orphan_records = parsed_records(comments + [orphan])
         self.assertEqual(
             evaluate_guards(manifest, with_records(observation, manifest, orphan_records)).code,
             "GOVERNANCE_RECORD_INVALID",
@@ -498,9 +558,7 @@ class OperatorGuardTests(unittest.TestCase):
                 {"disposition": "granted", "execution_authorised": True, "single_use": True},
             ),
         )
-        records = parse_governance_comments(
-            comments + [second], expected_owner="8ft0-ai", expected_issue=ISSUE
-        )
+        records = parsed_records(comments + [second])
         self.assertEqual(
             evaluate_guards(manifest, with_records(observation, manifest, records)).code,
             "GOVERNANCE_AMBIGUOUS",
@@ -521,9 +579,7 @@ class OperatorGuardTests(unittest.TestCase):
                 {"disposition": "approved"},
             ),
         )
-        records = parse_governance_comments(
-            comments + [approval], expected_owner="8ft0-ai", expected_issue=ISSUE
-        )
+        records = parsed_records(comments + [approval])
         live = with_records(observation, manifest, records, stage="live_l1")
         self.assertTrue(evaluate_guards(manifest, live).passed)
         self.assertEqual(
@@ -559,9 +615,7 @@ class OperatorGuardTests(unittest.TestCase):
                 {"disposition": "rejected"},
             ),
         )
-        records = parse_governance_comments(
-            comments + [approved, rejected], expected_owner="8ft0-ai", expected_issue=ISSUE
-        )
+        records = parsed_records(comments + [approved, rejected])
         self.assertEqual(
             evaluate_guards(manifest, with_records(observation, manifest, records, stage="live_l1")).code,
             "GOVERNANCE_AMBIGUOUS",
@@ -608,9 +662,7 @@ class OperatorGuardTests(unittest.TestCase):
                 {"disposition": "rejected"},
             ),
         )
-        records = parse_governance_comments(
-            comments + [approved, supersession, rejected], expected_owner="8ft0-ai", expected_issue=ISSUE
-        )
+        records = parsed_records(comments + [approved, supersession, rejected])
         self.assertEqual(
             evaluate_guards(manifest, with_records(observation, manifest, records, stage="live_l1")).code,
             "AUTHORITY_NOT_GRANTED",
@@ -655,10 +707,8 @@ class OperatorGuardTests(unittest.TestCase):
                 {"disposition": "approved"},
             ),
         )
-        replacement_records = parse_governance_comments(
-            comments + [rejected_first, supersede_rejected, approved_second],
-            expected_owner="8ft0-ai",
-            expected_issue=ISSUE,
+        replacement_records = parsed_records(
+            comments + [rejected_first, supersede_rejected, approved_second]
         )
         self.assertTrue(
             evaluate_guards(
@@ -667,7 +717,7 @@ class OperatorGuardTests(unittest.TestCase):
             ).passed
         )
 
-    def test_governance_history_is_manifest_bound_and_fails_on_snapshot_shrinkage(self):
+    def test_governance_history_rejects_baseline_tamper_and_wrong_manifest(self):
         _, _, authority, manifest, comments, observation = make_state()
         consumption = governance_comment(
             104,
@@ -682,22 +732,20 @@ class OperatorGuardTests(unittest.TestCase):
                 {"run_id": 12345, "run_attempt": 1},
             ),
         )
-        full_records = parse_governance_comments(
-            comments + [consumption], expected_owner="8ft0-ai", expected_issue=ISSUE
-        )
+        full_records = parsed_records(comments + [consumption])
         full_history = build_governance_history(manifest.sha256, full_records)
         self.assertEqual(
             evaluate_guards(manifest, with_observation(observation, governance_history=full_history)).code,
             "AUTHORITY_CONSUMED",
         )
 
-        shrunk = GovernanceHistory(
+        inconsistent = GovernanceHistory(
             manifest_sha256=manifest.sha256,
             baseline=full_history.baseline,
             records=full_history.records[:-1],
         )
         self.assertEqual(
-            evaluate_guards(manifest, with_observation(observation, governance_history=shrunk)).code,
+            evaluate_guards(manifest, with_observation(observation, governance_history=inconsistent)).code,
             "GOVERNANCE_HISTORY_CHANGED",
         )
 

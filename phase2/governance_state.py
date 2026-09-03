@@ -1,25 +1,34 @@
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
-from typing import Sequence
+from types import MappingProxyType
+from typing import Any, Sequence
 
 from .operator_manifest import (
+    MANIFEST_FIELDS,
+    SHA256,
     CommentBinding,
     ExecutionManifest,
     GovernanceRecord,
     HistoryBaseline,
+    OperatorContractError,
+    canonical_json,
+    parse_execution_manifest,
     sha256_text,
 )
-
-
-SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 class GovernanceStateError(RuntimeError):
     def __init__(self, code: str):
         super().__init__(code)
         self.code = code
+
+
+@dataclass(frozen=True)
+class GuardedExecutionManifest(ExecutionManifest):
+    governance_history: HistoryBaseline
 
 
 @dataclass(frozen=True)
@@ -41,6 +50,108 @@ class GovernanceState:
     active_approval: GovernanceRecord | None
     consumption: GovernanceRecord | None
     terminal: GovernanceRecord | None
+
+
+def _duplicate_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise OperatorContractError("DUPLICATE_JSON_KEY")
+        result[key] = value
+    return result
+
+
+def _reject_float(_: str) -> float:
+    raise OperatorContractError("FLOAT_NOT_SUPPORTED")
+
+
+def _reject_constant(_: str) -> float:
+    raise OperatorContractError("NONFINITE_NUMBER_NOT_SUPPORTED")
+
+
+def _require_supported_json(value: Any) -> None:
+    if value is None or isinstance(value, float):
+        raise OperatorContractError("UNSUPPORTED_JSON_VALUE")
+    if isinstance(value, (str, bool)) or type(value) is int:
+        return
+    if isinstance(value, list):
+        for item in value:
+            _require_supported_json(item)
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise OperatorContractError("UNSUPPORTED_JSON_VALUE")
+            _require_supported_json(item)
+        return
+    raise OperatorContractError("UNSUPPORTED_JSON_VALUE")
+
+
+def _freeze(value: Any) -> Any:
+    if isinstance(value, dict):
+        return MappingProxyType({key: _freeze(item) for key, item in value.items()})
+    if isinstance(value, list):
+        return tuple(_freeze(item) for item in value)
+    return value
+
+
+def _strict_guarded_json(raw: str) -> dict[str, Any]:
+    try:
+        value = json.loads(
+            raw,
+            object_pairs_hook=_duplicate_pairs,
+            parse_float=_reject_float,
+            parse_constant=_reject_constant,
+        )
+    except OperatorContractError:
+        raise
+    except (json.JSONDecodeError, UnicodeError) as exc:
+        raise OperatorContractError("MANIFEST_JSON_INVALID") from exc
+    if not isinstance(value, dict):
+        raise OperatorContractError("MANIFEST_JSON_INVALID")
+    _require_supported_json(value)
+    if raw != canonical_json(value):
+        raise OperatorContractError("NONCANONICAL_JSON")
+    return value
+
+
+def parse_guarded_execution_manifest(
+    raw: str,
+    *,
+    expected_sha256: str | None = None,
+) -> GuardedExecutionManifest:
+    value = _strict_guarded_json(raw)
+    expected_fields = MANIFEST_FIELDS | frozenset({"governance_history"})
+    if frozenset(value) != expected_fields:
+        raise OperatorContractError("MANIFEST_SCHEMA_MISMATCH")
+
+    history = value.get("governance_history")
+    if (
+        not isinstance(history, dict)
+        or frozenset(history) != frozenset({"through_id", "history_sha256"})
+        or type(history.get("through_id")) is not int
+        or history["through_id"] < 0
+        or not isinstance(history.get("history_sha256"), str)
+        or SHA256.fullmatch(history["history_sha256"]) is None
+    ):
+        raise OperatorContractError("MANIFEST_GOVERNANCE_HISTORY_INVALID")
+
+    core = dict(value)
+    del core["governance_history"]
+    parse_execution_manifest(canonical_json(core))
+
+    digest = sha256_text(raw)
+    if expected_sha256 is not None:
+        if not isinstance(expected_sha256, str) or SHA256.fullmatch(expected_sha256) is None:
+            raise OperatorContractError("MANIFEST_EXPECTED_DIGEST_INVALID")
+        if digest != expected_sha256:
+            raise OperatorContractError("MANIFEST_IDENTITY_MISMATCH")
+
+    return GuardedExecutionManifest(
+        _freeze(value),
+        digest,
+        HistoryBaseline(int(history["through_id"]), str(history["history_sha256"])),
+    )
 
 
 def canonical_governance_history(
@@ -101,6 +212,8 @@ def validate_governance_history(
     manifest: ExecutionManifest,
     history: GovernanceHistory,
 ) -> None:
+    if not isinstance(manifest, GuardedExecutionManifest):
+        raise GovernanceStateError("GOVERNANCE_HISTORY_CHANGED")
     if not isinstance(history, GovernanceHistory):
         raise GovernanceStateError("GOVERNANCE_HISTORY_CHANGED")
     if SHA256.fullmatch(history.manifest_sha256) is None or history.manifest_sha256 != manifest.sha256:
@@ -111,18 +224,29 @@ def validate_governance_history(
         raise GovernanceStateError("GOVERNANCE_HISTORY_CHANGED")
     if tuple(sorted(history.records, key=lambda record: record.comment_id)) != history.records:
         raise GovernanceStateError("GOVERNANCE_HISTORY_CHANGED")
-    try:
-        actual = governance_history_baseline(history.records)
-    except GovernanceStateError:
-        raise
+    if any(
+        record.governing_issue != manifest.governing_issue or record.operation != manifest.operation
+        for record in history.records
+    ):
+        raise GovernanceStateError("GOVERNANCE_HISTORY_CHANGED")
+
+    actual = governance_history_baseline(history.records)
     if actual != history.baseline:
         raise GovernanceStateError("GOVERNANCE_HISTORY_CHANGED")
+
+    required = manifest.governance_history
     required_through = max(
         manifest.proposal.comment_id,
         manifest.readiness.comment_id,
         manifest.authority.comment_id,
     )
-    if history.baseline.through_id < required_through:
+    if required.through_id < required_through or history.baseline.through_id < required.through_id:
+        raise GovernanceStateError("GOVERNANCE_HISTORY_CHANGED")
+    anchored_prefix = governance_history_baseline(
+        history.records,
+        through_comment_id=required.through_id,
+    )
+    if anchored_prefix != required:
         raise GovernanceStateError("GOVERNANCE_HISTORY_CHANGED")
 
 
@@ -144,18 +268,6 @@ def _exact_record(
     if len(matches) != 1:
         return None
     return matches[0]
-
-
-def _same_issue_operation(
-    manifest: ExecutionManifest,
-    records: Sequence[GovernanceRecord],
-) -> tuple[GovernanceRecord, ...]:
-    return tuple(
-        record
-        for record in records
-        if record.governing_issue == manifest.governing_issue
-        and record.operation == manifest.operation
-    )
 
 
 def _valid_lineage_authority(
@@ -309,11 +421,11 @@ def reduce_governance_history(
     history: GovernanceHistory,
 ) -> GovernanceState:
     validate_governance_history(manifest, history)
-    all_records = _same_issue_operation(manifest, history.records)
+    records = history.records
 
-    proposal = _exact_record(all_records, record_type="proposal", binding=manifest.proposal)
-    readiness = _exact_record(all_records, record_type="readiness", binding=manifest.readiness)
-    authority = _exact_record(all_records, record_type="authority", binding=manifest.authority)
+    proposal = _exact_record(records, record_type="proposal", binding=manifest.proposal)
+    readiness = _exact_record(records, record_type="readiness", binding=manifest.readiness)
+    authority = _exact_record(records, record_type="authority", binding=manifest.authority)
     if proposal is None or readiness is None or authority is None:
         raise GovernanceStateError("GOVERNANCE_RECORD_INVALID")
 
@@ -330,28 +442,31 @@ def reduce_governance_history(
         raise GovernanceStateError("GOVERNANCE_RECORD_INVALID")
 
     lineage_ids = frozenset({proposal.record_id, readiness.record_id, authority.record_id})
-    records = _semantic_records(manifest, all_records, lineage_record_ids=lineage_ids)
+    semantic_records = _semantic_records(manifest, records, lineage_record_ids=lineage_ids)
     approvals, current_consumption, terminal = _validate_lifecycle(
         manifest,
-        records,
+        semantic_records,
         proposal=proposal,
         readiness=readiness,
         authority=authority,
     )
 
-    if any(_is_invalidated(record.record_id, records) for record in (proposal, readiness, authority)):
+    if any(
+        _is_invalidated(record.record_id, semantic_records)
+        for record in (proposal, readiness, authority)
+    ):
         authority_status = "superseded"
     elif readiness.details["disposition"] != "ready" or authority.details["disposition"] != "granted":
         authority_status = "not_granted"
     else:
         active_authorities = [
             record
-            for record in records
+            for record in semantic_records
             if record.record_type == "authority"
             and record.lineage_id == authority.lineage_id
             and record.details.get("disposition") == "granted"
-            and not _is_invalidated(record.record_id, records)
-            and not _is_consumed(record.record_id, records)
+            and not _is_invalidated(record.record_id, semantic_records)
+            and not _is_consumed(record.record_id, semantic_records)
         ]
         if any(
             not _valid_lineage_authority(record, proposal=proposal, readiness=readiness)
@@ -360,7 +475,7 @@ def reduce_governance_history(
             raise GovernanceStateError("GOVERNANCE_RECORD_INVALID")
         if len(active_authorities) > 1:
             raise GovernanceStateError("GOVERNANCE_AMBIGUOUS")
-        if _is_consumed(authority.record_id, records):
+        if _is_consumed(authority.record_id, semantic_records):
             authority_status = "consumed"
         elif not active_authorities or active_authorities[0].record_id != authority.record_id:
             authority_status = "not_granted"
@@ -368,7 +483,7 @@ def reduce_governance_history(
             authority_status = "active"
 
     active_approvals = tuple(
-        record for record in approvals if not _is_invalidated(record.record_id, records)
+        record for record in approvals if not _is_invalidated(record.record_id, semantic_records)
     )
     if len(active_approvals) > 1:
         approval_status = "ambiguous"

@@ -1,7 +1,8 @@
 import unittest
 
+from phase2.governance_state import parse_guarded_execution_manifest
 from phase2.operator_guard import evaluate_guards
-from phase2.operator_manifest import canonical_json, parse_execution_manifest, parse_governance_comments
+from phase2.operator_manifest import canonical_json, parse_governance_comments
 from test_operator_guard import (
     APPROVAL_ID,
     AUTHORITY_ID,
@@ -22,13 +23,20 @@ from test_operator_guard import (
 
 class OperatorGuardOrderingTests(unittest.TestCase):
     def _assert_invalid_lineage(self, proposal, readiness, authority):
-        manifest = parse_execution_manifest(
-            canonical_json(manifest_payload(proposal, readiness, authority))
-        )
         records = parse_governance_comments(
             [proposal, readiness, authority],
             expected_owner="8ft0-ai",
             expected_issue=ISSUE,
+        )
+        manifest = parse_guarded_execution_manifest(
+            canonical_json(
+                manifest_payload(
+                    proposal,
+                    readiness,
+                    authority,
+                    governance_records=records,
+                )
+            )
         )
         result = evaluate_guards(manifest, observation_for(manifest, records))
         self.assertEqual(result.code, "GOVERNANCE_RECORD_INVALID")
@@ -105,7 +113,7 @@ class OperatorGuardOrderingTests(unittest.TestCase):
         )
         self._assert_invalid_lineage(proposal, readiness, authority)
 
-    def test_manifest_approval_must_follow_authority(self):
+    def test_manifest_approval_cannot_precede_manifest_history_anchor(self):
         _, _, authority, manifest, comments, observation = make_state()
         approval = governance_comment(
             100,
@@ -126,7 +134,7 @@ class OperatorGuardOrderingTests(unittest.TestCase):
             expected_issue=ISSUE,
         )
         live = with_records(observation, manifest, records, stage="live_l1")
-        self.assertEqual(evaluate_guards(manifest, live).code, "GOVERNANCE_RECORD_INVALID")
+        self.assertEqual(evaluate_guards(manifest, live).code, "GOVERNANCE_HISTORY_CHANGED")
 
 
 if __name__ == "__main__":

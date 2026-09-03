@@ -6,9 +6,11 @@ This document describes the inert B1 contract surface for the governed stable-op
 
 The private execution manifest contract is `gitstate-live-execution-manifest/v1`.
 
+The guardable B1 representation extends the core execution-manifest payload with one required `governance_history` baseline. `phase2.governance_state.parse_guarded_execution_manifest` validates the complete canonical object, validates the unchanged core manifest through `phase2.operator_manifest`, and calculates the manifest SHA-256 over the complete object including that governance-history baseline. The baseline is therefore part of the exact manifest identity used by post-manifest governance records.
+
 A manifest is a canonical UTF-8 JSON object. Parsing is fail-closed: exact schema keys only; duplicate keys are rejected; floats, non-finite numbers and null are rejected; object keys are lexicographically sorted; separators are `,` and `:` with no insignificant whitespace; there is no trailing newline; and SHA-256 is calculated over those exact canonical UTF-8 bytes. A non-canonical representation is rejected rather than silently normalised.
 
-The manifest binds the decision-critical execution inputs without carrying secrets: contract, operation and governing issue; exact executor repository/commit/tree/workflow/module identities; protocol identity; exact proposal/readiness/authority comment and body bindings; state baseline; operator/workflow history baselines; allocator App boundary; any bounded owner-observation dependency; protected-environment policy; exact execution-enable variable absence expectation; `single_use: true`; and `workstream_e_authorised: false`.
+The manifest binds the decision-critical execution inputs without carrying secrets: contract, operation and governing issue; exact executor repository/commit/tree/workflow/module identities; protocol identity; exact proposal/readiness/authority comment and body bindings; the canonical governance-history prefix through which the manifest was created; state baseline; operator/workflow history baselines; allocator App boundary; any bounded owner-observation dependency; protected-environment policy; exact execution-enable variable absence expectation; `single_use: true`; and `workstream_e_authorised: false`.
 
 The parsed manifest is a deeply immutable value after digest verification. Mapping containers are read-only and array containers are tuples, so later caller code cannot change decision-critical semantics while retaining the previously verified digest.
 
@@ -28,23 +30,21 @@ Every parsed machine record is owner-authenticated, timestamp-valid, immutable b
 
 GitHub comments are governance transport and evidence; they are not by themselves the durable authority for irreversible lifecycle state. A fresh enumeration of currently visible comments is therefore not a conforming source for B1 live integration.
 
-The common guard now consumes a `GovernanceHistory` value. It contains:
-
-- the exact manifest SHA-256 to which the snapshot applies;
-- a canonical `HistoryBaseline` over the complete supplied governance-record sequence; and
-- the immutable ordered governance records used by the reducer.
+The common guard consumes a `GovernanceHistory` value. It contains the exact guarded-manifest SHA-256 to which the snapshot applies, a canonical `HistoryBaseline` over the complete supplied governance-record sequence, and the immutable ordered governance records used by the reducer.
 
 The canonical history form is:
 
 `<comment-id>\t<record-id>\t<record-type>\t<body-sha256>\n`
 
-The baseline covers the complete concatenated UTF-8 sequence including the final newline. The guard requires the snapshot to bind the exact manifest, requires canonical record ordering and uniqueness, recomputes the baseline, and returns `GOVERNANCE_HISTORY_CHANGED` on a manifest mismatch, record shrink/edit inconsistency or baseline mismatch.
+The SHA-256 baseline covers the complete concatenated UTF-8 sequence including the final newline. The guarded manifest carries the required prefix baseline. Evaluation recomputes both the complete observation baseline and the prefix ending at the manifest's `through_id`; the observed prefix must exactly equal the baseline embedded in the manifest.
 
-B1 deliberately does not implement the live history provider. A later separately reviewed integration slice must obtain `GovernanceHistory` from the governed private append-only/deletion-resistant authority and must retain irreversible transitions even if their GitHub transport comments are later deleted. The provider may extend history but must never reconstruct a shorter authoritative history from currently visible comments. This is a required trust-boundary property of later activation, not an optional caller convention.
+This closes the successor-manifest deletion case at the manifest boundary. If authority was consumed or revoked before successor manifest B was created, B's digest commits to a governance prefix containing that irreversible transition. Even a newly recomputed, internally self-consistent shorter history fails `GOVERNANCE_HISTORY_CHANGED` because its prefix cannot reproduce B's embedded baseline.
+
+B1 deliberately does not implement the live history provider. A later separately reviewed integration slice must obtain `GovernanceHistory` from the governed private append-only/deletion-resistant authority and must retain irreversible transitions created after the current manifest as well. The provider may extend history but must never reconstruct a shorter authoritative history from currently visible comments. This is a required trust-boundary property of later activation, not an optional caller convention.
 
 ### Lineage and manifest scopes
 
-Proposal, readiness and authority exist before the manifest, so they bind an immutable lineage ID plus exact prior record/comment-body bindings. Post-manifest records additionally bind a manifest SHA-256.
+Proposal, readiness and authority exist before the manifest, so they bind an immutable lineage ID plus exact prior record/comment-body bindings. Post-manifest records bind the exact guarded-manifest SHA-256, which includes its governance-history prefix baseline.
 
 Authority lifecycle is deliberately not scoped away by manifest replacement. A typed consumption, revocation or supersession that targets a bound proposal/readiness/authority remains effective for any successor manifest that attempts to reuse the same lineage authority. In particular, a one-use authority consumed under manifest A cannot become usable again merely because manifest B has a different digest.
 
@@ -78,9 +78,9 @@ Terminal conclusion is intentionally excluded from this baseline. If terminal ev
 
 ## Pure governance reducer and semantic guard
 
-`phase2.governance_state` is the single pure reducer for governance lifecycle semantics. Given an exact manifest plus a manifest-bound durable `GovernanceHistory`, it validates causal lineage, lifecycle targets, consumption/terminal structure and active authority, then derives a `GovernanceState` including the effective manifest-approval status.
+`phase2.governance_state` owns the guarded-manifest parser, canonical governance-history model and the single pure reducer for governance lifecycle semantics. Given an exact guarded manifest plus its manifest-bound durable `GovernanceHistory`, it validates the embedded history prefix, causal lineage, lifecycle targets, consumption/terminal structure and active authority, then derives a `GovernanceState` including the effective manifest-approval status.
 
-`phase2.operator_guard` accepts the immutable parsed manifest plus a typed observation object and returns `PASS` or one typed failure. It imports no GitHub API, credential, token-mint, workflow-dispatch, ref-update or Workstream-D live execution provider. The guard does not accept a caller-selected manifest approval.
+`phase2.operator_guard` accepts the immutable guarded manifest plus a typed observation object and returns `PASS` or one typed failure. It imports no GitHub API, credential, token-mint, workflow-dispatch, ref-update or Workstream-D live execution provider. The guard does not accept a caller-selected manifest approval.
 
 A complete observation is shape-validated before semantic comparison. It binds an explicit timezone-aware UTC evaluation instant plus exact operation, control repository/commit/tree/workflow/module identities, protocol/state identities, operator/workflow baselines, App boundary, environment policy, exact execution-enable variable name/absence and the manifest-bound durable governance history.
 
