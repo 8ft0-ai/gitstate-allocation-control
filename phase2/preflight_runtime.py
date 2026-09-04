@@ -13,11 +13,14 @@ from .operator_manifest import (
     SHA40,
     SHA256,
     WorkflowHistoryRecord,
+    canonical_json,
+    sha256_text,
     workflow_history_baseline,
 )
 
 
 WORKFLOW_HISTORY_OPERATION = "phase2-adversarial/workflow-dispatch/v1"
+WORKSTREAM_D_EXECUTION_VARIABLE = "PHASE2_WORKSTREAM_D_EXECUTION_ENABLED"
 PUBLIC_CARRIER_DELETION_QUERY = """query PublicCarrierDeletionEvents($owner:String!,$name:String!,$number:Int!,$after:String){repository(owner:$owner,name:$name){issue(number:$number){timelineItems(first:100,after:$after,itemTypes:[COMMENT_DELETED_EVENT]){nodes{__typename ... on CommentDeletedEvent{id createdAt}} pageInfo{hasNextPage endCursor}}}}}"""
 
 
@@ -48,6 +51,53 @@ def _require_positive_int(value: object, reason: str) -> int:
     if type(value) is not int or value <= 0:
         raise PreflightRuntimeError(reason)
     return value
+
+
+def _public_carrier_inventory_digest(comments: Sequence[Mapping[str, Any]]) -> str:
+    records: list[tuple[int, str]] = []
+    seen_comment_ids: set[int] = set()
+    for comment in comments:
+        if not isinstance(comment, Mapping):
+            raise PreflightRuntimeError("READ_EVIDENCE_AMBIGUOUS")
+        comment_id = _require_positive_int(
+            comment.get("id"),
+            "READ_EVIDENCE_AMBIGUOUS",
+        )
+        if comment_id in seen_comment_ids:
+            raise PreflightRuntimeError("READ_EVIDENCE_AMBIGUOUS")
+        seen_comment_ids.add(comment_id)
+
+        body = comment.get("body")
+        user = comment.get("user")
+        owner = user.get("login") if isinstance(user, Mapping) else None
+        created_at = comment.get("created_at")
+        updated_at = comment.get("updated_at")
+        if (
+            not isinstance(body, str)
+            or not isinstance(owner, str)
+            or not owner
+            or not isinstance(created_at, str)
+            or not created_at
+            or not isinstance(updated_at, str)
+            or not updated_at
+        ):
+            raise PreflightRuntimeError("READ_EVIDENCE_AMBIGUOUS")
+        records.append(
+            (
+                comment_id,
+                canonical_json(
+                    {
+                        "body_sha256": sha256_text(body),
+                        "comment_id": comment_id,
+                        "created_at": created_at,
+                        "owner": owner,
+                        "updated_at": updated_at,
+                    }
+                ),
+            )
+        )
+    records.sort(key=lambda item: item[0])
+    return sha256_text("".join(f"{record}\n" for _, record in records))
 
 
 def validate_public_carrier_history(api: GitHubAPI) -> None:
@@ -112,11 +162,18 @@ def validate_public_carrier_history(api: GitHubAPI) -> None:
     raise PreflightRuntimeError("READ_EVIDENCE_AMBIGUOUS")
 
 
-def _read_public_carrier_comments(api: GitHubAPI) -> list[dict[str, Any]]:
+def _read_public_carrier_comments(
+    api: GitHubAPI,
+) -> tuple[list[dict[str, Any]], str]:
     validate_public_carrier_history(api)
-    comments = projection._list_issue_comments(api, projection.PROJECTION_ISSUE_NUMBER)
+    first = projection._list_issue_comments(api, projection.PROJECTION_ISSUE_NUMBER)
+    first_digest = _public_carrier_inventory_digest(first)
+    second = projection._list_issue_comments(api, projection.PROJECTION_ISSUE_NUMBER)
+    second_digest = _public_carrier_inventory_digest(second)
     validate_public_carrier_history(api)
-    return comments
+    if first_digest != second_digest:
+        raise PreflightRuntimeError("PUBLIC_CARRIER_CHANGED")
+    return second, second_digest
 
 
 def _workflow_attempt(
@@ -307,6 +364,18 @@ def _context(values: Mapping[str, str]) -> tuple[str, int, int, str, int, str, s
     )
 
 
+def _require_execution_variable_identity(preflight_projection) -> None:
+    manifest_variable = preflight_projection.manifest.payload["environment"][
+        "execution_variable"
+    ]
+    bound_variable = preflight_projection.bound_observation["execution_variable"]
+    if (
+        manifest_variable != WORKSTREAM_D_EXECUTION_VARIABLE
+        or bound_variable != WORKSTREAM_D_EXECUTION_VARIABLE
+    ):
+        raise PreflightRuntimeError("PREFLIGHT_EXECUTION_VARIABLE_IDENTITY_MISMATCH")
+
+
 def _projection_evidence(
     preflight_projection,
     result: GuardResult,
@@ -314,6 +383,7 @@ def _projection_evidence(
     run_id: int,
     run_attempt: int,
     trusted_sha: str,
+    public_carrier_snapshot_sha256: str,
 ) -> dict[str, object]:
     projection_valid = result.passed is True
     return {
@@ -328,6 +398,7 @@ def _projection_evidence(
         "projection_comment_id": preflight_projection.comment_id,
         "projection_body_sha256": preflight_projection.body_sha256,
         "manifest_sha256": preflight_projection.manifest_sha256,
+        "public_carrier_snapshot_sha256": public_carrier_snapshot_sha256,
         "projection_valid": projection_valid,
         "private_freshness_proven": False,
         "projected_snapshot_guard_code": result.code,
@@ -359,7 +430,7 @@ def run_preflight(
     ) = _context(env)
 
     api = api_factory(token, env.get("GITHUB_API_URL", "https://api.github.com"))
-    comments = _read_public_carrier_comments(api)
+    comments, public_carrier_snapshot_sha256 = _read_public_carrier_comments(api)
     preflight_projection, invalidations = projection.parse_projection_history(
         comments,
         expected_projection_comment_id=projection_comment_id,
@@ -367,6 +438,7 @@ def run_preflight(
     )
     if preflight_projection.manifest_sha256 != expected_manifest_sha256:
         raise PreflightRuntimeError("PREFLIGHT_MANIFEST_IDENTITY_MISMATCH")
+    _require_execution_variable_identity(preflight_projection)
 
     if projection._matching_invalidation(preflight_projection, invalidations) is not None:
         result = GuardResult.failure("GOVERNANCE_SUPERSEDED")
@@ -376,6 +448,7 @@ def run_preflight(
             run_id=run_id,
             run_attempt=run_attempt,
             trusted_sha=trusted_sha,
+            public_carrier_snapshot_sha256=public_carrier_snapshot_sha256,
         )
         print(json.dumps(record, sort_keys=True, separators=(",", ":")))
         return record
@@ -391,8 +464,7 @@ def run_preflight(
         manifest_sha256=expected_manifest_sha256,
     )
 
-    execution_variable = str(preflight_projection.bound_observation["execution_variable"])
-    execution_variable_absent = env.get(execution_variable, "") == ""
+    execution_variable_absent = env.get(WORKSTREAM_D_EXECUTION_VARIABLE, "") == ""
     evaluated_at = now or datetime.now(timezone.utc)
     if evaluated_at.tzinfo is None:
         raise PreflightRuntimeError("PREFLIGHT_TIME_INVALID")
@@ -411,6 +483,7 @@ def run_preflight(
         run_id=run_id,
         run_attempt=run_attempt,
         trusted_sha=trusted_sha,
+        public_carrier_snapshot_sha256=public_carrier_snapshot_sha256,
     )
     print(json.dumps(record, sort_keys=True, separators=(",", ":")))
     return record

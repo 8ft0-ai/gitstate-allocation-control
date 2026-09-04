@@ -34,9 +34,11 @@ A later execution-capable slice must obtain current governance from the B1-confo
 
 A public invalidation is a fail-closed tombstone only. It binds an exact projection and manifest subject and may additionally bind exact authority or manifest-approval identities. It carries no positive authority fields and cannot restore an invalidated object.
 
-B2 validates the complete currently visible dedicated issue history and honours a matching tombstone during preflight. It additionally queries GitHub's read-visible `CommentDeletedEvent` timeline for the dedicated carrier through the read-only GraphQL query surface. Any comment deletion on issue #28 permanently fails B2 preflight as `PUBLIC_CARRIER_DELETION_DETECTED`.
+B2 queries GitHub's read-visible `CommentDeletedEvent` timeline for the dedicated carrier through the read-only GraphQL query surface. Any comment deletion on issue #28 permanently fails B2 preflight as `PUBLIC_CARRIER_DELETION_DETECTED`.
 
-The mutable comment inventory is read inside a deletion-history bracket: B2 requires a clean complete deletion-history read, captures the completely paginated visible comment inventory, then requires another clean complete deletion-history read before that captured inventory may be used. The second clean deletion-history read is the carrier observation's linearisation point. A deletion before or during comment pagination is therefore fail-closed, while a deletion after that point cannot alter the already captured inventory and is detected by the next observation.
+The mutable carrier is observed with a bounded stability check rather than an unsupported transactional-snapshot claim. B2 first requires a clean complete deletion-history read, then captures the complete paginated visible comment inventory twice. Each inventory is canonicalised over exact comment ID, body SHA-256, owner, creation timestamp and update timestamp. The two canonical inventory digests must be identical. A persistent addition, edit, projection replacement or invalidation appearing between the two scans therefore fails closed as `PUBLIC_CARRIER_CHANGED`. B2 then requires another clean complete deletion-history read before the second inventory may be used.
+
+The accepted second inventory digest is emitted as `public_carrier_snapshot_sha256`. It identifies the exact visible carrier snapshot used for that B2 result. The two-scan check is deliberately described as bounded stability evidence, not as a linearizable or transactional GitHub snapshot. A change after the completed observation is outside that observation and is detected by a later preflight; B2 evidence remains non-authorising and is never reusable execution authority.
 
 This carrier-wide deletion rule is deliberately stronger than subject-specific invalidation. B2 does not try to infer the content or identity of a deleted comment. Because issue #28 is a dedicated machine carrier, deletion means its visible comment inventory can no longer prove a complete monotonic history. Deleting a tombstone, projection or ordinary carrier comment therefore cannot make an older projection produce a valid B2 result again. Recovery from a deletion requires a new separately governed carrier/contract rather than reusing issue #28.
 
@@ -65,11 +67,13 @@ The preflight projection supplies explicitly bound, non-secret observation evide
 - protected control commit/tree identity;
 - workflow and bounded module blob identities;
 - complete public V1 operator history;
-- complete currently visible preflight projection/invalidation history inside the deletion-history bracket;
+- two matching complete visible preflight projection/invalidation inventories plus the exact accepted carrier snapshot digest;
 - GitHub-managed comment-deletion history for the dedicated carrier, with any deletion permanently fail-closed;
 - complete workflow-dispatch history through the manifest baseline plus explicitly bound post-baseline preflight observations;
 - workflow-run ordinal continuity from the manifest baseline through the current preflight, so deletion of a completed post-baseline run cannot restore a projection-valid result;
-- execution-enable variable absence.
+- the exact repository-versioned Workstream-D execution-variable identity plus its unprotected job-context absence observation.
+
+The execution-variable identity is not projection-selectable. B2 requires both the manifest environment field and the bound observation to name exactly `PHASE2_WORKSTREAM_D_EXECUTION_ENABLED`. The job-context absence check is only an input to projected-snapshot validation; because B2 does not enter `phase-2-allocator`, it is not evidence of current protected-environment freshness and cannot turn `private_freshness_proven` true.
 
 The resulting typed `GuardObservation` is evaluated by the same pure `phase2.operator_guard.evaluate_guards` implementation introduced in B1. The guard receives no GitHub API, token-mint, ref-update, workflow-dispatch or scenario-execution capability. Its result describes the supplied projected snapshot only; B2 qualifies that result before exposing evidence and does not expose an ordinary B1 guard-PASS contract.
 
@@ -87,7 +91,7 @@ Any historical prefix change, live rerun, post-baseline rerun, unrelated dispatc
 
 ## Evidence
 
-A successful B2 preflight emits deterministic projection-validation evidence including run ID/attempt, protected control SHA, projection comment/body identity, manifest SHA-256 and the qualified projected-snapshot guard diagnostic. Every successful record states:
+A successful B2 preflight emits deterministic projection-validation evidence including run ID/attempt, protected control SHA, projection comment/body identity, manifest SHA-256, `public_carrier_snapshot_sha256` and the qualified projected-snapshot guard diagnostic. Every successful record states:
 
 - `status: GITSTATE_PREFLIGHT_PROJECTION_VALID`;
 - `projection_valid: true`;
@@ -102,9 +106,9 @@ A successful B2 preflight emits deterministic projection-validation evidence inc
 
 B2 does not emit `GITSTATE_PREFLIGHT_PASS`, `guard_passed`, `guard_code` or `guard_category`. Those unqualified names could be misread as current-authority evidence and are deliberately absent from the executable B2 evidence contract.
 
-A carrier deletion, workflow-history discontinuity, public invalidation or negative projected-snapshot guard result produces blocked evidence. All blocked command output remains non-authorising and emits no credential material.
+A carrier deletion, unstable carrier inventory, workflow-history discontinuity, public invalidation or negative projected-snapshot guard result produces blocked evidence. All blocked command output remains non-authorising and emits no credential material.
 
-`GITSTATE_PREFLIGHT_PROJECTION_VALID` means only that the exact public projection and the independently reacquired public/read-only facts satisfy B2's consistency checks. It is not evidence that current private authority exists, is unconsumed, is unrevoked or that current private App/state/environment facts still match the projection.
+`GITSTATE_PREFLIGHT_PROJECTION_VALID` means only that the exact public projection, a bounded-stable visible carrier inventory and the independently reacquired public/read-only facts satisfy B2's consistency checks. It is not evidence that current private authority exists, is unconsumed, is unrevoked or that current private App/state/environment facts still match the projection.
 
 ## B2 boundary
 
