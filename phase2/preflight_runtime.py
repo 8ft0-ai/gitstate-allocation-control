@@ -307,6 +307,40 @@ def _context(values: Mapping[str, str]) -> tuple[str, int, int, str, int, str, s
     )
 
 
+def _projection_evidence(
+    preflight_projection,
+    result: GuardResult,
+    *,
+    run_id: int,
+    run_attempt: int,
+    trusted_sha: str,
+) -> dict[str, object]:
+    projection_valid = result.passed is True
+    return {
+        "status": (
+            "GITSTATE_PREFLIGHT_PROJECTION_VALID"
+            if projection_valid
+            else "GITSTATE_PREFLIGHT_BLOCKED"
+        ),
+        "run_id": run_id,
+        "run_attempt": run_attempt,
+        "trusted_sha": trusted_sha,
+        "projection_comment_id": preflight_projection.comment_id,
+        "projection_body_sha256": preflight_projection.body_sha256,
+        "manifest_sha256": preflight_projection.manifest_sha256,
+        "projection_valid": projection_valid,
+        "private_freshness_proven": False,
+        "projected_snapshot_guard_code": result.code,
+        "projected_snapshot_guard_category": result.category,
+        "execution_authorised": False,
+        "credential_material_emitted": False,
+        "control_state_tokens_minted": 0,
+        "canonical_state_mutated": False,
+        "workstream_d_scenarios_executed": 0,
+        "workstream_e_authorised": False,
+    }
+
+
 def run_preflight(
     values: Mapping[str, str] | None = None,
     *,
@@ -336,7 +370,7 @@ def run_preflight(
 
     if projection._matching_invalidation(preflight_projection, invalidations) is not None:
         result = GuardResult.failure("GOVERNANCE_SUPERSEDED")
-        record = projection._evidence(
+        record = _projection_evidence(
             preflight_projection,
             result,
             run_id=run_id,
@@ -371,7 +405,7 @@ def run_preflight(
         execution_variable_absent=execution_variable_absent,
     )
     result = evaluate_guards(preflight_projection.manifest, observation)
-    record = projection._evidence(
+    record = _projection_evidence(
         preflight_projection,
         result,
         run_id=run_id,
@@ -388,6 +422,8 @@ def _blocked_payload(exc: Exception) -> dict[str, object]:
         payload: dict[str, object] = {
             "status": "GITSTATE_PREFLIGHT_BLOCKED",
             "reason_code": reason,
+            "projection_valid": False,
+            "private_freshness_proven": False,
             "execution_authorised": False,
             "credential_material_emitted": False,
             "control_state_tokens_minted": 0,
@@ -400,6 +436,8 @@ def _blocked_payload(exc: Exception) -> dict[str, object]:
     return {
         "status": "GITSTATE_PREFLIGHT_BLOCKED",
         "reason_code": str(exc).split(":", 1)[0] or type(exc).__name__,
+        "projection_valid": False,
+        "private_freshness_proven": False,
         "execution_authorised": False,
         "credential_material_emitted": False,
         "control_state_tokens_minted": 0,
@@ -414,7 +452,7 @@ def main() -> int:
         if len(sys.argv) != 2 or sys.argv[1] != "preflight":
             raise PreflightRuntimeError("PREFLIGHT_COMMAND_REQUIRED")
         record = run_preflight()
-        return 0 if record.get("guard_passed") is True else 1
+        return 0 if record.get("projection_valid") is True else 1
     except Exception as exc:
         print(json.dumps(_blocked_payload(exc), sort_keys=True, separators=(",", ":")))
         return 1

@@ -267,6 +267,16 @@ def current_run(projection, *, run_id=RUN_ID, run_number=1):
 
 
 class PreflightProjectionTests(unittest.TestCase):
+    def assert_projection_valid_record(self, record):
+        self.assertTrue(record["projection_valid"])
+        self.assertEqual(record["status"], "GITSTATE_PREFLIGHT_PROJECTION_VALID")
+        self.assertFalse(record["private_freshness_proven"])
+        self.assertEqual(record["projected_snapshot_guard_code"], "PASS")
+        self.assertEqual(record["projected_snapshot_guard_category"], "pass")
+        self.assertNotIn("guard_passed", record)
+        self.assertNotIn("guard_code", record)
+        self.assertNotIn("guard_category", record)
+
     def test_projection_reproduces_exact_guarded_manifest_and_is_non_authorising(self):
         manifest, payload = projection_payload()
         source = projection_comment(payload=payload)
@@ -330,7 +340,7 @@ class PreflightProjectionTests(unittest.TestCase):
         )
         self.assertIsNone(preflight._matching_invalidation(parsed, invalidations))
 
-    def test_preflight_passes_with_read_only_capability_and_complete_projection_pagination(self):
+    def test_preflight_validates_projection_with_read_only_capability_and_complete_pagination(self):
         projection = projection_comment(1001)
         ordinary = [
             {
@@ -353,8 +363,7 @@ class PreflightProjectionTests(unittest.TestCase):
                 api_factory=lambda token, url: api,
                 now=EVALUATED_AT,
             )
-        self.assertTrue(record["guard_passed"])
-        self.assertEqual(record["guard_code"], "PASS")
+        self.assert_projection_valid_record(record)
         self.assertFalse(record["execution_authorised"])
         self.assertEqual(record["control_state_tokens_minted"], 0)
         self.assertFalse(record["canonical_state_mutated"])
@@ -364,6 +373,8 @@ class PreflightProjectionTests(unittest.TestCase):
         self.assertEqual(len(api.graphql_queries), 2)
         self.assertTrue(any("page=2" in path for path in api.gets))
         self.assertNotIn("read-only-fixture-token", output.getvalue())
+        self.assertNotIn("GITSTATE_PREFLIGHT_PASS", output.getvalue())
+        self.assertNotIn('"guard_passed"', output.getvalue())
 
     def test_deleted_carrier_comment_cannot_restore_preflight_after_tombstone_disappears(self):
         projection = projection_comment()
@@ -457,7 +468,7 @@ class PreflightProjectionTests(unittest.TestCase):
             api_factory=lambda token, url: api,
             now=EVALUATED_AT,
         )
-        self.assertTrue(record["guard_passed"])
+        self.assert_projection_valid_record(record)
 
         wrong = projection_payload(
             workflow_history=type(baseline)(baseline.through_id, "0" * 64)
@@ -492,7 +503,7 @@ class PreflightProjectionTests(unittest.TestCase):
             api_factory=lambda token, url: api,
             now=EVALUATED_AT,
         )
-        self.assertTrue(record["guard_passed"])
+        self.assert_projection_valid_record(record)
 
         unrelated_api = FakeReadOnlyAPI(
             projection_comments=[projection],
@@ -529,8 +540,34 @@ class PreflightProjectionTests(unittest.TestCase):
             api_factory=lambda token, url: api,
             now=EVALUATED_AT,
         )
-        self.assertTrue(record["guard_passed"])
+        self.assert_projection_valid_record(record)
         self.assertTrue(any("/attempts/1" in path for path in api.gets))
+
+    def test_reused_projection_never_claims_current_private_freshness_or_b1_pass(self):
+        projection = projection_comment()
+        title = current_run(projection)["display_title"]
+        api = FakeReadOnlyAPI(
+            projection_comments=[projection],
+            workflow_runs=[
+                workflow_run(500, title=title, run_number=1),
+                workflow_run(RUN_ID, title=title, run_number=2),
+            ],
+        )
+        output = StringIO()
+        with redirect_stdout(output):
+            record = runtime.run_preflight(
+                valid_environment(projection),
+                api_factory=lambda token, url: api,
+                now=EVALUATED_AT,
+            )
+
+        # Private governance/App/state/environment may have changed since projection
+        # publication. B2 deliberately has no capability to prove that freshness.
+        self.assert_projection_valid_record(record)
+        self.assertFalse(record["private_freshness_proven"])
+        self.assertNotEqual(record["status"], "GITSTATE_PREFLIGHT_PASS")
+        self.assertNotIn("GITSTATE_PREFLIGHT_PASS", output.getvalue())
+        self.assertNotIn('"guard_passed"', output.getvalue())
 
     def test_matching_invalidation_blocks_before_guard_and_never_writes(self):
         projection = projection_comment()
@@ -541,8 +578,11 @@ class PreflightProjectionTests(unittest.TestCase):
             api_factory=lambda token, url: api,
             now=EVALUATED_AT,
         )
-        self.assertFalse(record["guard_passed"])
-        self.assertEqual(record["guard_code"], "GOVERNANCE_SUPERSEDED")
+        self.assertFalse(record["projection_valid"])
+        self.assertEqual(record["status"], "GITSTATE_PREFLIGHT_BLOCKED")
+        self.assertFalse(record["private_freshness_proven"])
+        self.assertEqual(record["projected_snapshot_guard_code"], "GOVERNANCE_SUPERSEDED")
+        self.assertNotIn("guard_passed", record)
         self.assertFalse(record["execution_authorised"])
         self.assertFalse(api.posts)
 
@@ -558,6 +598,9 @@ class PreflightProjectionTests(unittest.TestCase):
             "PHASE2_ALLOCATOR_APP_PRIVATE_KEY",
         ):
             self.assertNotIn(forbidden, source)
+        runtime_source = inspect.getsource(runtime)
+        self.assertNotIn("GITSTATE_PREFLIGHT_PASS", runtime_source)
+        self.assertNotIn('"guard_passed"', runtime_source)
 
     def test_workflow_preflight_route_is_capability_denied_and_live_v1_path_is_preserved(self):
         workflow = Path(".github/workflows/phase2-adversarial.yml").read_text(encoding="utf-8")
