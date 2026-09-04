@@ -136,9 +136,17 @@ def invalidation_comment(projection, *, comment_id=1002, manifest_sha=None):
     }
 
 
-def workflow_run(run_id, *, title, attempt=1, head_sha=TRUSTED_SHA):
+def workflow_run(
+    run_id,
+    *,
+    title,
+    attempt=1,
+    head_sha=TRUSTED_SHA,
+    run_number=1,
+):
     return {
         "id": run_id,
+        "run_number": run_number,
         "run_attempt": attempt,
         "head_sha": head_sha,
         "event": "workflow_dispatch",
@@ -247,7 +255,7 @@ def valid_environment(projection):
     }
 
 
-def current_run(projection, *, run_id=RUN_ID):
+def current_run(projection, *, run_id=RUN_ID, run_number=1):
     parsed = preflight.parse_projection_comment(projection)
     assert parsed is not None
     title = runtime.expected_run_name(
@@ -255,7 +263,7 @@ def current_run(projection, *, run_id=RUN_ID):
         parsed.body_sha256,
         parsed.manifest_sha256,
     )
-    return workflow_run(run_id, title=title)
+    return workflow_run(run_id, title=title, run_number=run_number)
 
 
 class PreflightProjectionTests(unittest.TestCase):
@@ -353,7 +361,7 @@ class PreflightProjectionTests(unittest.TestCase):
         self.assertEqual(record["workstream_d_scenarios_executed"], 0)
         self.assertFalse(record["workstream_e_authorised"])
         self.assertFalse(api.posts)
-        self.assertEqual(len(api.graphql_queries), 1)
+        self.assertEqual(len(api.graphql_queries), 2)
         self.assertTrue(any("page=2" in path for path in api.gets))
         self.assertNotIn("read-only-fixture-token", output.getvalue())
 
@@ -440,8 +448,8 @@ class PreflightProjectionTests(unittest.TestCase):
         api = FakeReadOnlyAPI(
             projection_comments=[projection],
             workflow_runs=[
-                workflow_run(100, title="historical"),
-                current_run(projection),
+                workflow_run(100, title="historical", run_number=1),
+                current_run(projection, run_number=2),
             ],
         )
         record = runtime.run_preflight(
@@ -458,8 +466,8 @@ class PreflightProjectionTests(unittest.TestCase):
         wrong_api = FakeReadOnlyAPI(
             projection_comments=[wrong_projection],
             workflow_runs=[
-                workflow_run(100, title="historical"),
-                current_run(wrong_projection),
+                workflow_run(100, title="historical", run_number=1),
+                current_run(wrong_projection, run_number=2),
             ],
         )
         with self.assertRaisesRegex(runtime.PreflightRuntimeError, "WORKFLOW_HISTORY_CHANGED"):
@@ -475,8 +483,8 @@ class PreflightProjectionTests(unittest.TestCase):
         api = FakeReadOnlyAPI(
             projection_comments=[projection],
             workflow_runs=[
-                workflow_run(500, title=title),
-                workflow_run(RUN_ID, title=title),
+                workflow_run(500, title=title, run_number=1),
+                workflow_run(RUN_ID, title=title, run_number=2),
             ],
         )
         record = runtime.run_preflight(
@@ -489,8 +497,8 @@ class PreflightProjectionTests(unittest.TestCase):
         unrelated_api = FakeReadOnlyAPI(
             projection_comments=[projection],
             workflow_runs=[
-                workflow_run(500, title="contract_check"),
-                workflow_run(RUN_ID, title=title),
+                workflow_run(500, title="contract_check", run_number=1),
+                workflow_run(RUN_ID, title=title, run_number=2),
             ],
         )
         with self.assertRaisesRegex(runtime.PreflightRuntimeError, "WORKFLOW_HISTORY_CHANGED"):
@@ -509,11 +517,11 @@ class PreflightProjectionTests(unittest.TestCase):
         )
         _, payload = projection_payload(workflow_history=baseline)
         projection = projection_comment(payload=payload)
-        current_attempt = workflow_run(100, title="historical", attempt=2)
-        first_attempt = workflow_run(100, title="historical", attempt=1)
+        current_attempt = workflow_run(100, title="historical", attempt=2, run_number=1)
+        first_attempt = workflow_run(100, title="historical", attempt=1, run_number=1)
         api = FakeReadOnlyAPI(
             projection_comments=[projection],
-            workflow_runs=[current_attempt, current_run(projection)],
+            workflow_runs=[current_attempt, current_run(projection, run_number=2)],
             attempt_payloads={(100, 1): first_attempt},
         )
         record = runtime.run_preflight(
