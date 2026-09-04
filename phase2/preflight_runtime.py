@@ -112,6 +112,13 @@ def validate_public_carrier_history(api: GitHubAPI) -> None:
     raise PreflightRuntimeError("READ_EVIDENCE_AMBIGUOUS")
 
 
+def _read_public_carrier_comments(api: GitHubAPI) -> list[dict[str, Any]]:
+    validate_public_carrier_history(api)
+    comments = projection._list_issue_comments(api, projection.PROJECTION_ISSUE_NUMBER)
+    validate_public_carrier_history(api)
+    return comments
+
+
 def _workflow_attempt(
     api: GitHubAPI,
     run: Mapping[str, Any],
@@ -163,6 +170,46 @@ def _complete_workflow_records(
     return tuple(records)
 
 
+def _validate_workflow_run_number_continuity(
+    runs: Sequence[Mapping[str, Any]],
+    *,
+    baseline_through_id: int,
+    current_run_id: int,
+) -> None:
+    run_numbers_by_id: dict[int, int] = {}
+    seen_run_numbers: set[int] = set()
+    for run in runs:
+        run_id = _require_positive_int(run.get("id"), "WORKFLOW_HISTORY_CHANGED")
+        run_number = _require_positive_int(run.get("run_number"), "WORKFLOW_HISTORY_CHANGED")
+        if run_id in run_numbers_by_id or run_number in seen_run_numbers:
+            raise PreflightRuntimeError("WORKFLOW_HISTORY_CHANGED")
+        run_numbers_by_id[run_id] = run_number
+        seen_run_numbers.add(run_number)
+
+    current_run_number = run_numbers_by_id.get(current_run_id)
+    if current_run_number is None:
+        raise PreflightRuntimeError("WORKFLOW_HISTORY_CHANGED")
+
+    if baseline_through_id == 0:
+        baseline_run_number = 0
+    else:
+        baseline_run_number = run_numbers_by_id.get(baseline_through_id)
+        if baseline_run_number is None:
+            raise PreflightRuntimeError("WORKFLOW_HISTORY_CHANGED")
+
+    if current_run_number <= baseline_run_number:
+        raise PreflightRuntimeError("WORKFLOW_HISTORY_CHANGED")
+
+    observed = {
+        run_number
+        for run_number in seen_run_numbers
+        if baseline_run_number < run_number <= current_run_number
+    }
+    expected = set(range(baseline_run_number + 1, current_run_number + 1))
+    if observed != expected:
+        raise PreflightRuntimeError("WORKFLOW_HISTORY_CHANGED")
+
+
 def validate_workflow_history(
     api: GitHubAPI,
     manifest,
@@ -187,6 +234,11 @@ def validate_workflow_history(
     prefix = tuple(record for record in records if record.run_id <= baseline.through_id)
     if workflow_history_baseline(prefix) != baseline:
         raise PreflightRuntimeError("WORKFLOW_HISTORY_CHANGED")
+    _validate_workflow_run_number_continuity(
+        runs,
+        baseline_through_id=baseline.through_id,
+        current_run_id=run_id,
+    )
 
     suffix = [
         run
@@ -273,8 +325,7 @@ def run_preflight(
     ) = _context(env)
 
     api = api_factory(token, env.get("GITHUB_API_URL", "https://api.github.com"))
-    validate_public_carrier_history(api)
-    comments = projection._list_issue_comments(api, projection.PROJECTION_ISSUE_NUMBER)
+    comments = _read_public_carrier_comments(api)
     preflight_projection, invalidations = projection.parse_projection_history(
         comments,
         expected_projection_comment_id=projection_comment_id,
