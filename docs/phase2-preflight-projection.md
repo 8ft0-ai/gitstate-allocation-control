@@ -36,7 +36,7 @@ B2 validates the complete dedicated issue history and honours a matching tombsto
 - performs no capsule discovery or consumption;
 - receives no allocator App private key, installation token, control/state mutation token or state-repository secret;
 - accepts only the exact public projection comment ID and expected body SHA-256 as workflow inputs;
-- runs `phase2.preflight_projection` and stops after deterministic evidence output.
+- runs the dedicated capability-denied preflight runtime and stops after deterministic evidence output.
 
 The historical `phase2.operator_runtime preflight` command is retired and fails closed as `OPERATOR_PREFLIGHT_PROJECTION_REQUIRED`. The V1 live execution route still uses the unchanged capsule discovery/consumption and existing credential/revocation stack.
 
@@ -48,16 +48,20 @@ The preflight projection supplies explicitly bound, non-secret observation evide
 - workflow and bounded module blob identities;
 - complete public V1 operator history;
 - complete preflight projection/invalidation history;
-- workflow-dispatch history suffix for the exact attempt-1 preflight run;
+- complete workflow-dispatch history through the manifest baseline plus explicitly bound post-baseline preflight observations;
 - execution-enable variable absence.
 
 The resulting typed `GuardObservation` is evaluated by the same pure `phase2.operator_guard.evaluate_guards` implementation introduced in B1. The guard receives no GitHub API, token-mint, ref-update, workflow-dispatch or scenario-execution capability.
 
 A manifest-bound owner observation remains subject to the B1 `valid_through` freshness rule. A matching caller-supplied validity flag cannot override expiry.
 
-## Workflow-history suffix
+## Workflow-history reconciliation
 
-The guarded manifest binds the pre-dispatch workflow-history baseline. B2 permits exactly one post-baseline workflow-dispatch observation: the current run, attempt 1, on the exact protected control SHA. Any unrelated post-baseline dispatch, rerun or identity mismatch is `WORKFLOW_HISTORY_CHANGED`/fail-closed evidence.
+The guarded manifest binds the complete workflow history through its construction baseline. B2 reconstructs all `workflow_dispatch` records through that baseline, including every historical attempt of any rerun, and requires the resulting canonical B1 workflow-history baseline to match the manifest exactly.
+
+After the bound baseline, B2 permits one or more non-authorising `operator_preflight` attempt-1 observations only when every such run is on the exact protected control SHA and its immutable Actions display title binds the same preflight-projection comment ID, projection body SHA-256 and manifest SHA-256. The current run must be present in that bounded suffix. A further preflight is therefore another independently identified evidence observation, never reusable authority.
+
+Any historical prefix change, live rerun, post-baseline rerun, unrelated dispatch, mismatched trusted SHA, mismatched projection/manifest identity, duplicate run identity or malformed attempt history is `WORKFLOW_HISTORY_CHANGED`/fail-closed evidence.
 
 ## Evidence
 
