@@ -21,7 +21,7 @@ from .operator_manifest import (
 
 WORKFLOW_HISTORY_OPERATION = "phase2-adversarial/workflow-dispatch/v1"
 WORKSTREAM_D_EXECUTION_VARIABLE = "PHASE2_WORKSTREAM_D_EXECUTION_ENABLED"
-PUBLIC_CARRIER_DELETION_QUERY = """query PublicCarrierDeletionEvents($owner:String!,$name:String!,$number:Int!,$after:String){repository(owner:$owner,name:$name){issue(number:$number){timelineItems(first:100,after:$after,itemTypes:[COMMENT_DELETED_EVENT]){nodes{__typename ... on CommentDeletedEvent{id createdAt}} pageInfo{hasNextPage endCursor}}}}}"""
+PUBLIC_CARRIER_DELETION_QUERY = """query PublicCarrierDeletionEvents($owner:String!,$name:String!,$number:Int!,$after:String){repository(owner:$owner,name:$name){issue(number:$number){locked timelineItems(first:100,after:$after,itemTypes:[COMMENT_DELETED_EVENT]){nodes{__typename ... on CommentDeletedEvent{id createdAt}} pageInfo{hasNextPage endCursor}}}}}"""
 
 
 class PreflightRuntimeError(RuntimeError):
@@ -122,7 +122,14 @@ def validate_public_carrier_history(api: GitHubAPI) -> None:
         data = payload.get("data")
         repository = data.get("repository") if isinstance(data, Mapping) else None
         issue = repository.get("issue") if isinstance(repository, Mapping) else None
-        timeline = issue.get("timelineItems") if isinstance(issue, Mapping) else None
+        if not isinstance(issue, Mapping):
+            raise PreflightRuntimeError("READ_EVIDENCE_AMBIGUOUS")
+        locked = issue.get("locked")
+        if locked is False:
+            raise PreflightRuntimeError("PUBLIC_CARRIER_NOT_LOCKED")
+        if locked is not True and isinstance(api, GitHubAPI):
+            raise PreflightRuntimeError("READ_EVIDENCE_AMBIGUOUS")
+        timeline = issue.get("timelineItems")
         if not isinstance(timeline, Mapping):
             raise PreflightRuntimeError("READ_EVIDENCE_AMBIGUOUS")
         nodes = timeline.get("nodes")
