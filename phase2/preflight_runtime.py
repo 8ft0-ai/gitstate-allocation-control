@@ -1,0 +1,309 @@
+from __future__ import annotations
+
+import json
+import os
+import sys
+from datetime import datetime, timezone
+from typing import Any, Callable, Mapping, Sequence
+
+from . import preflight_projection as projection
+from .github_api import GitHubAPI, GitHubAPIError
+from .operator_guard import GuardResult, evaluate_guards
+from .operator_manifest import (
+    SHA40,
+    SHA256,
+    WorkflowHistoryRecord,
+    workflow_history_baseline,
+)
+
+
+WORKFLOW_HISTORY_OPERATION = "phase2-adversarial/workflow-dispatch/v1"
+
+
+class PreflightRuntimeError(RuntimeError):
+    pass
+
+
+def expected_run_name(
+    projection_comment_id: int,
+    projection_body_sha256: str,
+    manifest_sha256: str,
+) -> str:
+    return (
+        "operator_preflight "
+        f"projection={projection_comment_id} "
+        f"body={projection_body_sha256} "
+        f"manifest={manifest_sha256}"
+    )
+
+
+def _require_sha(value: object, pattern, reason: str) -> str:
+    if not isinstance(value, str) or pattern.fullmatch(value) is None:
+        raise PreflightRuntimeError(reason)
+    return value
+
+
+def _require_positive_int(value: object, reason: str) -> int:
+    if type(value) is not int or value <= 0:
+        raise PreflightRuntimeError(reason)
+    return value
+
+
+def _workflow_attempt(
+    api: GitHubAPI,
+    run: Mapping[str, Any],
+    attempt: int,
+) -> Mapping[str, Any]:
+    current_attempt = _require_positive_int(run.get("run_attempt"), "WORKFLOW_HISTORY_CHANGED")
+    if attempt == current_attempt:
+        return run
+    payload = api.get(
+        f"/repos/{projection.CONTROL_REPOSITORY}/actions/runs/{run['id']}/attempts/{attempt}"
+    )
+    if not isinstance(payload, Mapping):
+        raise PreflightRuntimeError("WORKFLOW_HISTORY_CHANGED")
+    return payload
+
+
+def _complete_workflow_records(
+    api: GitHubAPI,
+    runs: Sequence[Mapping[str, Any]],
+) -> tuple[WorkflowHistoryRecord, ...]:
+    records: list[WorkflowHistoryRecord] = []
+    seen: set[tuple[int, int]] = set()
+    for run in runs:
+        run_id = _require_positive_int(run.get("id"), "WORKFLOW_HISTORY_CHANGED")
+        current_attempt = _require_positive_int(run.get("run_attempt"), "WORKFLOW_HISTORY_CHANGED")
+        for attempt in range(1, current_attempt + 1):
+            source = _workflow_attempt(api, run, attempt)
+            if source.get("id") != run_id or source.get("run_attempt") != attempt:
+                raise PreflightRuntimeError("WORKFLOW_HISTORY_CHANGED")
+            if source.get("event") != "workflow_dispatch":
+                raise PreflightRuntimeError("WORKFLOW_HISTORY_CHANGED")
+            trusted_sha = _require_sha(
+                source.get("head_sha"),
+                SHA40,
+                "WORKFLOW_HISTORY_CHANGED",
+            )
+            key = (run_id, attempt)
+            if key in seen:
+                raise PreflightRuntimeError("WORKFLOW_HISTORY_CHANGED")
+            seen.add(key)
+            records.append(
+                WorkflowHistoryRecord(
+                    run_id,
+                    attempt,
+                    trusted_sha,
+                    WORKFLOW_HISTORY_OPERATION,
+                )
+            )
+    return tuple(records)
+
+
+def validate_workflow_history(
+    api: GitHubAPI,
+    manifest,
+    *,
+    run_id: int,
+    run_attempt: int,
+    trusted_sha: str,
+    projection_comment_id: int,
+    projection_body_sha256: str,
+    manifest_sha256: str,
+) -> None:
+    if run_attempt != 1:
+        raise PreflightRuntimeError("OPERATOR_RERUN_FORBIDDEN")
+    expected_title = expected_run_name(
+        projection_comment_id,
+        projection_body_sha256,
+        manifest_sha256,
+    )
+    runs = projection._list_workflow_runs(api)
+    records = _complete_workflow_records(api, runs)
+    baseline = manifest.workflow_history
+    prefix = tuple(record for record in records if record.run_id <= baseline.through_id)
+    if workflow_history_baseline(prefix) != baseline:
+        raise PreflightRuntimeError("WORKFLOW_HISTORY_CHANGED")
+
+    suffix = [
+        run
+        for run in runs
+        if type(run.get("id")) is int and int(run["id"]) > baseline.through_id
+    ]
+    if not suffix:
+        raise PreflightRuntimeError("WORKFLOW_HISTORY_CHANGED")
+    current_seen = False
+    suffix_ids: set[int] = set()
+    for run in suffix:
+        suffix_run_id = _require_positive_int(run.get("id"), "WORKFLOW_HISTORY_CHANGED")
+        if suffix_run_id in suffix_ids:
+            raise PreflightRuntimeError("WORKFLOW_HISTORY_CHANGED")
+        suffix_ids.add(suffix_run_id)
+        if (
+            run.get("run_attempt") != 1
+            or run.get("event") != "workflow_dispatch"
+            or run.get("head_sha") != trusted_sha
+            or run.get("display_title") != expected_title
+        ):
+            raise PreflightRuntimeError("WORKFLOW_HISTORY_CHANGED")
+        if suffix_run_id == run_id:
+            current_seen = True
+    if not current_seen:
+        raise PreflightRuntimeError("WORKFLOW_HISTORY_CHANGED")
+
+
+def _context(values: Mapping[str, str]) -> tuple[str, int, int, str, int, str, str]:
+    try:
+        repository = values["GITHUB_REPOSITORY"]
+        ref = values["GITHUB_REF"]
+        trusted_sha = values["GITHUB_SHA"]
+        run_id = int(values["GITHUB_RUN_ID"])
+        run_attempt = int(values["GITHUB_RUN_ATTEMPT"])
+        token = values["GITHUB_TOKEN"]
+        projection_comment_id = int(values["PREFLIGHT_PROJECTION_COMMENT_ID"])
+        projection_body_sha256 = values["PREFLIGHT_PROJECTION_BODY_SHA256"]
+        manifest_sha256 = values["PREFLIGHT_MANIFEST_SHA256"]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise PreflightRuntimeError("PREFLIGHT_CONTEXT_INCOMPLETE") from exc
+    if repository != projection.CONTROL_REPOSITORY:
+        raise PreflightRuntimeError("OPERATOR_REPOSITORY_MISMATCH")
+    if ref != "refs/heads/main":
+        raise PreflightRuntimeError("OPERATOR_PROTECTED_MAIN_REQUIRED")
+    _require_sha(trusted_sha, SHA40, "OPERATOR_TRUSTED_SHA_INVALID")
+    _require_positive_int(run_id, "OPERATOR_RUN_INVALID")
+    _require_positive_int(run_attempt, "OPERATOR_RUN_INVALID")
+    if not token:
+        raise PreflightRuntimeError("READ_EVIDENCE_UNAVAILABLE")
+    _require_positive_int(projection_comment_id, "PREFLIGHT_PROJECTION_COMMENT_ID_INVALID")
+    _require_sha(
+        projection_body_sha256,
+        SHA256,
+        "PREFLIGHT_PROJECTION_EXPECTED_DIGEST_INVALID",
+    )
+    _require_sha(manifest_sha256, SHA256, "PREFLIGHT_MANIFEST_DIGEST_INVALID")
+    return (
+        trusted_sha,
+        run_id,
+        run_attempt,
+        token,
+        projection_comment_id,
+        projection_body_sha256,
+        manifest_sha256,
+    )
+
+
+def run_preflight(
+    values: Mapping[str, str] | None = None,
+    *,
+    api_factory: Callable[[str, str], GitHubAPI] = GitHubAPI,
+    now: datetime | None = None,
+) -> dict[str, object]:
+    env = os.environ if values is None else values
+    (
+        trusted_sha,
+        run_id,
+        run_attempt,
+        token,
+        projection_comment_id,
+        projection_body_sha256,
+        expected_manifest_sha256,
+    ) = _context(env)
+
+    api = api_factory(token, env.get("GITHUB_API_URL", "https://api.github.com"))
+    comments = projection._list_issue_comments(api, projection.PROJECTION_ISSUE_NUMBER)
+    preflight_projection, invalidations = projection.parse_projection_history(
+        comments,
+        expected_projection_comment_id=projection_comment_id,
+        expected_projection_body_sha256=projection_body_sha256,
+    )
+    if preflight_projection.manifest_sha256 != expected_manifest_sha256:
+        raise PreflightRuntimeError("PREFLIGHT_MANIFEST_IDENTITY_MISMATCH")
+
+    if projection._matching_invalidation(preflight_projection, invalidations) is not None:
+        result = GuardResult.failure("GOVERNANCE_SUPERSEDED")
+        record = projection._evidence(
+            preflight_projection,
+            result,
+            run_id=run_id,
+            run_attempt=run_attempt,
+            trusted_sha=trusted_sha,
+        )
+        print(json.dumps(record, sort_keys=True, separators=(",", ":")))
+        return record
+
+    validate_workflow_history(
+        api,
+        preflight_projection.manifest,
+        run_id=run_id,
+        run_attempt=run_attempt,
+        trusted_sha=trusted_sha,
+        projection_comment_id=projection_comment_id,
+        projection_body_sha256=projection_body_sha256,
+        manifest_sha256=expected_manifest_sha256,
+    )
+
+    execution_variable = str(preflight_projection.bound_observation["execution_variable"])
+    execution_variable_absent = env.get(execution_variable, "") == ""
+    evaluated_at = now or datetime.now(timezone.utc)
+    if evaluated_at.tzinfo is None:
+        raise PreflightRuntimeError("PREFLIGHT_TIME_INVALID")
+    evaluated_at = evaluated_at.astimezone(timezone.utc)
+    observation = projection._guard_observation(
+        preflight_projection,
+        api,
+        trusted_sha=trusted_sha,
+        evaluated_at=evaluated_at,
+        execution_variable_absent=execution_variable_absent,
+    )
+    result = evaluate_guards(preflight_projection.manifest, observation)
+    record = projection._evidence(
+        preflight_projection,
+        result,
+        run_id=run_id,
+        run_attempt=run_attempt,
+        trusted_sha=trusted_sha,
+    )
+    print(json.dumps(record, sort_keys=True, separators=(",", ":")))
+    return record
+
+
+def _blocked_payload(exc: Exception) -> dict[str, object]:
+    if isinstance(exc, GitHubAPIError):
+        reason = "READ_EVIDENCE_RATE_LIMITED" if exc.rate_limited else "READ_EVIDENCE_UNAVAILABLE"
+        payload: dict[str, object] = {
+            "status": "GITSTATE_PREFLIGHT_BLOCKED",
+            "reason_code": reason,
+            "execution_authorised": False,
+            "credential_material_emitted": False,
+            "control_state_tokens_minted": 0,
+            "canonical_state_mutated": False,
+            "workstream_d_scenarios_executed": 0,
+            "workstream_e_authorised": False,
+        }
+        payload.update(exc.safe_diagnostic())
+        return payload
+    return {
+        "status": "GITSTATE_PREFLIGHT_BLOCKED",
+        "reason_code": str(exc).split(":", 1)[0] or type(exc).__name__,
+        "execution_authorised": False,
+        "credential_material_emitted": False,
+        "control_state_tokens_minted": 0,
+        "canonical_state_mutated": False,
+        "workstream_d_scenarios_executed": 0,
+        "workstream_e_authorised": False,
+    }
+
+
+def main() -> int:
+    try:
+        if len(sys.argv) != 2 or sys.argv[1] != "preflight":
+            raise PreflightRuntimeError("PREFLIGHT_COMMAND_REQUIRED")
+        record = run_preflight()
+        return 0 if record.get("guard_passed") is True else 1
+    except Exception as exc:
+        print(json.dumps(_blocked_payload(exc), sort_keys=True, separators=(",", ":")))
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
