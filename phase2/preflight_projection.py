@@ -634,20 +634,8 @@ def validate_preflight_workflow_suffix(
     run_attempt: int,
     trusted_sha: str,
 ) -> None:
-    if run_attempt != 1:
-        raise PreflightProjectionError("OPERATOR_RERUN_FORBIDDEN")
-    runs = _list_workflow_runs(api)
-    suffix = [run for run in runs if type(run.get("id")) is int and int(run["id"]) > baseline.through_id]
-    if len(suffix) != 1:
-        raise PreflightProjectionError("WORKFLOW_HISTORY_CHANGED")
-    current = suffix[0]
-    if (
-        current.get("id") != run_id
-        or current.get("run_attempt") != 1
-        or current.get("head_sha") != trusted_sha
-        or current.get("event") != "workflow_dispatch"
-    ):
-        raise PreflightProjectionError("WORKFLOW_HISTORY_CHANGED")
+    del api, baseline, run_id, run_attempt, trusted_sha
+    raise PreflightProjectionError("PREFLIGHT_RUNTIME_REQUIRED")
 
 
 def _guard_observation(
@@ -728,85 +716,8 @@ def run_preflight(
     api_factory: Callable[[str, str], GitHubAPI] = GitHubAPI,
     now: datetime | None = None,
 ) -> dict[str, object]:
-    env = os.environ if values is None else values
-    try:
-        repository = env["GITHUB_REPOSITORY"]
-        ref = env["GITHUB_REF"]
-        trusted_sha = env["GITHUB_SHA"]
-        run_id = int(env["GITHUB_RUN_ID"])
-        run_attempt = int(env["GITHUB_RUN_ATTEMPT"])
-        token = env["GITHUB_TOKEN"]
-        projection_comment_id = int(env["PREFLIGHT_PROJECTION_COMMENT_ID"])
-        expected_body_sha256 = env["PREFLIGHT_PROJECTION_BODY_SHA256"]
-    except (KeyError, TypeError, ValueError) as exc:
-        raise PreflightProjectionError("PREFLIGHT_CONTEXT_INCOMPLETE") from exc
-
-    if repository != CONTROL_REPOSITORY:
-        raise PreflightProjectionError("OPERATOR_REPOSITORY_MISMATCH")
-    if ref != "refs/heads/main":
-        raise PreflightProjectionError("OPERATOR_PROTECTED_MAIN_REQUIRED")
-    _require_hex(trusted_sha, SHA40, "OPERATOR_TRUSTED_SHA_INVALID")
-    _require_int(run_id, "OPERATOR_RUN_INVALID")
-    _require_int(run_attempt, "OPERATOR_RUN_INVALID")
-    _require_string(token, "READ_EVIDENCE_UNAVAILABLE")
-    _require_int(projection_comment_id, "PREFLIGHT_PROJECTION_COMMENT_ID_INVALID")
-    _require_hex(
-        expected_body_sha256,
-        SHA256,
-        "PREFLIGHT_PROJECTION_EXPECTED_DIGEST_INVALID",
-    )
-
-    api = api_factory(token, env.get("GITHUB_API_URL", "https://api.github.com"))
-    comments = _list_issue_comments(api, PROJECTION_ISSUE_NUMBER)
-    projection, invalidations = parse_projection_history(
-        comments,
-        expected_projection_comment_id=projection_comment_id,
-        expected_projection_body_sha256=expected_body_sha256,
-    )
-
-    if _matching_invalidation(projection, invalidations) is not None:
-        result = GuardResult.failure("GOVERNANCE_SUPERSEDED")
-        record = _evidence(
-            projection,
-            result,
-            run_id=run_id,
-            run_attempt=run_attempt,
-            trusted_sha=trusted_sha,
-        )
-        print(json.dumps(record, sort_keys=True, separators=(",", ":")))
-        return record
-
-    validate_preflight_workflow_suffix(
-        api,
-        projection.manifest.workflow_history,
-        run_id=run_id,
-        run_attempt=run_attempt,
-        trusted_sha=trusted_sha,
-    )
-
-    execution_variable = str(projection.bound_observation["execution_variable"])
-    execution_variable_absent = env.get(execution_variable, "") == ""
-    evaluated_at = now or datetime.now(timezone.utc)
-    if evaluated_at.tzinfo is None:
-        raise PreflightProjectionError("PREFLIGHT_TIME_INVALID")
-    evaluated_at = evaluated_at.astimezone(timezone.utc)
-    observation = _guard_observation(
-        projection,
-        api,
-        trusted_sha=trusted_sha,
-        evaluated_at=evaluated_at,
-        execution_variable_absent=execution_variable_absent,
-    )
-    result = evaluate_guards(projection.manifest, observation)
-    record = _evidence(
-        projection,
-        result,
-        run_id=run_id,
-        run_attempt=run_attempt,
-        trusted_sha=trusted_sha,
-    )
-    print(json.dumps(record, sort_keys=True, separators=(",", ":")))
-    return record
+    del values, api_factory, now
+    raise PreflightProjectionError("PREFLIGHT_RUNTIME_REQUIRED")
 
 
 def _blocked_payload(exc: Exception) -> dict[str, object]:

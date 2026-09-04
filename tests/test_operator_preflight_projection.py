@@ -147,16 +147,52 @@ def workflow_run(run_id, *, title, attempt=1, head_sha=TRUSTED_SHA):
 
 
 class FakeReadOnlyAPI:
-    def __init__(self, *, projection_comments, workflow_runs=None, attempt_payloads=None):
+    def __init__(
+        self,
+        *,
+        projection_comments,
+        workflow_runs=None,
+        attempt_payloads=None,
+        deletion_pages=None,
+    ):
         self.projection_comments = list(projection_comments)
         self.workflow_runs = list(workflow_runs or [])
         self.attempt_payloads = dict(attempt_payloads or {})
+        self.deletion_pages = list(deletion_pages or [[]])
         self.gets = []
+        self.graphql_queries = []
         self.posts = []
 
     @staticmethod
     def _page(path):
         return int(path.rsplit("page=", 1)[1])
+
+    def graphql_query(self, query, variables):
+        self.graphql_queries.append((query, dict(variables)))
+        after = variables.get("after")
+        if after is None:
+            page = 0
+        elif isinstance(after, str) and after.startswith("cursor-"):
+            page = int(after.split("-", 1)[1])
+        else:
+            raise AssertionError("unexpected GraphQL cursor")
+        nodes = self.deletion_pages[page] if page < len(self.deletion_pages) else []
+        has_next = page + 1 < len(self.deletion_pages)
+        return {
+            "data": {
+                "repository": {
+                    "issue": {
+                        "timelineItems": {
+                            "nodes": nodes,
+                            "pageInfo": {
+                                "hasNextPage": has_next,
+                                "endCursor": f"cursor-{page + 1}" if has_next else None,
+                            },
+                        }
+                    }
+                }
+            }
+        }
 
     def get(self, path):
         self.gets.append(path)
@@ -317,8 +353,76 @@ class PreflightProjectionTests(unittest.TestCase):
         self.assertEqual(record["workstream_d_scenarios_executed"], 0)
         self.assertFalse(record["workstream_e_authorised"])
         self.assertFalse(api.posts)
+        self.assertEqual(len(api.graphql_queries), 1)
         self.assertTrue(any("page=2" in path for path in api.gets))
         self.assertNotIn("read-only-fixture-token", output.getvalue())
+
+    def test_deleted_carrier_comment_cannot_restore_preflight_after_tombstone_disappears(self):
+        projection = projection_comment()
+        deletion = {
+            "__typename": "CommentDeletedEvent",
+            "id": "CDE_kwDOexample",
+            "createdAt": "2026-09-04T00:03:00Z",
+        }
+        api = FakeReadOnlyAPI(
+            projection_comments=[projection],
+            workflow_runs=[current_run(projection)],
+            deletion_pages=[[deletion]],
+        )
+        with self.assertRaisesRegex(
+            runtime.PreflightRuntimeError,
+            "PUBLIC_CARRIER_DELETION_DETECTED",
+        ):
+            runtime.run_preflight(
+                valid_environment(projection),
+                api_factory=lambda token, url: api,
+                now=EVALUATED_AT,
+            )
+        self.assertFalse(api.posts)
+
+    def test_carrier_deletion_history_paginates_before_permanent_fail_closed(self):
+        projection = projection_comment()
+        deletion = {
+            "__typename": "CommentDeletedEvent",
+            "id": "CDE_kwDOlater",
+            "createdAt": "2026-09-04T00:04:00Z",
+        }
+        api = FakeReadOnlyAPI(
+            projection_comments=[projection],
+            workflow_runs=[current_run(projection)],
+            deletion_pages=[[], [deletion]],
+        )
+        with self.assertRaisesRegex(
+            runtime.PreflightRuntimeError,
+            "PUBLIC_CARRIER_DELETION_DETECTED",
+        ):
+            runtime.run_preflight(
+                valid_environment(projection),
+                api_factory=lambda token, url: api,
+                now=EVALUATED_AT,
+            )
+        self.assertEqual(len(api.graphql_queries), 2)
+
+    def test_legacy_projection_runtime_and_suffix_validator_are_retired(self):
+        projection = projection_comment()
+        parsed = preflight.parse_projection_comment(projection)
+        assert parsed is not None
+        with self.assertRaisesRegex(
+            preflight.PreflightProjectionError,
+            "PREFLIGHT_RUNTIME_REQUIRED",
+        ):
+            preflight.run_preflight({})
+        with self.assertRaisesRegex(
+            preflight.PreflightProjectionError,
+            "PREFLIGHT_RUNTIME_REQUIRED",
+        ):
+            preflight.validate_preflight_workflow_suffix(
+                object(),
+                parsed.manifest.workflow_history,
+                run_id=RUN_ID,
+                run_attempt=1,
+                trusted_sha=TRUSTED_SHA,
+            )
 
     def test_complete_workflow_prefix_must_match_manifest_baseline(self):
         baseline = workflow_history_baseline(

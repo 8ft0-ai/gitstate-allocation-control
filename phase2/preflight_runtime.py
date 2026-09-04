@@ -18,6 +18,7 @@ from .operator_manifest import (
 
 
 WORKFLOW_HISTORY_OPERATION = "phase2-adversarial/workflow-dispatch/v1"
+PUBLIC_CARRIER_DELETION_QUERY = """query PublicCarrierDeletionEvents($owner:String!,$name:String!,$number:Int!,$after:String){repository(owner:$owner,name:$name){issue(number:$number){timelineItems(first:100,after:$after,itemTypes:[COMMENT_DELETED_EVENT]){nodes{__typename ... on CommentDeletedEvent{id createdAt}} pageInfo{hasNextPage endCursor}}}}}"""
 
 
 class PreflightRuntimeError(RuntimeError):
@@ -47,6 +48,68 @@ def _require_positive_int(value: object, reason: str) -> int:
     if type(value) is not int or value <= 0:
         raise PreflightRuntimeError(reason)
     return value
+
+
+def validate_public_carrier_history(api: GitHubAPI) -> None:
+    owner, name = projection.CONTROL_REPOSITORY.split("/", 1)
+    after: str | None = None
+    seen_cursors: set[str] = set()
+    for _ in range(100):
+        payload = api.graphql_query(
+            PUBLIC_CARRIER_DELETION_QUERY,
+            {
+                "owner": owner,
+                "name": name,
+                "number": projection.PROJECTION_ISSUE_NUMBER,
+                "after": after,
+            },
+        )
+        if not isinstance(payload, Mapping):
+            raise PreflightRuntimeError("READ_EVIDENCE_AMBIGUOUS")
+        errors = payload.get("errors")
+        if errors not in (None, []):
+            raise PreflightRuntimeError("READ_EVIDENCE_UNAVAILABLE")
+        data = payload.get("data")
+        repository = data.get("repository") if isinstance(data, Mapping) else None
+        issue = repository.get("issue") if isinstance(repository, Mapping) else None
+        timeline = issue.get("timelineItems") if isinstance(issue, Mapping) else None
+        if not isinstance(timeline, Mapping):
+            raise PreflightRuntimeError("READ_EVIDENCE_AMBIGUOUS")
+        nodes = timeline.get("nodes")
+        page_info = timeline.get("pageInfo")
+        if (
+            not isinstance(nodes, list)
+            or any(not isinstance(node, Mapping) for node in nodes)
+            or not isinstance(page_info, Mapping)
+        ):
+            raise PreflightRuntimeError("READ_EVIDENCE_AMBIGUOUS")
+        for node in nodes:
+            if (
+                node.get("__typename") != "CommentDeletedEvent"
+                or not isinstance(node.get("id"), str)
+                or not node.get("id")
+                or not isinstance(node.get("createdAt"), str)
+                or not node.get("createdAt")
+            ):
+                raise PreflightRuntimeError("READ_EVIDENCE_AMBIGUOUS")
+            raise PreflightRuntimeError("PUBLIC_CARRIER_DELETION_DETECTED")
+        has_next_page = page_info.get("hasNextPage")
+        end_cursor = page_info.get("endCursor")
+        if type(has_next_page) is not bool:
+            raise PreflightRuntimeError("READ_EVIDENCE_AMBIGUOUS")
+        if not has_next_page:
+            if end_cursor is not None and not isinstance(end_cursor, str):
+                raise PreflightRuntimeError("READ_EVIDENCE_AMBIGUOUS")
+            return
+        if (
+            not isinstance(end_cursor, str)
+            or not end_cursor
+            or end_cursor in seen_cursors
+        ):
+            raise PreflightRuntimeError("READ_EVIDENCE_AMBIGUOUS")
+        seen_cursors.add(end_cursor)
+        after = end_cursor
+    raise PreflightRuntimeError("READ_EVIDENCE_AMBIGUOUS")
 
 
 def _workflow_attempt(
@@ -210,6 +273,7 @@ def run_preflight(
     ) = _context(env)
 
     api = api_factory(token, env.get("GITHUB_API_URL", "https://api.github.com"))
+    validate_public_carrier_history(api)
     comments = projection._list_issue_comments(api, projection.PROJECTION_ISSUE_NUMBER)
     preflight_projection, invalidations = projection.parse_projection_history(
         comments,

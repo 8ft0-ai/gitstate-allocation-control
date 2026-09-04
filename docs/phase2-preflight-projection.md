@@ -20,11 +20,15 @@ A projection is evidence only. It carries `execution_authorised: false` and `wor
 
 The projection embeds the exact canonical guarded B1 manifest so canonicalising the nested object reproduces the bound manifest SHA-256. It also carries the exact B1 governance source evidence needed for the pure B1 reducer to re-authenticate and re-parse governance semantics without granting the public workflow private-repository access. Projection construction must therefore apply the repository's public disclosure boundary before publication: governance source material containing credentials, personal/proprietary content, private repository names/URLs or other direct private-governance locators is not publishable.
 
-## Public invalidation
+## Public invalidation and deletion monotonicity
 
 A public invalidation is a fail-closed tombstone only. It binds an exact projection and manifest subject and may additionally bind exact authority or manifest-approval identities. It carries no positive authority fields and cannot restore an invalidated object.
 
-B2 validates the complete dedicated issue history and honours a matching tombstone during preflight. B3, if separately authorised and reviewed later, is responsible for enforcing the same public invalidation boundary at execution-capsule discovery/consumption and live L1/L2 gates.
+B2 validates the complete currently visible dedicated issue history and honours a matching tombstone during preflight. It additionally queries GitHub's read-visible `CommentDeletedEvent` timeline for the dedicated carrier through the read-only GraphQL query surface. Any comment deletion on issue #28 permanently fails B2 preflight as `PUBLIC_CARRIER_DELETION_DETECTED`.
+
+This carrier-wide deletion rule is deliberately stronger than subject-specific invalidation. B2 does not try to infer the content or identity of a deleted comment. Because issue #28 is a dedicated machine carrier, deletion means its visible comment inventory can no longer prove a complete monotonic history. Deleting a tombstone, projection or ordinary carrier comment therefore cannot make an older projection executable again. Recovery from a deletion requires a new separately governed carrier/contract rather than reusing issue #28.
+
+B3, if separately authorised and reviewed later, is responsible for enforcing this same public invalidation/deletion boundary or a stronger deletion-resistant durable-history boundary at execution-capsule discovery/consumption and live L1/L2 gates.
 
 ## Capability-denied preflight workflow
 
@@ -36,9 +40,10 @@ B2 validates the complete dedicated issue history and honours a matching tombsto
 - performs no capsule discovery or consumption;
 - receives no allocator App private key, installation token, control/state mutation token or state-repository secret;
 - accepts only the exact public projection comment ID and expected body SHA-256 as workflow inputs;
-- runs the dedicated capability-denied preflight runtime and stops after deterministic evidence output.
+- uses a read-only GraphQL query only to enumerate GitHub-managed comment-deletion events for the dedicated public carrier;
+- runs the dedicated capability-denied `phase2.preflight_runtime` and stops after deterministic evidence output.
 
-The historical `phase2.operator_runtime preflight` command is retired and fails closed as `OPERATOR_PREFLIGHT_PROJECTION_REQUIRED`. The V1 live execution route still uses the unchanged capsule discovery/consumption and existing credential/revocation stack.
+The historical `phase2.operator_runtime preflight` command is retired and fails closed as `OPERATOR_PREFLIGHT_PROJECTION_REQUIRED`. The earlier executable path in `phase2.preflight_projection` is also retired: its `run_preflight` and legacy suffix validator fail closed as `PREFLIGHT_RUNTIME_REQUIRED`. `phase2.preflight_runtime` is the sole B2 executable preflight implementation. The V1 live execution route still uses the unchanged capsule discovery/consumption and existing credential/revocation stack.
 
 ## Observation and guard model
 
@@ -47,7 +52,8 @@ The preflight projection supplies explicitly bound, non-secret observation evide
 - protected control commit/tree identity;
 - workflow and bounded module blob identities;
 - complete public V1 operator history;
-- complete preflight projection/invalidation history;
+- complete currently visible preflight projection/invalidation history;
+- GitHub-managed comment-deletion history for the dedicated carrier, with any deletion permanently fail-closed;
 - complete workflow-dispatch history through the manifest baseline plus explicitly bound post-baseline preflight observations;
 - execution-enable variable absence.
 
@@ -72,6 +78,8 @@ A successful preflight emits deterministic evidence including run ID/attempt, pr
 - `canonical_state_mutated: false`;
 - `workstream_d_scenarios_executed: 0`;
 - `workstream_e_authorised: false`.
+
+A carrier deletion fails before PASS evidence can be produced. All blocked command output remains non-authorising and emits no credential material.
 
 A PASS is review evidence only. It is not reusable execution authority.
 

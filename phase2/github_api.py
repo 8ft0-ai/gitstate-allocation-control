@@ -124,5 +124,16 @@ class GitHubAPI:
     def get(self, path: str) -> Any:
         return self.request("GET", path)[0]
 
+    def graphql_query(self, query: str, variables: dict[str, Any]) -> Any:
+        if not isinstance(query, str) or not query.lstrip().startswith("query"):
+            raise ValueError("GRAPHQL_READ_QUERY_REQUIRED")
+        if not isinstance(variables, dict):
+            raise ValueError("GRAPHQL_VARIABLES_INVALID")
+        return self.request(
+            "POST",
+            "/graphql",
+            {"query": query, "variables": variables},
+        )[0]
+
     def post(self, path: str, body: dict[str, Any]) -> Any:
         return self.request("POST", path, body)[0]
