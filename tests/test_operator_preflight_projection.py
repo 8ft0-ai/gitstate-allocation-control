@@ -9,8 +9,15 @@ from io import StringIO
 from pathlib import Path
 
 import phase2.preflight_projection as preflight
+import phase2.preflight_runtime as runtime
+from phase2.governance_state import parse_guarded_execution_manifest
 from phase2.operator_capsule import OperatorCapsuleError, parse_capsule_comment
-from phase2.operator_manifest import canonical_json, sha256_text
+from phase2.operator_manifest import (
+    WorkflowHistoryRecord,
+    canonical_json,
+    sha256_text,
+    workflow_history_baseline,
+)
 from test_operator_guard import make_state, parsed_records
 
 
@@ -67,8 +74,15 @@ def bound_observation(observation):
     }
 
 
-def projection_payload(*, projection_id="9" * 32):
+def projection_payload(*, projection_id="9" * 32, workflow_history=None):
     _, _, _, manifest, comments, observation = make_state()
+    if workflow_history is not None:
+        value = thaw(manifest.payload)
+        value["workflow_history"] = {
+            "through_id": workflow_history.through_id,
+            "history_sha256": workflow_history.history_sha256,
+        }
+        manifest = parse_guarded_execution_manifest(canonical_json(value))
     records = parsed_records(comments)
     return manifest, {
         "contract": preflight.PROJECTION_CONTRACT,
@@ -122,9 +136,21 @@ def invalidation_comment(projection, *, comment_id=1002, manifest_sha=None):
     }
 
 
+def workflow_run(run_id, *, title, attempt=1, head_sha=TRUSTED_SHA):
+    return {
+        "id": run_id,
+        "run_attempt": attempt,
+        "head_sha": head_sha,
+        "event": "workflow_dispatch",
+        "display_title": title,
+    }
+
+
 class FakeReadOnlyAPI:
-    def __init__(self, *, projection_comments):
+    def __init__(self, *, projection_comments, workflow_runs=None, attempt_payloads=None):
         self.projection_comments = list(projection_comments)
+        self.workflow_runs = list(workflow_runs or [])
+        self.attempt_payloads = dict(attempt_payloads or {})
         self.gets = []
         self.posts = []
 
@@ -136,7 +162,7 @@ class FakeReadOnlyAPI:
         self.gets.append(path)
         if f"/issues/{preflight.PROJECTION_ISSUE_NUMBER}/comments" in path:
             page = self._page(path)
-            if page == 1 and len(self.projection_comments) > 1:
+            if page == 1 and len(self.projection_comments) > 100:
                 return self.projection_comments[:100]
             if page == 2 and len(self.projection_comments) > 100:
                 return self.projection_comments[100:]
@@ -157,18 +183,11 @@ class FakeReadOnlyAPI:
             f"/repos/{preflight.CONTROL_REPOSITORY}/actions/workflows/{preflight.WORKFLOW_FILENAME}/runs"
         ):
             page = self._page(path)
-            return {
-                "workflow_runs": [
-                    {
-                        "id": RUN_ID,
-                        "run_attempt": 1,
-                        "head_sha": TRUSTED_SHA,
-                        "event": "workflow_dispatch",
-                    }
-                ]
-                if page == 1
-                else []
-            }
+            return {"workflow_runs": self.workflow_runs if page == 1 else []}
+        if "/actions/runs/" in path and "/attempts/" in path:
+            run_id = int(path.split("/actions/runs/", 1)[1].split("/", 1)[0])
+            attempt = int(path.rsplit("/", 1)[1])
+            return self.attempt_payloads[(run_id, attempt)]
         raise AssertionError(path)
 
     def post(self, path, body):
@@ -177,6 +196,8 @@ class FakeReadOnlyAPI:
 
 
 def valid_environment(projection):
+    parsed = preflight.parse_projection_comment(projection)
+    assert parsed is not None
     return {
         "GITHUB_REPOSITORY": preflight.CONTROL_REPOSITORY,
         "GITHUB_REF": "refs/heads/main",
@@ -186,7 +207,19 @@ def valid_environment(projection):
         "GITHUB_TOKEN": "read-only-fixture-token",
         "PREFLIGHT_PROJECTION_COMMENT_ID": str(projection["id"]),
         "PREFLIGHT_PROJECTION_BODY_SHA256": sha256_text(projection["body"]),
+        "PREFLIGHT_MANIFEST_SHA256": parsed.manifest_sha256,
     }
+
+
+def current_run(projection, *, run_id=RUN_ID):
+    parsed = preflight.parse_projection_comment(projection)
+    assert parsed is not None
+    title = runtime.expected_run_name(
+        parsed.comment_id,
+        parsed.body_sha256,
+        parsed.manifest_sha256,
+    )
+    return workflow_run(run_id, title=title)
 
 
 class PreflightProjectionTests(unittest.TestCase):
@@ -265,10 +298,13 @@ class PreflightProjectionTests(unittest.TestCase):
             }
             for index in range(1, 101)
         ]
-        api = FakeReadOnlyAPI(projection_comments=ordinary + [projection])
+        api = FakeReadOnlyAPI(
+            projection_comments=ordinary + [projection],
+            workflow_runs=[current_run(projection)],
+        )
         output = StringIO()
         with redirect_stdout(output):
-            record = preflight.run_preflight(
+            record = runtime.run_preflight(
                 valid_environment(projection),
                 api_factory=lambda token, url: api,
                 now=EVALUATED_AT,
@@ -284,11 +320,111 @@ class PreflightProjectionTests(unittest.TestCase):
         self.assertTrue(any("page=2" in path for path in api.gets))
         self.assertNotIn("read-only-fixture-token", output.getvalue())
 
+    def test_complete_workflow_prefix_must_match_manifest_baseline(self):
+        baseline = workflow_history_baseline(
+            [
+                WorkflowHistoryRecord(
+                    100,
+                    1,
+                    TRUSTED_SHA,
+                    runtime.WORKFLOW_HISTORY_OPERATION,
+                )
+            ]
+        )
+        _, payload = projection_payload(workflow_history=baseline)
+        projection = projection_comment(payload=payload)
+        api = FakeReadOnlyAPI(
+            projection_comments=[projection],
+            workflow_runs=[
+                workflow_run(100, title="historical"),
+                current_run(projection),
+            ],
+        )
+        record = runtime.run_preflight(
+            valid_environment(projection),
+            api_factory=lambda token, url: api,
+            now=EVALUATED_AT,
+        )
+        self.assertTrue(record["guard_passed"])
+
+        wrong = projection_payload(
+            workflow_history=type(baseline)(baseline.through_id, "0" * 64)
+        )[1]
+        wrong_projection = projection_comment(2001, payload=wrong)
+        wrong_api = FakeReadOnlyAPI(
+            projection_comments=[wrong_projection],
+            workflow_runs=[
+                workflow_run(100, title="historical"),
+                current_run(wrong_projection),
+            ],
+        )
+        with self.assertRaisesRegex(runtime.PreflightRuntimeError, "WORKFLOW_HISTORY_CHANGED"):
+            runtime.run_preflight(
+                valid_environment(wrong_projection),
+                api_factory=lambda token, url: wrong_api,
+                now=EVALUATED_AT,
+            )
+
+    def test_multiple_bound_attempt_one_preflights_are_allowed_but_unrelated_dispatch_is_not(self):
+        projection = projection_comment()
+        title = current_run(projection)["display_title"]
+        api = FakeReadOnlyAPI(
+            projection_comments=[projection],
+            workflow_runs=[
+                workflow_run(500, title=title),
+                workflow_run(RUN_ID, title=title),
+            ],
+        )
+        record = runtime.run_preflight(
+            valid_environment(projection),
+            api_factory=lambda token, url: api,
+            now=EVALUATED_AT,
+        )
+        self.assertTrue(record["guard_passed"])
+
+        unrelated_api = FakeReadOnlyAPI(
+            projection_comments=[projection],
+            workflow_runs=[
+                workflow_run(500, title="contract_check"),
+                workflow_run(RUN_ID, title=title),
+            ],
+        )
+        with self.assertRaisesRegex(runtime.PreflightRuntimeError, "WORKFLOW_HISTORY_CHANGED"):
+            runtime.run_preflight(
+                valid_environment(projection),
+                api_factory=lambda token, url: unrelated_api,
+                now=EVALUATED_AT,
+            )
+
+    def test_historical_rerun_attempts_are_reconstructed_before_prefix_digest(self):
+        baseline = workflow_history_baseline(
+            [
+                WorkflowHistoryRecord(100, 1, TRUSTED_SHA, runtime.WORKFLOW_HISTORY_OPERATION),
+                WorkflowHistoryRecord(100, 2, TRUSTED_SHA, runtime.WORKFLOW_HISTORY_OPERATION),
+            ]
+        )
+        _, payload = projection_payload(workflow_history=baseline)
+        projection = projection_comment(payload=payload)
+        current_attempt = workflow_run(100, title="historical", attempt=2)
+        first_attempt = workflow_run(100, title="historical", attempt=1)
+        api = FakeReadOnlyAPI(
+            projection_comments=[projection],
+            workflow_runs=[current_attempt, current_run(projection)],
+            attempt_payloads={(100, 1): first_attempt},
+        )
+        record = runtime.run_preflight(
+            valid_environment(projection),
+            api_factory=lambda token, url: api,
+            now=EVALUATED_AT,
+        )
+        self.assertTrue(record["guard_passed"])
+        self.assertTrue(any("/attempts/1" in path for path in api.gets))
+
     def test_matching_invalidation_blocks_before_guard_and_never_writes(self):
         projection = projection_comment()
         tombstone = invalidation_comment(projection)
         api = FakeReadOnlyAPI(projection_comments=[projection, tombstone])
-        record = preflight.run_preflight(
+        record = runtime.run_preflight(
             valid_environment(projection),
             api_factory=lambda token, url: api,
             now=EVALUATED_AT,
@@ -298,8 +434,8 @@ class PreflightProjectionTests(unittest.TestCase):
         self.assertFalse(record["execution_authorised"])
         self.assertFalse(api.posts)
 
-    def test_preflight_module_has_no_token_mint_or_mutation_provider_dependency(self):
-        source = inspect.getsource(preflight)
+    def test_preflight_modules_have_no_token_mint_or_mutation_provider_dependency(self):
+        source = inspect.getsource(preflight) + inspect.getsource(runtime)
         for forbidden in (
             "create_app_jwt",
             "mint_token",
@@ -317,7 +453,8 @@ class PreflightProjectionTests(unittest.TestCase):
         self.assertIn("needs: [contract-check]", preflight_job)
         self.assertIn("actions: read", preflight_job)
         self.assertIn("issues: read", preflight_job)
-        self.assertIn("phase2.preflight_projection preflight", preflight_job)
+        self.assertIn("phase2.preflight_runtime preflight", preflight_job)
+        self.assertIn("PREFLIGHT_MANIFEST_SHA256", preflight_job)
         for forbidden in (
             "capsule-discovery",
             "capsule-consumption",
@@ -331,6 +468,10 @@ class PreflightProjectionTests(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, preflight_job)
 
+        self.assertIn(
+            "operator_preflight projection={0} body={1} manifest={2}",
+            workflow,
+        )
         capsule_prefix = workflow.split("\n  live-scenario-suite:\n", 1)[0]
         self.assertEqual(
             capsule_prefix.count("if: ${{ inputs.operation == 'live_scenario_suite' }}"),
