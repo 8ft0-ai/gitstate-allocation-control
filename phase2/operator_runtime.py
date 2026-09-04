@@ -214,31 +214,8 @@ def preflight(
     api_factory: Callable[[str, str], GitHubAPI] = GitHubAPI,
     jwt_factory: Callable[[int, str], str] = create_app_jwt,
 ) -> dict[str, object]:
-    env = os.environ if values is None else values
-    context = context_from_environment(env)
-    if context.input_operation != "operator_preflight":
-        raise OperatorRuntimeError("OPERATOR_PREFLIGHT_OPERATION_REQUIRED")
-    _, _, _, _, inventory = _app_inventory_proof(
-        env, context, api_factory=api_factory, jwt_factory=jwt_factory
-    )
-    record: dict[str, object] = {
-        "status": "GITSTATE_OPERATOR_PREFLIGHT_SUCCEEDED",
-        "run_id": context.run_id,
-        "run_attempt": context.run_attempt,
-        "trusted_sha": context.trusted_sha,
-        "protocol_sha": context.expected_protocol_sha,
-        "capsule_id": context.capsule_id,
-        "capsule_body_sha256": context.capsule_body_sha256,
-        "consumption_record_sha256": context.consumption_record_sha256,
-        "attempt_namespace": f"wd-{context.run_id}-{context.run_attempt}-{context.attempt_nonce}",
-        "inventory": inventory.payload(),
-        "control_state_tokens_minted": 0,
-        "canonical_state_mutated": False,
-        "workstream_d_scenarios_executed": 0,
-        "workstream_e_authorised": False,
-    }
-    print(json.dumps(record, sort_keys=True, separators=(",", ":")))
-    return record
+    del values, api_factory, jwt_factory
+    raise OperatorRuntimeError("OPERATOR_PREFLIGHT_PROJECTION_REQUIRED")
 
 
 def _operator_acquire_credentials(
