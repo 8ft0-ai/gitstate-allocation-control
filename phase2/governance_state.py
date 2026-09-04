@@ -7,15 +7,18 @@ from types import MappingProxyType
 from typing import Any, Sequence
 
 from .operator_manifest import (
+    GOVERNANCE_OWNER,
     MANIFEST_FIELDS,
     SHA256,
     CommentBinding,
     ExecutionManifest,
     GovernanceRecord,
+    GovernanceSource,
     HistoryBaseline,
     OperatorContractError,
     canonical_json,
     parse_execution_manifest,
+    parse_governance_comment,
     sha256_text,
 )
 
@@ -33,11 +36,15 @@ class GuardedExecutionManifest(ExecutionManifest):
 
 @dataclass(frozen=True)
 class GovernanceHistory:
-    """Manifest-bound snapshot supplied by a durable append-only history provider."""
+    """Manifest-bound exact source evidence supplied by a durable history provider."""
 
     manifest_sha256: str
     baseline: HistoryBaseline
-    records: tuple[GovernanceRecord, ...]
+    records: tuple[GovernanceSource, ...]
+
+    @property
+    def sources(self) -> tuple[GovernanceSource, ...]:
+        return self.records
 
 
 @dataclass(frozen=True)
@@ -159,18 +166,21 @@ def canonical_governance_history(
     *,
     through_comment_id: int | None = None,
 ) -> str:
-    ordered = tuple(sorted(records, key=lambda record: record.comment_id))
+    materialized = tuple(records)
+    if any(not isinstance(record, GovernanceRecord) for record in materialized):
+        raise GovernanceStateError("GOVERNANCE_RECORD_INVALID")
+    if any(type(record.comment_id) is not int for record in materialized):
+        raise GovernanceStateError("GOVERNANCE_RECORD_INVALID")
+    ordered = tuple(sorted(materialized, key=lambda record: record.comment_id))
     seen_comments: set[int] = set()
     seen_records: set[str] = set()
     lines: list[str] = []
     for record in ordered:
-        if not isinstance(record, GovernanceRecord):
-            raise GovernanceStateError("GOVERNANCE_RECORD_INVALID")
         if record.comment_id <= 0 or record.comment_id in seen_comments:
             raise GovernanceStateError("GOVERNANCE_RECORD_INVALID")
         if record.record_id in seen_records:
             raise GovernanceStateError("GOVERNANCE_RECORD_INVALID")
-        if SHA256.fullmatch(record.body_sha256) is None:
+        if not isinstance(record.body_sha256, str) or SHA256.fullmatch(record.body_sha256) is None:
             raise GovernanceStateError("GOVERNANCE_RECORD_INVALID")
         seen_comments.add(record.comment_id)
         seen_records.add(record.record_id)
@@ -186,12 +196,17 @@ def governance_history_baseline(
     *,
     through_comment_id: int | None = None,
 ) -> HistoryBaseline:
+    materialized = tuple(records)
+    if any(not isinstance(record, GovernanceRecord) for record in materialized):
+        raise GovernanceStateError("GOVERNANCE_RECORD_INVALID")
+    if any(type(record.comment_id) is not int for record in materialized):
+        raise GovernanceStateError("GOVERNANCE_RECORD_INVALID")
     selected = tuple(
         record
-        for record in records
+        for record in materialized
         if through_comment_id is None or record.comment_id <= through_comment_id
     )
-    canonical = canonical_governance_history(records, through_comment_id=through_comment_id)
+    canonical = canonical_governance_history(materialized, through_comment_id=through_comment_id)
     through = max((record.comment_id for record in selected), default=0)
     return HistoryBaseline(through, sha256_text(canonical))
 
@@ -200,37 +215,117 @@ def build_governance_history(
     manifest_sha256: str,
     records: Sequence[GovernanceRecord],
 ) -> GovernanceHistory:
-    ordered = tuple(sorted(records, key=lambda record: record.comment_id))
+    if not isinstance(manifest_sha256, str) or SHA256.fullmatch(manifest_sha256) is None:
+        raise GovernanceStateError("GOVERNANCE_HISTORY_CHANGED")
+    materialized = tuple(records)
+    if any(not isinstance(record, GovernanceRecord) for record in materialized):
+        raise GovernanceStateError("GOVERNANCE_HISTORY_CHANGED")
+    if any(type(record.comment_id) is not int for record in materialized):
+        raise GovernanceStateError("GOVERNANCE_HISTORY_CHANGED")
+    ordered = tuple(sorted(materialized, key=lambda record: record.comment_id))
+    sources: list[GovernanceSource] = []
+    for record in ordered:
+        source = record.source
+        if not isinstance(source, GovernanceSource):
+            raise GovernanceStateError("GOVERNANCE_HISTORY_CHANGED")
+        if (
+            source.comment_id != record.comment_id
+            or not isinstance(source.body, str)
+            or sha256_text(source.body) != record.body_sha256
+        ):
+            raise GovernanceStateError("GOVERNANCE_HISTORY_CHANGED")
+        sources.append(source)
     return GovernanceHistory(
         manifest_sha256=manifest_sha256,
         baseline=governance_history_baseline(ordered),
-        records=ordered,
+        records=tuple(sources),
     )
+
+
+def _source_comment(source: GovernanceSource) -> dict[str, Any]:
+    if (
+        type(source.comment_id) is not int
+        or source.comment_id <= 0
+        or not isinstance(source.body, str)
+        or not isinstance(source.owner, str)
+        or not source.owner
+        or not isinstance(source.created_at, str)
+        or not isinstance(source.updated_at, str)
+    ):
+        raise GovernanceStateError("GOVERNANCE_HISTORY_CHANGED")
+    return {
+        "id": source.comment_id,
+        "body": source.body,
+        "user": {"login": source.owner},
+        "created_at": source.created_at,
+        "updated_at": source.updated_at,
+    }
+
+
+def _records_from_sources(
+    manifest: GuardedExecutionManifest,
+    sources: tuple[GovernanceSource, ...],
+) -> tuple[GovernanceRecord, ...]:
+    records: list[GovernanceRecord] = []
+    seen_comments: set[int] = set()
+    seen_records: set[str] = set()
+    previous_comment_id = 0
+    for source in sources:
+        if not isinstance(source, GovernanceSource):
+            raise GovernanceStateError("GOVERNANCE_HISTORY_CHANGED")
+        source_comment = _source_comment(source)
+        if source.comment_id <= previous_comment_id or source.comment_id in seen_comments:
+            raise GovernanceStateError("GOVERNANCE_HISTORY_CHANGED")
+        try:
+            record = parse_governance_comment(
+                source_comment,
+                expected_owner=GOVERNANCE_OWNER,
+                expected_issue=manifest.governing_issue,
+            )
+        except (OperatorContractError, TypeError, ValueError, KeyError, AttributeError) as exc:
+            raise GovernanceStateError("GOVERNANCE_HISTORY_CHANGED") from exc
+        if record is None or record.source != source:
+            raise GovernanceStateError("GOVERNANCE_HISTORY_CHANGED")
+        if record.record_id in seen_records:
+            raise GovernanceStateError("GOVERNANCE_HISTORY_CHANGED")
+        previous_comment_id = source.comment_id
+        seen_comments.add(source.comment_id)
+        seen_records.add(record.record_id)
+        records.append(record)
+    return tuple(records)
 
 
 def validate_governance_history(
     manifest: ExecutionManifest,
     history: GovernanceHistory,
-) -> None:
+) -> tuple[GovernanceRecord, ...]:
     if not isinstance(manifest, GuardedExecutionManifest):
         raise GovernanceStateError("GOVERNANCE_HISTORY_CHANGED")
     if not isinstance(history, GovernanceHistory):
         raise GovernanceStateError("GOVERNANCE_HISTORY_CHANGED")
-    if SHA256.fullmatch(history.manifest_sha256) is None or history.manifest_sha256 != manifest.sha256:
+    if (
+        not isinstance(history.manifest_sha256, str)
+        or SHA256.fullmatch(history.manifest_sha256) is None
+        or history.manifest_sha256 != manifest.sha256
+    ):
         raise GovernanceStateError("GOVERNANCE_HISTORY_CHANGED")
     if not isinstance(history.baseline, HistoryBaseline):
         raise GovernanceStateError("GOVERNANCE_HISTORY_CHANGED")
-    if not isinstance(history.records, tuple):
-        raise GovernanceStateError("GOVERNANCE_HISTORY_CHANGED")
-    if tuple(sorted(history.records, key=lambda record: record.comment_id)) != history.records:
-        raise GovernanceStateError("GOVERNANCE_HISTORY_CHANGED")
-    if any(
-        record.governing_issue != manifest.governing_issue or record.operation != manifest.operation
-        for record in history.records
+    if (
+        type(history.baseline.through_id) is not int
+        or history.baseline.through_id < 0
+        or not isinstance(history.baseline.history_sha256, str)
+        or SHA256.fullmatch(history.baseline.history_sha256) is None
     ):
         raise GovernanceStateError("GOVERNANCE_HISTORY_CHANGED")
+    if not isinstance(history.records, tuple):
+        raise GovernanceStateError("GOVERNANCE_HISTORY_CHANGED")
 
-    actual = governance_history_baseline(history.records)
+    records = _records_from_sources(manifest, history.records)
+    if any(record.operation != manifest.operation for record in records):
+        raise GovernanceStateError("GOVERNANCE_HISTORY_CHANGED")
+
+    actual = governance_history_baseline(records)
     if actual != history.baseline:
         raise GovernanceStateError("GOVERNANCE_HISTORY_CHANGED")
 
@@ -243,11 +338,12 @@ def validate_governance_history(
     if required.through_id < required_through or history.baseline.through_id < required.through_id:
         raise GovernanceStateError("GOVERNANCE_HISTORY_CHANGED")
     anchored_prefix = governance_history_baseline(
-        history.records,
+        records,
         through_comment_id=required.through_id,
     )
     if anchored_prefix != required:
         raise GovernanceStateError("GOVERNANCE_HISTORY_CHANGED")
+    return records
 
 
 def _same_binding(record: GovernanceRecord, binding: CommentBinding) -> bool:
@@ -420,8 +516,7 @@ def reduce_governance_history(
     manifest: ExecutionManifest,
     history: GovernanceHistory,
 ) -> GovernanceState:
-    validate_governance_history(manifest, history)
-    records = history.records
+    records = validate_governance_history(manifest, history)
 
     proposal = _exact_record(records, record_type="proposal", binding=manifest.proposal)
     readiness = _exact_record(records, record_type="readiness", binding=manifest.readiness)

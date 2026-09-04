@@ -230,6 +230,8 @@ def _evaluate_governance(
         state = reduce_governance_history(manifest, observation.governance_history)
     except GovernanceStateError as exc:
         return GuardResult.failure(exc.code)
+    except Exception:
+        return GuardResult.failure("GUARD_EVALUATOR_DEFECT")
 
     if state.authority_status == "superseded":
         return GuardResult.failure("GOVERNANCE_SUPERSEDED")

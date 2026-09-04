@@ -12,6 +12,7 @@ from typing import Any, Iterable, Mapping, Sequence
 MANIFEST_CONTRACT = "gitstate-live-execution-manifest/v1"
 GOVERNANCE_CONTRACT = "gitstate-execution-governance/v1"
 GOVERNANCE_PREFIX = "/gitstate-governance-v1 "
+GOVERNANCE_OWNER = "8ft0-ai"
 V1_CAPSULE_CONTRACT = "gitstate-operator/v1"
 V1_CONSUMPTION_CONTRACT = "gitstate-consumption/v1"
 V1_GOVERNANCE_CONTRACT = "gitstate-private-governance/v1"
@@ -451,10 +452,20 @@ def parse_execution_manifest(raw: str, *, expected_sha256: str | None = None) ->
 
 
 @dataclass(frozen=True)
+class GovernanceSource:
+    comment_id: int
+    body: str
+    owner: str
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True)
 class GovernanceRecord:
     payload: Mapping[str, Any]
     comment_id: int
     body_sha256: str
+    source: GovernanceSource | None = None
 
     @property
     def record_id(self) -> str:
@@ -647,7 +658,14 @@ def parse_governance_comment(
     _require_subject(str(record_type), value.get("subject"))
     _require_governance_details(str(record_type), value.get("details"))
     _require_bool(value.get("workstream_e_authorised"), False, "WORKSTREAM_E_NOT_AUTHORISED")
-    return GovernanceRecord(_freeze(value), int(comment_id), body_digest)
+    source = GovernanceSource(
+        comment_id=int(comment_id),
+        body=body,
+        owner=str(user["login"]),
+        created_at=str(created),
+        updated_at=str(updated),
+    )
+    return GovernanceRecord(_freeze(value), int(comment_id), body_digest, source)
 
 
 def parse_governance_comments(

@@ -26,21 +26,27 @@ Supported record types are `proposal`, `readiness`, `authority`, `manifest_appro
 
 Every parsed machine record is owner-authenticated, timestamp-valid, immutable by created/updated timestamp equality, and bound by GitHub comment ID plus exact comment-body SHA-256. Duplicate comment IDs, duplicate record IDs, malformed reserved records and body-digest mismatches fail closed. Parsed governance payloads are deeply immutable after validation.
 
+The B1 governance owner is repository-versioned as `8ft0-ai`. It is not selected by the `GovernanceHistory` caller. The guarded manifest already binds the exact executable module identities, so changing this owner contract requires a newly reviewed implementation identity rather than a mutable history input.
+
 ### Durable governance history
 
 GitHub comments are governance transport and evidence; they are not by themselves the durable authority for irreversible lifecycle state. A fresh enumeration of currently visible comments is therefore not a conforming source for B1 live integration.
 
-The common guard consumes a `GovernanceHistory` value. It contains the exact guarded-manifest SHA-256 to which the snapshot applies, a canonical `HistoryBaseline` over the complete supplied governance-record sequence, and the immutable ordered governance records used by the reducer.
+The common guard consumes a `GovernanceHistory` value. It contains the exact guarded-manifest SHA-256 to which the snapshot applies, a canonical `HistoryBaseline` over the complete supplied governance sequence, and immutable exact source evidence for each governance comment: comment ID, complete body, owner, creation timestamp and update timestamp. It does not trust a caller-supplied semantic `GovernanceRecord` as authority.
 
-The canonical history form is:
+Parser-created `GovernanceRecord` values retain their exact source evidence so `build_governance_history` can discard the caller-facing semantic payload and persist only the source material needed for independent revalidation. A semantic record without parser-attached source evidence is not eligible to construct a `GovernanceHistory`.
+
+Before the reducer sees any governance semantics, `validate_governance_history` reconstructs the source comment, requires the repository-versioned owner, re-runs the strict governance parser, recomputes the exact body SHA-256 and derives a fresh immutable `GovernanceRecord`. Only those freshly derived records are used for history-baseline verification and lifecycle reduction. Changing a supplied in-memory disposition, manifest binding, lineage or lifecycle target while retaining the original source body therefore cannot change the authority decision.
+
+The canonical history form remains:
 
 `<comment-id>\t<record-id>\t<record-type>\t<body-sha256>\n`
 
-The SHA-256 baseline covers the complete concatenated UTF-8 sequence including the final newline. The guarded manifest carries the required prefix baseline. Evaluation recomputes both the complete observation baseline and the prefix ending at the manifest's `through_id`; the observed prefix must exactly equal the baseline embedded in the manifest.
+The SHA-256 baseline covers the complete concatenated UTF-8 sequence including the final newline. The guarded manifest carries the required prefix baseline. Evaluation recomputes both the complete observation baseline and the prefix ending at the manifest's `through_id` from the freshly re-parsed records; the observed prefix must exactly equal the baseline embedded in the manifest.
 
 This closes the successor-manifest deletion case at the manifest boundary. If authority was consumed or revoked before successor manifest B was created, B's digest commits to a governance prefix containing that irreversible transition. Even a newly recomputed, internally self-consistent shorter history fails `GOVERNANCE_HISTORY_CHANGED` because its prefix cannot reproduce B's embedded baseline.
 
-B1 deliberately does not implement the live history provider. A later separately reviewed integration slice must obtain `GovernanceHistory` from the governed private append-only/deletion-resistant authority and must retain irreversible transitions created after the current manifest as well. The provider may extend history but must never reconstruct a shorter authoritative history from currently visible comments. This is a required trust-boundary property of later activation, not an optional caller convention.
+B1 deliberately does not implement the live history provider. A later separately reviewed integration slice must obtain `GovernanceHistory` from the governed private append-only/deletion-resistant authority, retain the exact re-verifiable source evidence described above, and retain irreversible transitions created after the current manifest as well. The provider may extend history but must never reconstruct a shorter authoritative history from currently visible comments or materialise trusted semantics independently of the retained source evidence. These are required trust-boundary properties of later activation, not optional caller conventions.
 
 ### Lineage and manifest scopes
 
@@ -78,11 +84,13 @@ Terminal conclusion is intentionally excluded from this baseline. If terminal ev
 
 ## Pure governance reducer and semantic guard
 
-`phase2.governance_state` owns the guarded-manifest parser, canonical governance-history model and the single pure reducer for governance lifecycle semantics. Given an exact guarded manifest plus its manifest-bound durable `GovernanceHistory`, it validates the embedded history prefix, causal lineage, lifecycle targets, consumption/terminal structure and active authority, then derives a `GovernanceState` including the effective manifest-approval status.
+`phase2.governance_state` owns the guarded-manifest parser, exact-source governance-history model and the single pure reducer for governance lifecycle semantics. Given an exact guarded manifest plus its manifest-bound durable `GovernanceHistory`, it first re-authenticates and re-parses every source record, then validates the embedded history prefix, causal lineage, lifecycle targets, consumption/terminal structure and active authority, and finally derives a `GovernanceState` including the effective manifest-approval status.
 
 `phase2.operator_guard` accepts the immutable guarded manifest plus a typed observation object and returns `PASS` or one typed failure. It imports no GitHub API, credential, token-mint, workflow-dispatch, ref-update or Workstream-D live execution provider. The guard does not accept a caller-selected manifest approval.
 
 A complete observation is shape-validated before semantic comparison. It binds an explicit timezone-aware UTC evaluation instant plus exact operation, control repository/commit/tree/workflow/module identities, protocol/state identities, operator/workflow baselines, App boundary, environment policy, exact execution-enable variable name/absence and the manifest-bound durable governance history.
+
+Malformed or unauthenticated governance source evidence fails as `GOVERNANCE_HISTORY_CHANGED` before reduction. Semantic lifecycle failures continue to use their existing governance failure codes. If an unexpected implementation exception nevertheless escapes the governance reducer boundary, the common evaluator converts it to `GUARD_EVALUATOR_DEFECT`; Python exceptions are not part of the public guard result contract.
 
 When an owner observation is required, the common evaluator owns its freshness decision. Caller-supplied validity cannot override the manifest's `valid_through` boundary; `evaluated_at >= valid_through` produces `APP_BOUNDARY_CHANGED`.
 
