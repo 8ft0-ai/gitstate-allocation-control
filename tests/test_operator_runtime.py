@@ -247,7 +247,7 @@ class OperatorRuntimeTests(unittest.TestCase):
     def test_workflow_has_projected_preflight_and_preserves_one_live_operator_entry(self):
         workflow = Path(".github/workflows/phase2-adversarial.yml").read_text(encoding="utf-8")
         self.assertIn("operator_preflight", workflow)
-        self.assertIn("PYTHONPATH=. python3 -m phase2.preflight_projection preflight", workflow)
+        self.assertIn("PYTHONPATH=. python3 -m phase2.preflight_runtime preflight", workflow)
         self.assertIn("PYTHONPATH=. python3 -m phase2.operator_capsule discover", workflow)
         self.assertIn("PYTHONPATH=. python3 -m phase2.operator_capsule consume", workflow)
         self.assertIn('PYTHONPATH=. "$RUNTIME_PYTHON" -m phase2.operator_runtime live', workflow)
