@@ -22,6 +22,7 @@ from .operator_manifest import (
 WORKFLOW_HISTORY_OPERATION = "phase2-adversarial/workflow-dispatch/v1"
 WORKSTREAM_D_EXECUTION_VARIABLE = "PHASE2_WORKSTREAM_D_EXECUTION_ENABLED"
 PUBLIC_CARRIER_DELETION_QUERY = """query PublicCarrierDeletionEvents($owner:String!,$name:String!,$number:Int!,$after:String){repository(owner:$owner,name:$name){issue(number:$number){locked timelineItems(first:100,after:$after,itemTypes:[COMMENT_DELETED_EVENT]){nodes{__typename ... on CommentDeletedEvent{id createdAt}} pageInfo{hasNextPage endCursor}}}}}"""
+PUBLIC_CARRIER_TIMELINE_QUERY = """query PublicCarrierTimeline($owner:String!,$name:String!,$number:Int!,$after:String){repository(owner:$owner,name:$name){issue(number:$number){locked timelineItems(first:100,after:$after,itemTypes:[ISSUE_COMMENT,COMMENT_DELETED_EVENT]){totalCount filteredCount pageCount updatedAt nodes{__typename ... on IssueComment{databaseId body author{login} createdAt updatedAt} ... on CommentDeletedEvent{id createdAt}} pageInfo{hasNextPage endCursor}}}}}"""
 
 
 class PreflightRuntimeError(RuntimeError):
@@ -100,6 +101,165 @@ def _public_carrier_inventory_digest(comments: Sequence[Mapping[str, Any]]) -> s
     return sha256_text("".join(f"{record}\n" for _, record in records))
 
 
+def _public_carrier_timeline_digest(
+    comments: Sequence[Mapping[str, Any]],
+    *,
+    total_count: int,
+    updated_at: str,
+) -> str:
+    return sha256_text(
+        canonical_json(
+            {
+                "comment_inventory_sha256": _public_carrier_inventory_digest(comments),
+                "timeline_total_count": total_count,
+                "timeline_updated_at": updated_at,
+            }
+        )
+    )
+
+
+def _timeline_issue_comment(node: Mapping[str, Any]) -> dict[str, Any]:
+    comment_id = _require_positive_int(node.get("databaseId"), "READ_EVIDENCE_AMBIGUOUS")
+    body = node.get("body")
+    author = node.get("author")
+    owner = author.get("login") if isinstance(author, Mapping) else None
+    created_at = node.get("createdAt")
+    updated_at = node.get("updatedAt")
+    if (
+        not isinstance(body, str)
+        or not isinstance(owner, str)
+        or not owner
+        or not isinstance(created_at, str)
+        or not created_at
+        or not isinstance(updated_at, str)
+        or not updated_at
+    ):
+        raise PreflightRuntimeError("READ_EVIDENCE_AMBIGUOUS")
+    return {
+        "id": comment_id,
+        "body": body,
+        "user": {"login": owner},
+        "created_at": created_at,
+        "updated_at": updated_at,
+    }
+
+
+def _read_public_carrier_timeline_scan(
+    api: GitHubAPI,
+) -> tuple[list[dict[str, Any]], str]:
+    owner, name = projection.CONTROL_REPOSITORY.split("/", 1)
+    after: str | None = None
+    seen_cursors: set[str] = set()
+    comments: list[dict[str, Any]] = []
+    expected_total_count: int | None = None
+    expected_updated_at: str | None = None
+
+    for _ in range(100):
+        payload = api.graphql_query(
+            PUBLIC_CARRIER_TIMELINE_QUERY,
+            {
+                "owner": owner,
+                "name": name,
+                "number": projection.PROJECTION_ISSUE_NUMBER,
+                "after": after,
+            },
+        )
+        if not isinstance(payload, Mapping):
+            raise PreflightRuntimeError("READ_EVIDENCE_AMBIGUOUS")
+        errors = payload.get("errors")
+        if errors not in (None, []):
+            raise PreflightRuntimeError("READ_EVIDENCE_UNAVAILABLE")
+        data = payload.get("data")
+        repository = data.get("repository") if isinstance(data, Mapping) else None
+        issue = repository.get("issue") if isinstance(repository, Mapping) else None
+        if not isinstance(issue, Mapping):
+            raise PreflightRuntimeError("READ_EVIDENCE_AMBIGUOUS")
+        locked = issue.get("locked")
+        if locked is False:
+            raise PreflightRuntimeError("PUBLIC_CARRIER_NOT_LOCKED")
+        if locked is not True:
+            raise PreflightRuntimeError("READ_EVIDENCE_AMBIGUOUS")
+
+        timeline = issue.get("timelineItems")
+        if not isinstance(timeline, Mapping):
+            raise PreflightRuntimeError("READ_EVIDENCE_AMBIGUOUS")
+        nodes = timeline.get("nodes")
+        page_info = timeline.get("pageInfo")
+        total_count = timeline.get("totalCount")
+        filtered_count = timeline.get("filteredCount")
+        page_count = timeline.get("pageCount")
+        updated_at = timeline.get("updatedAt")
+        if (
+            not isinstance(nodes, list)
+            or any(not isinstance(node, Mapping) for node in nodes)
+            or not isinstance(page_info, Mapping)
+            or type(total_count) is not int
+            or total_count < 0
+            or type(filtered_count) is not int
+            or filtered_count < 0
+            or type(page_count) is not int
+            or page_count < 0
+            or page_count != len(nodes)
+            or filtered_count < page_count
+            or total_count < filtered_count
+            or not isinstance(updated_at, str)
+            or not updated_at
+        ):
+            raise PreflightRuntimeError("READ_EVIDENCE_AMBIGUOUS")
+
+        if expected_total_count is None:
+            expected_total_count = total_count
+            expected_updated_at = updated_at
+        elif total_count != expected_total_count or updated_at != expected_updated_at:
+            raise PreflightRuntimeError("PUBLIC_CARRIER_CHANGED")
+
+        for node in nodes:
+            typename = node.get("__typename")
+            if typename == "CommentDeletedEvent":
+                if (
+                    not isinstance(node.get("id"), str)
+                    or not node.get("id")
+                    or not isinstance(node.get("createdAt"), str)
+                    or not node.get("createdAt")
+                ):
+                    raise PreflightRuntimeError("READ_EVIDENCE_AMBIGUOUS")
+                raise PreflightRuntimeError("PUBLIC_CARRIER_DELETION_DETECTED")
+            if typename != "IssueComment":
+                raise PreflightRuntimeError("READ_EVIDENCE_AMBIGUOUS")
+            comments.append(_timeline_issue_comment(node))
+
+        if expected_total_count is not None and len(comments) > expected_total_count:
+            raise PreflightRuntimeError("READ_EVIDENCE_AMBIGUOUS")
+
+        has_next_page = page_info.get("hasNextPage")
+        end_cursor = page_info.get("endCursor")
+        if type(has_next_page) is not bool:
+            raise PreflightRuntimeError("READ_EVIDENCE_AMBIGUOUS")
+        if not has_next_page:
+            if end_cursor is not None and not isinstance(end_cursor, str):
+                raise PreflightRuntimeError("READ_EVIDENCE_AMBIGUOUS")
+            if expected_total_count is None or expected_updated_at is None:
+                raise PreflightRuntimeError("READ_EVIDENCE_AMBIGUOUS")
+            if len(comments) != expected_total_count:
+                raise PreflightRuntimeError("READ_EVIDENCE_AMBIGUOUS")
+            digest = _public_carrier_timeline_digest(
+                comments,
+                total_count=expected_total_count,
+                updated_at=expected_updated_at,
+            )
+            return comments, digest
+        if (
+            not isinstance(end_cursor, str)
+            or not end_cursor
+            or end_cursor in seen_cursors
+        ):
+            raise PreflightRuntimeError("READ_EVIDENCE_AMBIGUOUS")
+        seen_cursors.add(end_cursor)
+        after = end_cursor
+
+    raise PreflightRuntimeError("READ_EVIDENCE_AMBIGUOUS")
+
+
 def validate_public_carrier_history(api: GitHubAPI) -> None:
     owner, name = projection.CONTROL_REPOSITORY.split("/", 1)
     after: str | None = None
@@ -172,6 +332,16 @@ def validate_public_carrier_history(api: GitHubAPI) -> None:
 def _read_public_carrier_comments(
     api: GitHubAPI,
 ) -> tuple[list[dict[str, Any]], str]:
+    if isinstance(api, GitHubAPI):
+        first, first_digest = _read_public_carrier_timeline_scan(api)
+        second, second_digest = _read_public_carrier_timeline_scan(api)
+        if first_digest != second_digest:
+            raise PreflightRuntimeError("PUBLIC_CARRIER_CHANGED")
+        return second, second_digest
+
+    # Existing dependency-injected pure unit fakes predate the production
+    # single-timeline contract. Preserve that fixture adapter without exposing
+    # its split REST/GraphQL observation path to the CLI production provider.
     validate_public_carrier_history(api)
     first = projection._list_issue_comments(api, projection.PROJECTION_ISSUE_NUMBER)
     first_digest = _public_carrier_inventory_digest(first)
