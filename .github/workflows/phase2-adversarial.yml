@@ -1,4 +1,5 @@
 name: Phase 2 Workstream D adversarial harness
+run-name: ${{ inputs.operation == 'operator_preflight' && format('operator_preflight projection={0} body={1} manifest={2}', inputs.preflight_projection_comment_id, inputs.preflight_projection_body_sha256, inputs.preflight_manifest_sha256) || inputs.operation }}
 
 # Stage 2 retirement markers retained for the legacy Workstream D static regressions:
 # PHASE2_OWNER_INVENTORY_ATTESTATION_B64 is retired from the operator path.
@@ -23,6 +24,11 @@ on:
         type: string
       preflight_projection_body_sha256:
         description: Exact SHA-256 of the public preflight-projection comment body; operator_preflight only
+        required: false
+        default: ""
+        type: string
+      preflight_manifest_sha256:
+        description: Exact guarded-manifest SHA-256 bound by the projection; operator_preflight only
         required: false
         default: ""
         type: string
@@ -244,8 +250,9 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           PREFLIGHT_PROJECTION_COMMENT_ID: ${{ inputs.preflight_projection_comment_id }}
           PREFLIGHT_PROJECTION_BODY_SHA256: ${{ inputs.preflight_projection_body_sha256 }}
+          PREFLIGHT_MANIFEST_SHA256: ${{ inputs.preflight_manifest_sha256 }}
           PHASE2_WORKSTREAM_D_EXECUTION_ENABLED: ${{ vars.PHASE2_WORKSTREAM_D_EXECUTION_ENABLED }}
-        run: PYTHONPATH=. python3 -m phase2.preflight_projection preflight
+        run: PYTHONPATH=. python3 -m phase2.preflight_runtime preflight
 
       - name: Preserve capability-denied preflight boundary
         if: ${{ always() }}
