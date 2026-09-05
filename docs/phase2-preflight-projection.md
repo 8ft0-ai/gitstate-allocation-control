@@ -26,7 +26,9 @@ The file is introduced after that baseline with an empty record set. From then o
 
 This uses the already authoritative protected `main` history as the durable memory. A separate unprotected carrier branch is deliberately not used: a rewindable ref would not provide the monotonic proof required by B2.
 
-Before trusting the ledger, production requires the currently dispatched `GITHUB_SHA` to be the current head of GitHub-reported protected `main`. If main moves during the preflight, the run fails closed as `PUBLIC_CARRIER_LEDGER_MAIN_MOVED` and may be dispatched again from the new protected head.
+Production brackets every potentially positive B2 evaluation with two protected-main fences. Before trusting the ledger, the currently dispatched `GITHUB_SHA` must be the current head of GitHub-reported protected `main`. Immediately before any `projection_valid: true` evidence is constructed or emitted, production re-reads `main`, again requires `protected: true`, and requires the head to remain exactly the dispatched SHA.
+
+The final protected-main read is the positive-evidence linearisation point. If `main` advances between the entry and exit fences, including because a durable invalidation append reaches protected main after the ledger was first validated, the positive path fails closed as `PUBLIC_CARRIER_LEDGER_MAIN_MOVED` and may be dispatched again from the new protected head. Already-negative outcomes do not rely on this exit fence because they cannot restore or create eligibility.
 
 ## Ledger records
 
@@ -58,7 +60,7 @@ Invalidation publication reverses the safety order:
 1. append the invalidation subject/body binding to protected main;
 2. then publish the corresponding public invalidation record to issue #28.
 
-The protected-main ledger makes the invalidation effective immediately after step 1. A failure or delay in publishing the public mirror therefore cannot restore projection validity.
+The protected-main ledger makes the invalidation effective immediately after step 1. A failure or delay in publishing the public mirror therefore cannot restore projection validity. The exit protected-main fence ensures that an in-flight run which evaluated the pre-invalidation ledger cannot emit positive evidence after that append becomes current protected main.
 
 Any non-ledger protected-main change after a projection's executor anchor invalidates that projection for B2 and requires a newly constructed projection rather than silently rebasing the old projected authority.
 

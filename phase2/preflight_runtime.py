@@ -7,7 +7,10 @@ from datetime import datetime, timezone
 from typing import Callable, Mapping
 
 from . import preflight_runtime_legacy as _legacy
-from .preflight_carrier_ledger import validate_carrier_ledger
+from .preflight_carrier_ledger import (
+    _require_current_protected_main,
+    validate_carrier_ledger,
+)
 from .preflight_control_anchor import validate_ledger_only_control_descendant
 
 # Re-export the exact reviewed implementation surface so existing callers and
@@ -53,12 +56,13 @@ def run_preflight(
     _legacy._require_execution_variable_identity(preflight_projection)
 
     control_observation_sha = trusted_sha
+    carrier_ledger_required = _carrier_ledger_required(api)
 
     # The workflow CLI constructs the exact GitHubAPI provider and therefore
     # always enforces the protected-main ledger. Historical dependency-injected
     # fixtures keep their pre-ledger compatibility path; security regressions
     # opt in explicitly with carrier_ledger_production_test_double = True.
-    if _carrier_ledger_required(api):
+    if carrier_ledger_required:
         validate_carrier_ledger(
             api,
             trusted_sha=trusted_sha,
@@ -119,6 +123,16 @@ def run_preflight(
         execution_variable_absent=execution_variable_absent,
     )
     result = evaluate_guards(preflight_projection.manifest, observation)
+
+    # A positive B2 result is valid only at a point where the durable ledger
+    # state actually evaluated is still the current protected-main state.
+    # Re-read main immediately before positive evidence is constructed: this is
+    # the positive-evidence linearisation point. A concurrent ledger append,
+    # including an invalidation that became effective after the entry fence,
+    # therefore fails closed instead of allowing stale projection-valid output.
+    if result.passed and carrier_ledger_required:
+        _require_current_protected_main(api, trusted_sha)
+
     record = _legacy._projection_evidence(
         preflight_projection,
         result,
