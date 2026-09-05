@@ -1,107 +1,105 @@
 # Phase 2 stable operator — B2 preflight projection
 
-B2 adds a non-authorising, capability-denied preflight path on top of the inert B1 manifest/governance/guard contracts. It does not add the successor execution capsule or activate the B1/B2 guard engine for live mutation. B2 validates a projected snapshot; it does not prove that private governance, App, state or environment facts remain current after that projection was published.
+B2 adds a non-authorising, capability-denied preflight path on top of the inert B1 manifest/governance/guard contracts. It does not add a successor execution capsule or activate B1/B2 authority for live mutation.
 
-## Public carrier
+A successful B2 result means only that an exact public projection, a deletion-resistant protected-main carrier ledger, a bounded-stable current public carrier view and the independently reacquired read-only facts satisfy the B2 consistency checks. It does not prove that private governance, App, state or environment facts remain current.
 
-Issue #28 is the dedicated public, non-secret projection/governance carrier. It is deliberately separate from issue #17, which remains the historical V1 execution-capsule/consumption surface.
+## Public carrier and durable history
 
-The carrier conversation is locked as an operational security invariant. Every complete production carrier-history scan requires GitHub to report the issue as locked; an unlocked carrier fails closed as `PUBLIC_CARRIER_NOT_LOCKED`. Locking prevents an untrusted public commenter from manufacturing a permanent B2 denial by posting and deleting an ordinary carrier comment. Trusted maintainers may still mutate the carrier, so the deletion-history and bounded-stability checks remain mandatory.
+Issue #28 remains the dedicated public, non-secret projection/invalidation presentation surface. It is deliberately separate from issue #17, which remains the historical V1 execution-capsule/consumption surface.
 
-The preflight record contract is `gitstate-preflight-projection/v1` with transport prefix:
+The issue conversation must remain locked. Every production carrier scan requires `locked: true`; an unlocked carrier fails closed as `PUBLIC_CARRIER_NOT_LOCKED`.
+
+Current issue visibility is not used as the sole memory of what has previously existed. The deletion-resistant historical floor is:
+
+`policy/preflight-carrier-ledger.json`
+
+The ledger contract is:
+
+`gitstate-public-carrier-ledger/v1`
+
+Its baseline is the merged B1 protected-main commit:
+
+`2001449abb567deff097e76e228a5af9ebd0743d`
+
+The file is introduced after that baseline with an empty record set. From then on, every protected-main first-parent state must either leave the ledger byte-canonically unchanged or append exactly one chained record. Removal, mutation, reordering, replacement, multi-record jumps, deletion of the ledger, failure to reach the pinned B1 baseline, or a malformed chain is fail-closed evidence.
+
+This uses the already authoritative protected `main` history as the durable memory. A separate unprotected carrier branch is deliberately not used: a rewindable ref would not provide the monotonic proof required by B2.
+
+Before trusting the ledger, production requires the currently dispatched `GITHUB_SHA` to be the current head of GitHub-reported protected `main`. If main moves during the preflight, the run fails closed as `PUBLIC_CARRIER_LEDGER_MAIN_MOVED` and may be dispatched again from the new protected head.
+
+## Ledger records
+
+Every ledger record has a strictly increasing sequence, an opaque record ID, an exact body SHA-256, exact manifest SHA-256, the previous record SHA-256 and a SHA-256 over the canonical record payload. The first record chains from 64 zeroes.
+
+A projection ledger record additionally binds the exact public projection comment ID. B2 therefore cannot accept a deleted projection followed by an identical repost under a new comment identity.
+
+An invalidation ledger record binds the exact projection comment ID, projection body SHA-256 and manifest SHA-256 that it invalidates. Once such a record appears in protected-main history, preflight permanently fails that subject as `PUBLIC_CARRIER_LEDGER_INVALIDATED`, even if the public invalidation comment is later absent and GitHub has not yet exposed a corresponding `CommentDeletedEvent`.
+
+The ledger is fail-closed authority only. It never grants execution authority.
+
+### Publication order
+
+Projection publication is deliberately two-step:
+
+1. post the canonical projection record to locked issue #28;
+2. append its exact comment ID/body/manifest binding to the protected-main ledger through the normal reviewed main-change process.
+
+Before step 2 is merged, B2 fails as `PUBLIC_CARRIER_LEDGER_PROJECTION_NOT_BOUND`.
+
+Invalidation publication reverses the safety order:
+
+1. append the invalidation subject/body binding to the protected-main ledger;
+2. then publish the corresponding public invalidation record to issue #28.
+
+The protected-main ledger makes the invalidation effective immediately after step 1. A failure or delay in publishing the public mirror therefore cannot restore projection validity.
+
+## Current carrier observation
+
+Production still reads issue #28 through one GitHub GraphQL `Issue.timelineItems` connection filtered to `ISSUE_COMMENT` and `COMMENT_DELETED_EVENT`.
+
+The same connection supplies visible projection/invalidation comments and GitHub-managed deletion events. Every page must report `locked: true` and well-formed connection metadata. Counts, update metadata and cursor progression must remain internally consistent through a scan.
+
+Any visible `CommentDeletedEvent` fails B2 as `PUBLIC_CARRIER_DELETION_DETECTED`.
+
+B2 performs two complete current-carrier reads and requires identical canonical carrier-history digests. This is bounded current-observation stability only. It is explicitly not treated as a transaction, a globally linearizable snapshot or the durable historical floor.
+
+The exact review failure fixed by the protected-main ledger is the case where both unified timeline scans have already omitted a deleted invalidation while the deletion event is not yet visible. The two scans may agree, but the protected-main ledger still contains the invalidation and prevents `GITSTATE_PREFLIGHT_PROJECTION_VALID`.
+
+## Projection and invalidation contracts
+
+A projection record on issue #28 uses exactly one line:
 
 `/gitstate-preflight-projection-v1 <canonical-json>`
 
-The public invalidation contract is `gitstate-public-invalidation/v1` with transport prefix:
+Its canonical payload contract is:
+
+`gitstate-preflight-projection/v1`
+
+A public invalidation uses exactly one line:
 
 `/gitstate-public-invalidation-v1 <canonical-json>`
 
-Both contracts are canonical one-line records, owner-bound, immutable by creation/update timestamp equality and bound by exact GitHub comment ID plus body SHA-256. Malformed reserved records, duplicate identities, wrong-owner records, edits, digest mismatch or ambiguous subject state fail closed.
+Its payload contract is:
 
-A projection is evidence only. It carries `execution_authorised: false` and `workstream_e_authorised: false`; it cannot be parsed as a V1 execution capsule, cannot be consumed and cannot create a live authority object.
+`gitstate-public-invalidation/v1`
 
-The projection embeds the exact canonical guarded B1 manifest so canonicalising the nested object reproduces the bound manifest SHA-256. It also carries the exact B1 governance source evidence needed for the pure B1 reducer to re-authenticate and re-parse governance semantics without granting the public workflow private-repository access. Projection construction must therefore apply the repository's public disclosure boundary before publication: governance source material containing credentials, personal/proprietary content, private repository names/URLs or other direct private-governance locators is not publishable.
+Both are owner-bound, canonical and immutable by exact creation/update timestamp equality. Malformed reserved records, duplicate identities, wrong-owner records, edits, digest mismatches or ambiguous subject state fail closed.
 
-### Private freshness boundary
+Every projection carries:
 
-The embedded governance and bound protocol/state/App/environment observations are a self-contained snapshot. The capability-denied B2 workflow cannot independently enumerate the private durable governance provider or reacquire private mutable boundaries. A later private revocation, supersession, consumption, state change, App-boundary change or environment-policy change can therefore make the projection stale without altering the projection itself.
+- `execution_authorised: false`;
+- `workstream_e_authorised: false`.
 
-B2 consequently never presents the pure B1 evaluator's positive result as current authority. A successful projected-snapshot evaluation emits `GITSTATE_PREFLIGHT_PROJECTION_VALID`, `projection_valid: true`, `private_freshness_proven: false`, and the qualified diagnostic `projected_snapshot_guard_code: PASS`. It never emits `GITSTATE_PREFLIGHT_PASS` or `guard_passed: true`. Negative evaluator outcomes and all independent public/read-only invalidators remain fail-closed as `GITSTATE_PREFLIGHT_BLOCKED`.
+A projection cannot be parsed as a V1 execution capsule, cannot be consumed and cannot create a live authority object.
 
-The absence of a public invalidation is not proof that no newer private lifecycle transition exists. B2 does not assume an atomic coupling between private governance mutation and public tombstone publication. Reusing the same projection for another bounded attempt-1 preflight may validate that same projected snapshot again, but can never establish current private freshness or current execution authority.
+## Private freshness boundary
 
-A later execution-capable slice must obtain current governance from the B1-conforming append-only/deletion-resistant authority and independently reacquire every mutable fact that becomes decision-critical at execution time. B2 deliberately does not widen its credential or mutation capability to solve that later integration problem.
+The projection embeds a canonical guarded B1 manifest plus the exact governance source evidence and bound protocol/state/App/environment observations needed for deterministic B1 guard evaluation.
 
-## Public invalidation and deletion monotonicity
+Those are projected facts. The B2 job cannot independently reacquire private durable governance or other private mutable boundaries.
 
-A public invalidation is a fail-closed tombstone only. It binds an exact projection and manifest subject and may additionally bind exact authority or manifest-approval identities. It carries no positive authority fields and cannot restore an invalidated object.
-
-The production B2 carrier reader uses one GitHub GraphQL `Issue.timelineItems` connection filtered to `ISSUE_COMMENT` and `COMMENT_DELETED_EVENT`. It does not combine a REST issue-comment inventory with a separately visible GraphQL deletion feed. The same connection therefore supplies both the visible projection/invalidation comments and the permanent deletion signal used for the decision.
-
-Every page of a complete carrier-history scan must report `locked: true` and well-formed `totalCount`, `filteredCount`, `pageCount`, `updatedAt`, node and cursor metadata. `pageCount` must match the returned node count, the connection counts must be internally consistent, cursors must advance without repetition, and `totalCount` plus `updatedAt` must remain unchanged across every page in that scan. Any metadata change during pagination fails as `PUBLIC_CARRIER_CHANGED`; malformed or incomplete connection evidence fails as `READ_EVIDENCE_AMBIGUOUS`.
-
-Each `IssueComment` node is normalised into the existing exact comment identity used by the B2 parsers: numeric GitHub database ID, body, author login, creation timestamp and update timestamp. Any `CommentDeletedEvent` on issue #28 permanently fails B2 preflight as `PUBLIC_CARRIER_DELETION_DETECTED`. B2 deliberately does not infer the deleted content or attempt to distinguish a deleted tombstone from a projection or ordinary carrier record.
-
-B2 performs two complete reads of this same timeline connection. Each clean scan is canonicalised over the complete issue-comment inventory plus the connection's `totalCount` and `updatedAt`. The two resulting carrier-history digests must be identical. A persistent addition, edit, projection replacement, invalidation, lock transition, deletion event or connection-history update appearing between the scans therefore fails closed as `PUBLIC_CARRIER_CHANGED` or the more specific deletion/lock failure.
-
-The accepted second history digest is emitted as `public_carrier_snapshot_sha256`. It identifies the exact bounded-stable carrier history used for that B2 result. The two-scan check is deliberately described as bounded stability evidence, not as a claim that GitHub exposes a database transaction or globally linearizable snapshot. The security property is narrower and explicit: B2 no longer accepts a REST comment state by assuming that an independently observed GraphQL deletion surface has reached the same visibility point.
-
-This carrier-wide deletion rule is deliberately stronger than subject-specific invalidation. Because issue #28 is a dedicated machine carrier, any observed deletion means its history can no longer establish the required monotonic visible record set. Recovery from a deletion requires a new separately governed carrier/contract rather than reusing issue #28.
-
-The production workflow constructs the repository's `GitHubAPI` provider and therefore always uses this single-timeline path. Existing dependency-injected pure unit fixtures retain a compatibility adapter for their historical fake API shape only; that fixture path is not reachable from the workflow CLI and is not part of the production carrier-evidence contract.
-
-B3, if separately authorised and reviewed later, is responsible for enforcing this same public invalidation/deletion boundary or a stronger deletion-resistant durable-history boundary at execution-capsule discovery/consumption and live L1/L2 gates.
-
-## Capability-denied preflight workflow
-
-`operator_preflight` is now independent of the V1 execution-capsule jobs. Its workflow path:
-
-- depends only on the credential-free contract-check job;
-- has only `actions: read`, `contents: read` and `issues: read` GitHub-token permissions;
-- does not enter the protected live environment;
-- performs no capsule discovery or consumption;
-- receives no allocator App private key, installation token, control/state mutation token or state-repository secret;
-- accepts only the exact public projection comment ID and expected body SHA-256 as workflow inputs;
-- uses one read-only GraphQL issue-timeline connection to require the carrier to remain locked and to enumerate both visible issue comments and GitHub-managed comment-deletion events;
-- uses GitHub-managed workflow `run_number` ordinals only as read-only deletion/completeness evidence;
-- runs the dedicated capability-denied `phase2.preflight_runtime` and stops after deterministic evidence output.
-
-The historical `phase2.operator_runtime preflight` command is retired and fails closed as `OPERATOR_PREFLIGHT_PROJECTION_REQUIRED`. The earlier executable path in `phase2.preflight_projection` is also retired: its `run_preflight` and legacy suffix validator fail closed as `PREFLIGHT_RUNTIME_REQUIRED`. `phase2.preflight_runtime` is the sole B2 executable preflight implementation. The V1 live execution route still uses the unchanged capsule discovery/consumption and existing credential/revocation stack.
-
-## Observation and guard model
-
-The preflight projection supplies explicitly bound, non-secret observation evidence for protocol/state/App/environment facts that the capability-denied workflow cannot safely acquire itself. The workflow independently reacquires the key-free decision-critical observations available through its read-only GitHub credential:
-
-- protected control commit/tree identity;
-- workflow and bounded module blob identities;
-- complete public V1 operator history;
-- locked carrier state on every page of both complete carrier-history scans;
-- two matching complete `Issue.timelineItems` histories containing the visible projection/invalidation comments plus the exact accepted carrier-history digest;
-- GitHub-managed `CommentDeletedEvent` history on that same connection, with any deletion permanently fail-closed;
-- stable timeline `totalCount`/`updatedAt`, complete page counts and advancing cursors during each bounded scan;
-- complete workflow-dispatch history through the manifest baseline plus explicitly bound post-baseline preflight observations;
-- workflow-run ordinal continuity from the manifest baseline through the current preflight, so deletion of a completed post-baseline run cannot restore a projection-valid result;
-- the exact repository-versioned Workstream-D execution-variable identity plus its unprotected job-context absence observation.
-
-The execution-variable identity is not projection-selectable. B2 requires both the manifest environment field and the bound observation to name exactly `PHASE2_WORKSTREAM_D_EXECUTION_ENABLED`. The job-context absence check is only an input to projected-snapshot validation; because B2 does not enter `phase-2-allocator`, it is not evidence of current protected-environment freshness and cannot turn `private_freshness_proven` true.
-
-The resulting typed `GuardObservation` is evaluated by the same pure `phase2.operator_guard.evaluate_guards` implementation introduced in B1. The guard receives no GitHub API, token-mint, ref-update, workflow-dispatch or scenario-execution capability. Its result describes the supplied projected snapshot only; B2 qualifies that result before exposing evidence and does not expose an ordinary B1 guard-PASS contract.
-
-A manifest-bound owner observation remains subject to the B1 `valid_through` freshness rule. A matching caller-supplied validity flag cannot override expiry. That bound deadline can make a projection fail, but passing the deadline check does not prove that other private mutable facts remain current.
-
-## Workflow-history reconciliation
-
-The guarded manifest binds the complete workflow history through its construction baseline. B2 reconstructs all `workflow_dispatch` records through that baseline, including every historical attempt of any rerun, and requires the resulting canonical B1 workflow-history baseline to match the manifest exactly.
-
-GitHub's per-workflow `run_number` is a separate B2 completeness signal rather than part of the B1 canonical digest. The baseline's latest surviving bound run provides the ordinal anchor; an empty baseline anchors at zero. From that anchor through the current preflight run, every ordinal must be present exactly once. Because a rerun increments `run_attempt` without consuming another `run_number`, historical rerun reconstruction remains governed by the existing B1 attempt digest while deletion of an entire completed run leaves a permanent ordinal gap. Missing, duplicate or malformed ordinals are `WORKFLOW_HISTORY_CHANGED`.
-
-After the bound baseline, B2 permits one or more non-authorising `operator_preflight` attempt-1 observations only when every such run is on the exact protected control SHA and its immutable Actions display title binds the same preflight-projection comment ID, projection body SHA-256 and manifest SHA-256. The current run must be present in that bounded suffix. A further preflight is therefore another independently identified observation of the projected snapshot, never reusable authority or proof that private facts remain fresh.
-
-Any historical prefix change, live rerun, post-baseline rerun, unrelated dispatch, deleted workflow-run gap, mismatched trusted SHA, mismatched projection/manifest identity, duplicate run identity or malformed attempt history is `WORKFLOW_HISTORY_CHANGED`/fail-closed evidence.
-
-## Evidence
-
-A successful B2 preflight emits deterministic projection-validation evidence including run ID/attempt, protected control SHA, projection comment/body identity, manifest SHA-256, `public_carrier_snapshot_sha256` and the qualified projected-snapshot guard diagnostic. Every successful record states:
+A positive projected result is therefore always qualified as:
 
 - `status: GITSTATE_PREFLIGHT_PROJECTION_VALID`;
 - `projection_valid: true`;
@@ -114,11 +112,43 @@ A successful B2 preflight emits deterministic projection-validation evidence inc
 - `workstream_d_scenarios_executed: 0`;
 - `workstream_e_authorised: false`.
 
-B2 does not emit `GITSTATE_PREFLIGHT_PASS`, `guard_passed`, `guard_code` or `guard_category`. Those unqualified names could be misread as current-authority evidence and are deliberately absent from the executable B2 evidence contract.
+B2 never emits ordinary `GITSTATE_PREFLIGHT_PASS` or `guard_passed: true`.
 
-An unlocked carrier, carrier deletion, unstable/incomplete carrier history, workflow-history discontinuity, public invalidation or negative projected-snapshot guard result produces blocked evidence. All blocked command output remains non-authorising and emits no credential material.
+A later private revocation, supersession, consumption, state change, App-boundary change or environment-policy change can make the projection stale without changing the projection. B2 does not claim otherwise.
 
-`GITSTATE_PREFLIGHT_PROJECTION_VALID` means only that the exact public projection, a bounded-stable visible carrier history and the independently reacquired public/read-only facts satisfy B2's consistency checks. It is not evidence that current private authority exists, is unconsumed, is unrevoked or that current private App/state/environment facts still match the projection.
+## Workflow capability boundary
+
+`operator_preflight` remains independent of the V1 execution-capsule path.
+
+It has only:
+
+- `actions: read`;
+- `contents: read`;
+- `issues: read`.
+
+It does not enter `phase-2-allocator`, receive the allocator App private key, obtain installation/control/state tokens, access a state-repository secret, consume an execution capsule or receive any mutation-capability provider.
+
+The protected-main ledger check requires only the existing read-only GitHub token.
+
+The historical `phase2.operator_runtime preflight` command remains retired. The earlier executable path in `phase2.preflight_projection` also remains retired. `phase2.preflight_runtime` is still the sole workflow entry point; it now wraps the previously reviewed B2 runtime with the protected-main carrier-ledger fence.
+
+## Workflow-history reconciliation
+
+The guarded manifest still binds complete workflow history through its construction baseline.
+
+B2 reconstructs every historical `workflow_dispatch` attempt through that baseline and requires the canonical B1 workflow-history baseline to match exactly. It additionally requires GitHub-managed workflow `run_number` continuity through the current attempt-1 preflight.
+
+A missing run, rerun, duplicate ordinal, unrelated post-baseline dispatch, wrong protected control SHA or mismatched projection/manifest identity remains `WORKFLOW_HISTORY_CHANGED`.
+
+The carrier ledger does not weaken or replace those controls.
+
+## Public disclosure boundary
+
+Only non-sensitive synthetic identifiers and approved opaque bindings may appear in this public repository, issue #28, the ledger, workflow inputs, logs and artefacts.
+
+Do not publish credentials, tokens, personal data, proprietary task content, private repository identities or direct private-governance locators.
+
+Ledger records contain only public comment identities, opaque record IDs and hashes/bindings already permitted by the B2 public boundary.
 
 ## B2 boundary
 
@@ -130,9 +160,10 @@ B2 does not:
 - read the private durable governance provider;
 - prove current private governance/App/state/environment freshness;
 - mint an installation/control/state token in preflight;
-- dispatch a live workflow as implementation validation;
+- dispatch a live scenario as implementation validation;
 - enter the protected environment;
-- mutate/recover retained state;
-- authorise Workstream E or scenario 15.
+- mutate or recover retained canonical state;
+- authorise Workstream E;
+- add scenario 15.
 
-Successor execution-capsule and live L1/L2 integration remain a separately governed B3 slice requiring a new implementation authority and fresh substantive review.
+Successor execution-capsule and live L1/L2 integration remain separately governed later work.
