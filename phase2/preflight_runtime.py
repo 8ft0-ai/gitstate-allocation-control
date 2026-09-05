@@ -8,6 +8,7 @@ from typing import Callable, Mapping
 
 from . import preflight_runtime_legacy as _legacy
 from .preflight_carrier_ledger import validate_carrier_ledger
+from .preflight_control_anchor import validate_ledger_only_control_descendant
 
 # Re-export the exact reviewed implementation surface so existing callers and
 # regressions retain their established imports while this wrapper adds only the
@@ -51,6 +52,8 @@ def run_preflight(
         raise PreflightRuntimeError("PREFLIGHT_MANIFEST_IDENTITY_MISMATCH")
     _legacy._require_execution_variable_identity(preflight_projection)
 
+    control_observation_sha = trusted_sha
+
     # The workflow CLI constructs the exact GitHubAPI provider and therefore
     # always enforces the protected-main ledger. Historical dependency-injected
     # fixtures keep their pre-ledger compatibility path; security regressions
@@ -63,6 +66,21 @@ def run_preflight(
             projection_body_sha256=projection_body_sha256,
             manifest_sha256=expected_manifest_sha256,
         )
+
+        # Projection publication precedes its durable ledger binding because
+        # the binding needs the resulting public comment ID/body digest. That
+        # ledger-only append necessarily advances protected main. Preserve the
+        # exact B1 executor identity by allowing that advance only when every
+        # intervening first-parent commit changes exactly the carrier ledger.
+        projected_control_sha = str(
+            preflight_projection.manifest.payload["executor"]["commit_sha"]
+        )
+        validate_ledger_only_control_descendant(
+            api,
+            projected_control_sha=projected_control_sha,
+            trusted_sha=trusted_sha,
+        )
+        control_observation_sha = projected_control_sha
 
     if projection._matching_invalidation(preflight_projection, invalidations) is not None:
         result = GuardResult.failure("GOVERNANCE_SUPERSEDED")
@@ -96,7 +114,7 @@ def run_preflight(
     observation = projection._guard_observation(
         preflight_projection,
         api,
-        trusted_sha=trusted_sha,
+        trusted_sha=control_observation_sha,
         evaluated_at=evaluated_at,
         execution_variable_absent=execution_variable_absent,
     )
