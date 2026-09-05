@@ -38,21 +38,29 @@ An invalidation ledger record binds the exact projection comment ID, projection 
 
 The ledger is fail-closed authority only. It never grants execution authority.
 
-### Publication order
+### Publication order and exact control anchor
 
 Projection publication is deliberately two-step:
 
-1. post the canonical projection record to locked issue #28;
+1. post the canonical projection record to locked issue #28 while its embedded B1 manifest binds the exact protected-main executor commit/tree used to construct the projection;
 2. append its exact comment ID/body/manifest binding to the protected-main ledger through the normal reviewed main-change process.
 
 Before step 2 is merged, B2 fails as `PUBLIC_CARRIER_LEDGER_PROJECTION_NOT_BOUND`.
 
+The second step necessarily advances protected `main`: GitHub does not assign the public comment ID until step 1 has happened, while the durable ledger record must bind that exact comment identity and body digest. B2 therefore does not pretend that the post-publication ledger commit is the manifest's original B1 executor commit.
+
+Instead, production permits the current dispatched protected-main SHA to differ from the manifest's projected executor SHA only through a narrowly proved carrier-ledger bridge. The current SHA must be a first-parent descendant of the projected executor SHA, and every intervening commit must change exactly `policy/preflight-carrier-ledger.json` with no other file change. A code, workflow, module, policy or unrelated repository change fails closed as `PUBLIC_CARRIER_LEDGER_CONTROL_DRIFT`; an unreachable or ambiguous projected anchor also fails closed.
+
+After that proof, the pure B1 guard reacquires control tree, workflow and module identities at the manifest's exact projected executor SHA. The current dispatched `GITHUB_SHA` remains authoritative for the current workflow run, workflow-history reconciliation and current protected-main ledger state. This is not a general allowance for protected-main drift: it exists only to bridge the unavoidable comment-first ledger publication step without weakening the exact B1 control identity.
+
 Invalidation publication reverses the safety order:
 
-1. append the invalidation subject/body binding to the protected-main ledger;
+1. append the invalidation subject/body binding to protected main;
 2. then publish the corresponding public invalidation record to issue #28.
 
 The protected-main ledger makes the invalidation effective immediately after step 1. A failure or delay in publishing the public mirror therefore cannot restore projection validity.
+
+Any non-ledger protected-main change after a projection's executor anchor invalidates that projection for B2 and requires a newly constructed projection rather than silently rebasing the old projected authority.
 
 ## Current carrier observation
 
@@ -128,9 +136,9 @@ It has only:
 
 It does not enter `phase-2-allocator`, receive the allocator App private key, obtain installation/control/state tokens, access a state-repository secret, consume an execution capsule or receive any mutation-capability provider.
 
-The protected-main ledger check requires only the existing read-only GitHub token.
+The protected-main ledger and control-anchor checks require only the existing read-only GitHub token.
 
-The historical `phase2.operator_runtime preflight` command remains retired. The earlier executable path in `phase2.preflight_projection` also remains retired. `phase2.preflight_runtime` is still the sole workflow entry point; it now wraps the previously reviewed B2 runtime with the protected-main carrier-ledger fence.
+The historical `phase2.operator_runtime preflight` command remains retired. The earlier executable path in `phase2.preflight_projection` also remains retired. `phase2.preflight_runtime` is still the sole workflow entry point; it wraps the previously reviewed B2 runtime with the protected-main carrier-ledger fence and the ledger-only exact-control-anchor bridge.
 
 ## Workflow-history reconciliation
 
@@ -138,9 +146,9 @@ The guarded manifest still binds complete workflow history through its construct
 
 B2 reconstructs every historical `workflow_dispatch` attempt through that baseline and requires the canonical B1 workflow-history baseline to match exactly. It additionally requires GitHub-managed workflow `run_number` continuity through the current attempt-1 preflight.
 
-A missing run, rerun, duplicate ordinal, unrelated post-baseline dispatch, wrong protected control SHA or mismatched projection/manifest identity remains `WORKFLOW_HISTORY_CHANGED`.
+A missing run, rerun, duplicate ordinal, unrelated post-baseline dispatch, wrong current protected control SHA or mismatched projection/manifest identity remains `WORKFLOW_HISTORY_CHANGED`.
 
-The carrier ledger does not weaken or replace those controls.
+The carrier ledger and exact-control-anchor bridge do not weaken or replace those controls.
 
 ## Public disclosure boundary
 
