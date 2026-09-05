@@ -100,6 +100,8 @@ def _timeline_comment(comment):
 class LedgerProductionAPI(GitHubAPI):
     """Production-provider double with stable carrier scans and explicit main history."""
 
+    carrier_ledger_production_test_double = True
+
     def __init__(
         self,
         *,

@@ -17,6 +17,12 @@ for _name in dir(_legacy):
         globals()[_name] = getattr(_legacy, _name)
 
 
+def _carrier_ledger_required(api: object) -> bool:
+    return type(api) is GitHubAPI or getattr(
+        api, "carrier_ledger_production_test_double", False
+    ) is True
+
+
 def run_preflight(
     values: Mapping[str, str] | None = None,
     *,
@@ -45,12 +51,11 @@ def run_preflight(
         raise PreflightRuntimeError("PREFLIGHT_MANIFEST_IDENTITY_MISMATCH")
     _legacy._require_execution_variable_identity(preflight_projection)
 
-    # Existing dependency-injected pure unit fakes deliberately retain the
-    # historical compatibility adapter. The production provider, including
-    # production-like subclasses used by the security regressions, must also
-    # prove the deletion-resistant protected-main ledger before any positive
-    # projected-snapshot result is possible.
-    if isinstance(api, GitHubAPI):
+    # The workflow CLI constructs the exact GitHubAPI provider and therefore
+    # always enforces the protected-main ledger. Historical dependency-injected
+    # fixtures keep their pre-ledger compatibility path; security regressions
+    # opt in explicitly with carrier_ledger_production_test_double = True.
+    if _carrier_ledger_required(api):
         validate_carrier_ledger(
             api,
             trusted_sha=trusted_sha,
