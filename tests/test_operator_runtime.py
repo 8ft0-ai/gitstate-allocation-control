@@ -99,11 +99,18 @@ class FakeAppAPI:
 
 
 class OperatorRuntimeTests(unittest.TestCase):
-    def test_invalid_context_fails_before_allocator_private_key_read(self):
+    def test_legacy_runtime_preflight_is_retired_before_private_key_or_inventory_access(self):
         env = GuardedEnvironment(valid_environment("operator_preflight"))
-        env["EXPECTED_CONTROL_SHA"] = "f" * 40
-        with self.assertRaisesRegex(runtime.OperatorRuntimeError, "OPERATOR_CONTROL_SHA_MISMATCH"):
-            runtime.preflight(env)
+        with patch.object(
+            runtime,
+            "_app_inventory_proof",
+            side_effect=AssertionError("legacy preflight must not acquire inventory capability"),
+        ), patch.object(runtime, "mint_token", side_effect=AssertionError("must not mint")):
+            with self.assertRaisesRegex(
+                runtime.OperatorRuntimeError,
+                "OPERATOR_PREFLIGHT_PROJECTION_REQUIRED",
+            ):
+                runtime.preflight(env)
         self.assertFalse(env.private_key_read)
 
     def test_inventory_proof_precedes_existing_control_and_state_token_mints(self):
@@ -147,19 +154,6 @@ class OperatorRuntimeTests(unittest.TestCase):
             lease.token_scope_records[1].requested_repository_ids,
             (STATE_REPOSITORY_ID,),
         )
-
-    def test_preflight_mints_no_control_or_state_token_and_runs_no_scenarios(self):
-        env = valid_environment("operator_preflight")
-        with patch.object(
-            runtime,
-            "_app_inventory_proof",
-            return_value=(FakeAppAPI(), 10, 20, "https://api.github.invalid", inventory_evidence()),
-        ), patch.object(runtime, "mint_token", side_effect=AssertionError("must not mint")):
-            record = runtime.preflight(env)
-        self.assertEqual(record["control_state_tokens_minted"], 0)
-        self.assertEqual(record["workstream_d_scenarios_executed"], 0)
-        self.assertFalse(record["canonical_state_mutated"])
-        self.assertFalse(record["workstream_e_authorised"])
 
     def test_live_adapter_pins_new_protocol_and_delegates_to_existing_revocation_stack(self):
         env = valid_environment()
@@ -250,9 +244,10 @@ class OperatorRuntimeTests(unittest.TestCase):
         self.assertEqual(payload["reason_code"], "OPERATOR_TEST_FAILURE")
         self.assertNotIn("failure_phase", payload)
 
-    def test_workflow_has_one_operator_entry_and_no_manual_identity_or_inventory_inputs(self):
+    def test_workflow_has_projected_preflight_and_preserves_one_live_operator_entry(self):
         workflow = Path(".github/workflows/phase2-adversarial.yml").read_text(encoding="utf-8")
         self.assertIn("operator_preflight", workflow)
+        self.assertIn("PYTHONPATH=. python3 -m phase2.preflight_runtime preflight", workflow)
         self.assertIn("PYTHONPATH=. python3 -m phase2.operator_capsule discover", workflow)
         self.assertIn("PYTHONPATH=. python3 -m phase2.operator_capsule consume", workflow)
         self.assertIn('PYTHONPATH=. "$RUNTIME_PYTHON" -m phase2.operator_runtime live', workflow)
@@ -263,7 +258,7 @@ class OperatorRuntimeTests(unittest.TestCase):
         self.assertNotIn("${{ inputs.inventory_attestation_b64 }}", workflow)
         self.assertEqual(
             workflow.count("${{ secrets.PHASE2_ALLOCATOR_APP_PRIVATE_KEY }}"),
-            2,
+            1,
         )
 
 

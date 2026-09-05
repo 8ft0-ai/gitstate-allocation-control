@@ -1,0 +1,86 @@
+name: Exact candidate validation
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  exact-head-validation:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout exact pull-request head without persisted credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Prove exact candidate commit identity
+        shell: bash
+        env:
+          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          ACTUAL_HEAD_SHA="$(git rev-parse HEAD)"
+          test "$ACTUAL_HEAD_SHA" = "$EXPECTED_HEAD_SHA"
+          printf 'EXACT_HEAD_SHA=%s\n' "$ACTUAL_HEAD_SHA"
+
+      - name: Run dependency-free tests on exact candidate
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Compile Python sources on exact candidate
+        run: python3 -m compileall -q phase2 tests
+
+      - name: Install cryptographically pinned Beads and Dolt binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$RUNNER_TEMP/workstream-b-runtime"
+          mkdir -p "$ROOT/beads" "$ROOT/dolt"
+
+          curl --fail --location --silent --show-error \
+            https://github.com/gastownhall/beads/releases/download/v1.1.0/beads_1.1.0_linux_amd64.tar.gz \
+            -o "$ROOT/beads.tar.gz"
+          echo "b0f3dd607c3fb989ee08d0a6854fba80d0402971eb108f9af6170bc14d491a34  $ROOT/beads.tar.gz" \
+            | sha256sum --check --strict
+          tar -xzf "$ROOT/beads.tar.gz" -C "$ROOT/beads"
+
+          curl --fail --location --silent --show-error \
+            https://github.com/dolthub/dolt/releases/download/v2.1.4/dolt-linux-amd64.tar.gz \
+            -o "$ROOT/dolt.tar.gz"
+          echo "f3bd2329fc469d9d557af377dc36280da2c4ed13315cc2e4a82fe2b5ae682929  $ROOT/dolt.tar.gz" \
+            | sha256sum --check --strict
+          tar -xzf "$ROOT/dolt.tar.gz" -C "$ROOT/dolt"
+
+          BD_BIN="$(find "$ROOT/beads" -type f -name bd -print -quit)"
+          DOLT_BIN="$(find "$ROOT/dolt" -type f -name dolt -print -quit)"
+          test -n "$BD_BIN" -a -x "$BD_BIN"
+          test -n "$DOLT_BIN" -a -x "$DOLT_BIN"
+          "$BD_BIN" --version
+          "$DOLT_BIN" version
+          printf 'BD_BIN=%s\nDOLT_BIN=%s\n' "$BD_BIN" "$DOLT_BIN" >> "$GITHUB_ENV"
+
+      - name: Install pinned PEP-249 MySQL client in isolated venv
+        shell: bash
+        run: |
+          set -euo pipefail
+          VENV="$RUNNER_TEMP/workstream-b-venv"
+          python3 -m venv "$VENV"
+          cat > "$RUNNER_TEMP/workstream-b-requirements.txt" <<'EOF'
+          PyMySQL==1.1.2 --hash=sha256:e6b1d89711dd51f8f74b1631fe08f039e7d76cf67a42a323d3178f0f25762ed9
+          EOF
+          "$VENV/bin/python" -m pip install --disable-pip-version-check --no-deps --require-hashes \
+            -r "$RUNNER_TEMP/workstream-b-requirements.txt"
+          printf 'RUNTIME_PYTHON=%s\n' "$VENV/bin/python" >> "$GITHUB_ENV"
+
+      - name: Run real-runtime integration gates on exact candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONPATH=. "$RUNTIME_PYTHON" tests/integration_workstream_b_runtime.py
+          PYTHONPATH=. "$RUNTIME_PYTHON" tests/integration_workstream_b_readiness.py
+          PYTHONPATH=. "$RUNTIME_PYTHON" tests/test_workstream_d_live.py \
+            WorkstreamDLiveBoundaryTests.test_credential_free_real_runtime_fixture_bootstrap_against_local_bare_remote \
+            -v

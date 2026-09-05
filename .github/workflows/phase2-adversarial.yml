@@ -1,4 +1,5 @@
 name: Phase 2 Workstream D adversarial harness
+run-name: ${{ inputs.operation == 'operator_preflight' && format('operator_preflight projection={0} body={1} manifest={2}', inputs.preflight_projection_comment_id, inputs.preflight_projection_body_sha256, inputs.preflight_manifest_sha256) || inputs.operation }}
 
 # Stage 2 retirement markers retained for the legacy Workstream D static regressions:
 # PHASE2_OWNER_INVENTORY_ATTESTATION_B64 is retired from the operator path.
@@ -16,6 +17,21 @@ on:
           - contract_check
           - operator_preflight
           - live_scenario_suite
+      preflight_projection_comment_id:
+        description: Exact public preflight-projection comment ID; operator_preflight only
+        required: false
+        default: ""
+        type: string
+      preflight_projection_body_sha256:
+        description: Exact SHA-256 of the public preflight-projection comment body; operator_preflight only
+        required: false
+        default: ""
+        type: string
+      preflight_manifest_sha256:
+        description: Exact guarded-manifest SHA-256 bound by the projection; operator_preflight only
+        required: false
+        default: ""
+        type: string
 
 concurrency:
   group: beads-allocation-v0.2-${{ github.repository }}
@@ -44,7 +60,7 @@ jobs:
 
   capsule-discovery:
     needs: contract-check
-    if: ${{ inputs.operation == 'operator_preflight' || inputs.operation == 'live_scenario_suite' }}
+    if: ${{ inputs.operation == 'live_scenario_suite' }}
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -76,7 +92,7 @@ jobs:
 
   capsule-consumption:
     needs: [contract-check, capsule-discovery]
-    if: ${{ inputs.operation == 'operator_preflight' || inputs.operation == 'live_scenario_suite' }}
+    if: ${{ inputs.operation == 'live_scenario_suite' }}
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -214,12 +230,13 @@ jobs:
           echo 'No result from this workflow authorises production use or Workstream E.'
 
   operator-preflight:
-    needs: [contract-check, capsule-consumption]
+    needs: [contract-check]
     if: ${{ inputs.operation == 'operator_preflight' }}
     runs-on: ubuntu-24.04
-    environment: phase-2-allocator
     permissions:
+      actions: read
       contents: read
+      issues: read
     steps:
       - name: Checkout immutable protected-main content without persisted credentials
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -228,39 +245,18 @@ jobs:
           persist-credentials: false
           fetch-depth: 1
 
-      - name: Validate consumed operator context before allocator secret access
+      - name: Evaluate exact non-authorising preflight projection
         env:
-          ATTEMPT_NONCE: ${{ needs.capsule-consumption.outputs.attempt_nonce }}
-          CAPSULE_BODY_SHA256: ${{ needs.capsule-consumption.outputs.capsule_body_sha256 }}
-          CAPSULE_ID: ${{ needs.capsule-consumption.outputs.capsule_id }}
-          CONSUMPTION_RECORD_SHA256: ${{ needs.capsule-consumption.outputs.consumption_record_sha256 }}
-          EXPECTED_CONTROL_SHA: ${{ needs.capsule-consumption.outputs.expected_control_sha }}
-          EXPECTED_PROTOCOL_SHA: ${{ needs.capsule-consumption.outputs.expected_protocol_sha }}
-          EXPECTED_STATE_BASELINE: ${{ needs.capsule-consumption.outputs.expected_state_baseline }}
-          INPUT_OPERATION: ${{ inputs.operation }}
-          OPERATION_PROFILE: ${{ needs.capsule-consumption.outputs.operation_profile }}
-        run: PYTHONPATH=. python3 -m phase2.operator_runtime validate
+          GITHUB_TOKEN: ${{ github.token }}
+          PREFLIGHT_PROJECTION_COMMENT_ID: ${{ inputs.preflight_projection_comment_id }}
+          PREFLIGHT_PROJECTION_BODY_SHA256: ${{ inputs.preflight_projection_body_sha256 }}
+          PREFLIGHT_MANIFEST_SHA256: ${{ inputs.preflight_manifest_sha256 }}
+          PHASE2_WORKSTREAM_D_EXECUTION_ENABLED: ${{ vars.PHASE2_WORKSTREAM_D_EXECUTION_ENABLED }}
+        run: PYTHONPATH=. python3 -m phase2.preflight_runtime preflight
 
-      - name: Prove exact App inventory and positively revoke inventory token
-        env:
-          ATTEMPT_NONCE: ${{ needs.capsule-consumption.outputs.attempt_nonce }}
-          CAPSULE_BODY_SHA256: ${{ needs.capsule-consumption.outputs.capsule_body_sha256 }}
-          CAPSULE_ID: ${{ needs.capsule-consumption.outputs.capsule_id }}
-          CONSUMPTION_RECORD_SHA256: ${{ needs.capsule-consumption.outputs.consumption_record_sha256 }}
-          EXPECTED_CONTROL_SHA: ${{ needs.capsule-consumption.outputs.expected_control_sha }}
-          EXPECTED_PROTOCOL_SHA: ${{ needs.capsule-consumption.outputs.expected_protocol_sha }}
-          EXPECTED_STATE_BASELINE: ${{ needs.capsule-consumption.outputs.expected_state_baseline }}
-          INPUT_OPERATION: ${{ inputs.operation }}
-          OPERATION_PROFILE: ${{ needs.capsule-consumption.outputs.operation_profile }}
-          PHASE2_ALLOCATOR_APP_ID: ${{ vars.PHASE2_ALLOCATOR_APP_ID }}
-          PHASE2_ALLOCATOR_INSTALLATION_ID: ${{ vars.PHASE2_ALLOCATOR_INSTALLATION_ID }}
-          PHASE2_ALLOCATOR_APP_PRIVATE_KEY: ${{ secrets.PHASE2_ALLOCATOR_APP_PRIVATE_KEY }}
-          PHASE2_STATE_REPOSITORY_ID: ${{ secrets.PHASE2_STATE_REPOSITORY_ID }}
-        run: PYTHONPATH=. python3 -m phase2.operator_runtime preflight
-
-      - name: Preserve the non-mutating preflight boundary
+      - name: Preserve capability-denied preflight boundary
         if: ${{ always() }}
         run: |
-          echo 'Operator preflight may mint only the installation-wide Metadata-read-only inventory token.'
-          echo 'It must positively revoke that token and never mint the control/state runtime tokens or execute scenarios 1-14.'
+          echo 'Operator preflight is a read-only projection check and cannot create or consume execution authority.'
+          echo 'The route receives no allocator App private key, installation token or control/state mutation token.'
           echo 'No preflight result grants live Workstream D or Workstream E authority.'
