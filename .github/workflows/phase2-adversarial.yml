@@ -1,9 +1,9 @@
 name: Phase 2 Workstream D adversarial harness
-run-name: ${{ inputs.operation == 'operator_preflight' && format('operator_preflight projection={0} body={1} manifest={2}', inputs.preflight_projection_comment_id, inputs.preflight_projection_body_sha256, inputs.preflight_manifest_sha256) || inputs.operation }}
+run-name: ${{ inputs.operation == 'operator_preflight' && format('operator_preflight projection={0} body={1} manifest={2}', inputs.preflight_projection_comment_id, inputs.preflight_projection_body_sha256, inputs.preflight_manifest_sha256) || inputs.operation == 'live_scenario_suite' && format('live_scenario_suite capsule={0} body={1} manifest={2}', inputs.successor_capsule_id, inputs.successor_capsule_body_sha256, inputs.successor_manifest_sha256) || inputs.operation }}
 
 # Stage 2 retirement markers retained for the legacy Workstream D static regressions:
 # PHASE2_OWNER_INVENTORY_ATTESTATION_B64 is retired from the operator path.
-# The legacy inline guard `from phase2.workstream_d_live import context_from_environment` is replaced by phase2.operator_runtime validate.
+# B3 routes live execution through successor capsule consumption, capability-denied L1 and guarded L2 before the reviewed Workstream D revocation stack.
 
 on:
   workflow_dispatch:
@@ -32,6 +32,21 @@ on:
         required: false
         default: ""
         type: string
+      successor_capsule_id:
+        description: Exact successor V2 capsule ID; live_scenario_suite only
+        required: false
+        default: ""
+        type: string
+      successor_capsule_body_sha256:
+        description: Exact SHA-256 of the successor V2 capsule comment body; live_scenario_suite only
+        required: false
+        default: ""
+        type: string
+      successor_manifest_sha256:
+        description: Exact guarded-manifest SHA-256 bound by the successor capsule; live_scenario_suite only
+        required: false
+        default: ""
+        type: string
 
 concurrency:
   group: beads-allocation-v0.2-${{ github.repository }}
@@ -56,23 +71,25 @@ jobs:
       - name: Run credential-free operator and Workstream D checks
         run: |
           python3 -m unittest discover -s tests -p 'test_operator*.py' -v
+          python3 -m unittest discover -s tests -p 'test_successor*.py' -v
           python3 -m unittest discover -s tests -p 'test_workstream_d*.py' -v
 
-  capsule-discovery:
+  successor-capsule-discovery:
     needs: contract-check
     if: ${{ inputs.operation == 'live_scenario_suite' }}
     runs-on: ubuntu-24.04
     permissions:
+      actions: read
       contents: read
       issues: read
     outputs:
       capsule_id: ${{ steps.capsule.outputs.capsule_id }}
       capsule_comment_id: ${{ steps.capsule.outputs.capsule_comment_id }}
       capsule_body_sha256: ${{ steps.capsule.outputs.capsule_body_sha256 }}
-      capsule_payload_sha256: ${{ steps.capsule.outputs.capsule_payload_sha256 }}
+      manifest_sha256: ${{ steps.capsule.outputs.manifest_sha256 }}
+      projection_comment_id: ${{ steps.capsule.outputs.projection_comment_id }}
+      projection_body_sha256: ${{ steps.capsule.outputs.projection_body_sha256 }}
       expected_control_sha: ${{ steps.capsule.outputs.expected_control_sha }}
-      expected_protocol_sha: ${{ steps.capsule.outputs.expected_protocol_sha }}
-      expected_state_baseline: ${{ steps.capsule.outputs.expected_state_baseline }}
       operation_profile: ${{ steps.capsule.outputs.operation_profile }}
       attempt_nonce: ${{ steps.capsule.outputs.attempt_nonce }}
     steps:
@@ -83,30 +100,36 @@ jobs:
           persist-credentials: false
           fetch-depth: 1
 
-      - name: Discover exactly one valid unconsumed public execution capsule
+      - name: Discover exactly one valid unconsumed successor capsule
         id: capsule
         env:
+          EXPECTED_SUCCESSOR_CAPSULE_BODY_SHA256: ${{ inputs.successor_capsule_body_sha256 }}
+          EXPECTED_SUCCESSOR_CAPSULE_ID: ${{ inputs.successor_capsule_id }}
+          EXPECTED_SUCCESSOR_MANIFEST_SHA256: ${{ inputs.successor_manifest_sha256 }}
           GITHUB_TOKEN: ${{ github.token }}
           INPUT_OPERATION: ${{ inputs.operation }}
-        run: PYTHONPATH=. python3 -m phase2.operator_capsule discover
+        run: PYTHONPATH=. python3 -m phase2.successor_capsule discover
 
-  capsule-consumption:
-    needs: [contract-check, capsule-discovery]
+  successor-capsule-consumption:
+    needs: [contract-check, successor-capsule-discovery]
     if: ${{ inputs.operation == 'live_scenario_suite' }}
     runs-on: ubuntu-24.04
     permissions:
+      actions: read
       contents: read
       issues: write
     outputs:
       capsule_id: ${{ steps.consume.outputs.capsule_id }}
       capsule_comment_id: ${{ steps.consume.outputs.capsule_comment_id }}
       capsule_body_sha256: ${{ steps.consume.outputs.capsule_body_sha256 }}
+      manifest_sha256: ${{ steps.consume.outputs.manifest_sha256 }}
+      projection_comment_id: ${{ steps.consume.outputs.projection_comment_id }}
+      projection_body_sha256: ${{ steps.consume.outputs.projection_body_sha256 }}
       expected_control_sha: ${{ steps.consume.outputs.expected_control_sha }}
-      expected_protocol_sha: ${{ steps.consume.outputs.expected_protocol_sha }}
-      expected_state_baseline: ${{ steps.consume.outputs.expected_state_baseline }}
       operation_profile: ${{ steps.consume.outputs.operation_profile }}
       attempt_nonce: ${{ steps.consume.outputs.attempt_nonce }}
-      consumption_record_sha256: ${{ steps.consume.outputs.consumption_record_sha256 }}
+      consumption_comment_id: ${{ steps.consume.outputs.consumption_comment_id }}
+      consumption_body_sha256: ${{ steps.consume.outputs.consumption_body_sha256 }}
     steps:
       - name: Checkout immutable dispatched commit without persisted credentials
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -115,23 +138,25 @@ jobs:
           persist-credentials: false
           fetch-depth: 1
 
-      - name: Revalidate and durably consume the capsule before protected execution
+      - name: Revalidate and durably consume the successor capsule
         id: consume
         env:
-          EXPECTED_CAPSULE_BODY_SHA256: ${{ needs.capsule-discovery.outputs.capsule_body_sha256 }}
-          EXPECTED_CAPSULE_COMMENT_ID: ${{ needs.capsule-discovery.outputs.capsule_comment_id }}
-          EXPECTED_CAPSULE_ID: ${{ needs.capsule-discovery.outputs.capsule_id }}
+          EXPECTED_SUCCESSOR_CAPSULE_BODY_SHA256: ${{ needs.successor-capsule-discovery.outputs.capsule_body_sha256 }}
+          EXPECTED_SUCCESSOR_CAPSULE_COMMENT_ID: ${{ needs.successor-capsule-discovery.outputs.capsule_comment_id }}
+          EXPECTED_SUCCESSOR_CAPSULE_ID: ${{ needs.successor-capsule-discovery.outputs.capsule_id }}
+          EXPECTED_SUCCESSOR_MANIFEST_SHA256: ${{ needs.successor-capsule-discovery.outputs.manifest_sha256 }}
           GITHUB_TOKEN: ${{ github.token }}
           INPUT_OPERATION: ${{ inputs.operation }}
-        run: PYTHONPATH=. python3 -m phase2.operator_capsule consume
+        run: PYTHONPATH=. python3 -m phase2.successor_capsule consume
 
-  live-scenario-suite:
-    needs: [contract-check, capsule-consumption]
+  successor-live-l1:
+    needs: [contract-check, successor-capsule-consumption]
     if: ${{ inputs.operation == 'live_scenario_suite' }}
     runs-on: ubuntu-24.04
-    environment: phase-2-allocator
     permissions:
+      actions: read
       contents: read
+      issues: read
     steps:
       - name: Checkout immutable protected-main content without persisted credentials
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -140,20 +165,37 @@ jobs:
           persist-credentials: false
           fetch-depth: 1
 
-      - name: Validate consumed context before dependency installation or secret access
+      - name: Run capability-denied successor Gate L1 before protected environment
         env:
-          ATTEMPT_NONCE: ${{ needs.capsule-consumption.outputs.attempt_nonce }}
-          CAPSULE_BODY_SHA256: ${{ needs.capsule-consumption.outputs.capsule_body_sha256 }}
-          CAPSULE_ID: ${{ needs.capsule-consumption.outputs.capsule_id }}
-          CONSUMPTION_RECORD_SHA256: ${{ needs.capsule-consumption.outputs.consumption_record_sha256 }}
-          EXPECTED_CONTROL_SHA: ${{ needs.capsule-consumption.outputs.expected_control_sha }}
-          EXPECTED_PROTOCOL_SHA: ${{ needs.capsule-consumption.outputs.expected_protocol_sha }}
-          EXPECTED_STATE_BASELINE: ${{ needs.capsule-consumption.outputs.expected_state_baseline }}
-          INPUT_OPERATION: ${{ inputs.operation }}
-          OPERATION_PROFILE: ${{ needs.capsule-consumption.outputs.operation_profile }}
-          PHASE2_WORKSTREAM_D_EXECUTION_ENABLED: ${{ vars.PHASE2_WORKSTREAM_D_EXECUTION_ENABLED }}
-          PHASE2_WORKSTREAM_D_FIXTURE_MODE: workstream-d-synthetic-fixture-v1
-        run: PYTHONPATH=. python3 -m phase2.operator_runtime validate
+          ATTEMPT_NONCE: ${{ needs.successor-capsule-consumption.outputs.attempt_nonce }}
+          CAPSULE_BODY_SHA256: ${{ needs.successor-capsule-consumption.outputs.capsule_body_sha256 }}
+          CAPSULE_COMMENT_ID: ${{ needs.successor-capsule-consumption.outputs.capsule_comment_id }}
+          CAPSULE_ID: ${{ needs.successor-capsule-consumption.outputs.capsule_id }}
+          CONSUMPTION_BODY_SHA256: ${{ needs.successor-capsule-consumption.outputs.consumption_body_sha256 }}
+          CONSUMPTION_COMMENT_ID: ${{ needs.successor-capsule-consumption.outputs.consumption_comment_id }}
+          GITHUB_TOKEN: ${{ github.token }}
+          MANIFEST_SHA256: ${{ needs.successor-capsule-consumption.outputs.manifest_sha256 }}
+          OPERATION_PROFILE: ${{ needs.successor-capsule-consumption.outputs.operation_profile }}
+          PROJECTION_BODY_SHA256: ${{ needs.successor-capsule-consumption.outputs.projection_body_sha256 }}
+          PROJECTION_COMMENT_ID: ${{ needs.successor-capsule-consumption.outputs.projection_comment_id }}
+        run: PYTHONPATH=. python3 -m phase2.successor_runtime l1
+
+  live-scenario-suite:
+    needs: [contract-check, successor-capsule-consumption, successor-live-l1]
+    if: ${{ inputs.operation == 'live_scenario_suite' }}
+    runs-on: ubuntu-24.04
+    environment: phase-2-allocator
+    permissions:
+      actions: read
+      contents: read
+      issues: read
+    steps:
+      - name: Checkout immutable protected-main content without persisted credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
 
       - name: Install cryptographically pinned Beads and Dolt binaries
         shell: bash
@@ -161,21 +203,12 @@ jobs:
           set -euo pipefail
           ROOT="$RUNNER_TEMP/workstream-d-runtime"
           mkdir -p "$ROOT/beads" "$ROOT/dolt"
-
-          curl --fail --location --silent --show-error \
-            https://github.com/gastownhall/beads/releases/download/v1.1.0/beads_1.1.0_linux_amd64.tar.gz \
-            -o "$ROOT/beads.tar.gz"
-          echo "b0f3dd607c3fb989ee08d0a6854fba80d0402971eb108f9af6170bc14d491a34  $ROOT/beads.tar.gz" \
-            | sha256sum --check --strict
+          curl --fail --location --silent --show-error https://github.com/gastownhall/beads/releases/download/v1.1.0/beads_1.1.0_linux_amd64.tar.gz -o "$ROOT/beads.tar.gz"
+          echo "b0f3dd607c3fb989ee08d0a6854fba80d0402971eb108f9af6170bc14d491a34  $ROOT/beads.tar.gz" | sha256sum --check --strict
           tar -xzf "$ROOT/beads.tar.gz" -C "$ROOT/beads"
-
-          curl --fail --location --silent --show-error \
-            https://github.com/dolthub/dolt/releases/download/v2.1.4/dolt-linux-amd64.tar.gz \
-            -o "$ROOT/dolt.tar.gz"
-          echo "f3bd2329fc469d9d557af377dc36280da2c4ed13315cc2e4a82fe2b5ae682929  $ROOT/dolt.tar.gz" \
-            | sha256sum --check --strict
+          curl --fail --location --silent --show-error https://github.com/dolthub/dolt/releases/download/v2.1.4/dolt-linux-amd64.tar.gz -o "$ROOT/dolt.tar.gz"
+          echo "f3bd2329fc469d9d557af377dc36280da2c4ed13315cc2e4a82fe2b5ae682929  $ROOT/dolt.tar.gz" | sha256sum --check --strict
           tar -xzf "$ROOT/dolt.tar.gz" -C "$ROOT/dolt"
-
           BD_BIN="$(find "$ROOT/beads" -type f -name bd -print -quit)"
           DOLT_BIN="$(find "$ROOT/dolt" -type f -name dolt -print -quit)"
           test -n "$BD_BIN" -a -x "$BD_BIN"
@@ -193,41 +226,38 @@ jobs:
           cat > "$RUNNER_TEMP/workstream-d-requirements.txt" <<'EOF'
           PyMySQL==1.1.2 --hash=sha256:e6b1d89711dd51f8f74b1631fe08f039e7d76cf67a42a323d3178f0f25762ed9
           EOF
-          "$VENV/bin/python" -m pip install --disable-pip-version-check --no-deps --require-hashes \
-            -r "$RUNNER_TEMP/workstream-d-requirements.txt"
+          "$VENV/bin/python" -m pip install --disable-pip-version-check --no-deps --require-hashes -r "$RUNNER_TEMP/workstream-d-requirements.txt"
           printf 'RUNTIME_PYTHON=%s\n' "$VENV/bin/python" >> "$GITHUB_ENV"
 
-      - name: Execute capsule-gated fixture-only trusted-main Workstream D suite
+      - name: Execute successor-gated fixture-only Workstream D suite
         env:
-          ATTEMPT_NONCE: ${{ needs.capsule-consumption.outputs.attempt_nonce }}
-          CAPSULE_BODY_SHA256: ${{ needs.capsule-consumption.outputs.capsule_body_sha256 }}
-          CAPSULE_ID: ${{ needs.capsule-consumption.outputs.capsule_id }}
-          CONSUMPTION_RECORD_SHA256: ${{ needs.capsule-consumption.outputs.consumption_record_sha256 }}
-          EXPECTED_CONTROL_SHA: ${{ needs.capsule-consumption.outputs.expected_control_sha }}
-          EXPECTED_PROTOCOL_SHA: ${{ needs.capsule-consumption.outputs.expected_protocol_sha }}
-          EXPECTED_STATE_BASELINE: ${{ needs.capsule-consumption.outputs.expected_state_baseline }}
-          INPUT_OPERATION: ${{ inputs.operation }}
-          OPERATION_PROFILE: ${{ needs.capsule-consumption.outputs.operation_profile }}
+          ATTEMPT_NONCE: ${{ needs.successor-capsule-consumption.outputs.attempt_nonce }}
+          CAPSULE_BODY_SHA256: ${{ needs.successor-capsule-consumption.outputs.capsule_body_sha256 }}
+          CAPSULE_COMMENT_ID: ${{ needs.successor-capsule-consumption.outputs.capsule_comment_id }}
+          CAPSULE_ID: ${{ needs.successor-capsule-consumption.outputs.capsule_id }}
+          CONSUMPTION_BODY_SHA256: ${{ needs.successor-capsule-consumption.outputs.consumption_body_sha256 }}
+          CONSUMPTION_COMMENT_ID: ${{ needs.successor-capsule-consumption.outputs.consumption_comment_id }}
+          GITHUB_TOKEN: ${{ github.token }}
+          MANIFEST_SHA256: ${{ needs.successor-capsule-consumption.outputs.manifest_sha256 }}
+          OPERATION_PROFILE: ${{ needs.successor-capsule-consumption.outputs.operation_profile }}
           PHASE2_ALLOCATOR_APP_ID: ${{ vars.PHASE2_ALLOCATOR_APP_ID }}
           PHASE2_ALLOCATOR_INSTALLATION_ID: ${{ vars.PHASE2_ALLOCATOR_INSTALLATION_ID }}
           PHASE2_ALLOCATOR_APP_PRIVATE_KEY: ${{ secrets.PHASE2_ALLOCATOR_APP_PRIVATE_KEY }}
           PHASE2_CONTROL_ISSUE_NUMBER: "1"
           PHASE2_STATE_REPOSITORY_ID: ${{ secrets.PHASE2_STATE_REPOSITORY_ID }}
-          PHASE2_WORKSTREAM_D_EXECUTION_ENABLED: ${{ vars.PHASE2_WORKSTREAM_D_EXECUTION_ENABLED }}
           PHASE2_WORKSTREAM_D_FIXTURE_MODE: workstream-d-synthetic-fixture-v1
+          PROJECTION_BODY_SHA256: ${{ needs.successor-capsule-consumption.outputs.projection_body_sha256 }}
+          PROJECTION_COMMENT_ID: ${{ needs.successor-capsule-consumption.outputs.projection_comment_id }}
         shell: bash
-        run: |
-          set -euo pipefail
-          # Delegation target remains: PYTHONPATH=. "$RUNTIME_PYTHON" -m phase2.workstream_d_revocation
-          PYTHONPATH=. "$RUNTIME_PYTHON" -m phase2.operator_runtime live
+        run: PYTHONPATH=. "$RUNTIME_PYTHON" -m phase2.successor_runtime live
 
       - name: Preserve post-run governance boundary
         if: ${{ always() }}
         run: |
-          echo 'The operator consumes one authority capsule before protected execution and never permits rerun/reuse.'
-          echo 'The inventory token is Metadata-read-only, installation-wide solely for enumeration, and revoked before control/state token minting.'
-          echo 'The existing control/state token profiles and truthful post-run revocation path remain authoritative.'
-          echo 'No result from this workflow authorises production use or Workstream E.'
+          echo 'Successor Gate L1 ran without allocator credentials before the protected environment.'
+          echo 'Gate L2 uses only an installation-wide Metadata-read inventory token and positively revokes it before control/state token minting.'
+          echo 'The successor capsule is single-use and the live workflow is not rerunnable as authority.'
+          echo 'No result from this workflow authorises another Workstream D attempt or Workstream E.'
 
   operator-preflight:
     needs: [contract-check]

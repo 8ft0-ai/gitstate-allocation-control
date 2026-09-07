@@ -176,7 +176,7 @@ def discover_capsule(
                 continue
             capsule = parse_capsule_comment(
                 comment,
-                now=current,
+                now=None,
                 expected_control_sha=expected_control_sha,
                 expected_operation=expected_operation,
             )
@@ -211,6 +211,30 @@ def discover_capsule(
     eligible = [
         capsule for capsule in candidates if capsule.capsule_id not in consumed_ids
     ]
+    live_eligible: list[SuccessorCapsule] = []
+    for capsule in eligible:
+        try:
+            reparsed = parse_capsule_comment(
+                next(
+                    comment
+                    for comment in comments
+                    if comment.get("id") == capsule.comment_id
+                ),
+                now=current,
+                expected_control_sha=expected_control_sha,
+                expected_operation=expected_operation,
+            )
+        except (StopIteration, SuccessorContractError) as exc:
+            if isinstance(exc, SuccessorContractError) and str(exc) in {
+                "SUCCESSOR_CAPSULE_EXPIRED",
+                "SUCCESSOR_CAPSULE_NOT_YET_VALID",
+            }:
+                continue
+            raise SuccessorCapsuleError(str(exc)) from exc
+        if reparsed is None:
+            raise SuccessorCapsuleError("SUCCESSOR_CAPSULE_NOT_FOUND")
+        live_eligible.append(reparsed)
+    eligible = live_eligible
     if expected_capsule_id:
         eligible = [
             capsule

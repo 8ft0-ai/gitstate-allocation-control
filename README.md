@@ -47,4 +47,6 @@ The implementation does not post GitHub projections, authorise work to begin,
 mint credentials, dispatch intake or itself select/access live `refs/dolt/data`.
 Result projection and reconciliation remain separate governed work.
 
+The separately governed Workstream D operator path now includes an additive V2 successor capsule. Its live route requires an exact successful B2 projection, durable carrier-ledger validity and single-use consumption, then runs a capability-denied L1 guard before entering the protected environment. L2 proves and revokes the Metadata-read inventory token before the existing reduced control/state mutation tokens can be minted. This path changes no Workstream B ownership semantics and grants no Workstream E authority.
+
 Normal request-side writes and credentialed live checks remain fail-closed unless the separately reviewed activation variable `PHASE2_INTAKE_ENABLED` is exactly `true`. Neither Workstream A nor B creates that variable. Manual `workflow_dispatch` defaults to operator reconciliation; the protected scope probe is a separate explicit manual operation and never mutates canonical state.
