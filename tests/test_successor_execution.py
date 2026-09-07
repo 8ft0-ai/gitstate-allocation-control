@@ -13,7 +13,7 @@ from phase2.operator_inventory import CONTROL_REPOSITORY_ID, STATE_REPOSITORY_ID
 from phase2.operator_manifest import canonical_json, sha256_text
 from phase2.successor_contract import (
     CAPSULE_CONTRACT, CAPSULE_PREFIX, CONSUMPTION_CONTRACT, CONSUMPTION_PREFIX,
-    parse_capsule_comment, parse_operator_history,
+    SuccessorContractError, canonical_operator_history, parse_capsule_comment, parse_operator_history,
 )
 
 CONTROL_SHA = "a" * 40
@@ -61,14 +61,14 @@ def capsule_comment(comment_id=9001, **changes):
     }
 
 
-def consumption_comment(capsule, comment_id=9002):
+def consumption_comment(capsule, comment_id=9002, *, manifest_sha256=MANIFEST_SHA):
     body_sha = sha256_text(capsule["body"])
     value = {
         "contract": CONSUMPTION_CONTRACT,
         "capsule_id": CAPSULE_ID,
         "capsule_comment_id": capsule["id"],
         "capsule_body_sha256": body_sha,
-        "manifest_sha256": MANIFEST_SHA,
+        "manifest_sha256": manifest_sha256,
         "run_id": 8002,
         "run_attempt": 1,
         "trusted_sha": CONTROL_SHA,
@@ -104,6 +104,40 @@ class SuccessorExecutionTests(unittest.TestCase):
         cap = capsule_comment()
         records = parse_operator_history([cap, consumption_comment(cap)], require_closed=True)
         self.assertEqual([r.record_kind for r in records], [CAPSULE_CONTRACT, CONSUMPTION_CONTRACT])
+
+    def test_v2_consumption_manifest_must_match_capsule(self):
+        cap = capsule_comment()
+        wrong = consumption_comment(cap, manifest_sha256="9" * 64)
+        with self.assertRaisesRegex(
+            SuccessorContractError, "OPERATOR_HISTORY_CONSUMPTION_MISMATCH"
+        ):
+            parse_operator_history([cap, wrong], require_closed=True)
+
+    def test_wrong_manifest_historical_consumption_blocks_successor_discovery(self):
+        old = capsule_comment()
+        wrong = consumption_comment(old, manifest_sha256="9" * 64)
+        with self.assertRaisesRegex(
+            capsule_runtime.SuccessorCapsuleError,
+            "OPERATOR_HISTORY_CONSUMPTION_MISMATCH",
+        ):
+            capsule_runtime.discover_capsule(
+                CommentOnlyAPI([old, wrong]),
+                expected_control_sha=CONTROL_SHA,
+                expected_operation=OPERATION,
+                run_id=8003,
+                run_attempt=1,
+                now=datetime(2026, 9, 7, 10, 10, tzinfo=timezone.utc),
+            )
+
+    def test_manifest_binding_does_not_change_canonical_history_bytes(self):
+        cap = capsule_comment()
+        consumption = consumption_comment(cap)
+        records = parse_operator_history([cap, consumption], require_closed=True)
+        expected = (
+            f"{cap['id']}\t{CAPSULE_CONTRACT}\t{sha256_text(cap['body'])}\n"
+            f"{consumption['id']}\t{CONSUMPTION_CONTRACT}\t{sha256_text(consumption['body'])}\n"
+        )
+        self.assertEqual(canonical_operator_history(records), expected)
 
     def test_expired_unconsumed_capsule_is_not_live_eligible(self):
         cap = capsule_comment()

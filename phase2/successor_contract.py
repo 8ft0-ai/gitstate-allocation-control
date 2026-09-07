@@ -593,6 +593,7 @@ def _v2_history_record(comment: Mapping[str, Any]) -> OperatorHistoryRecord | No
             capsule_id=capsule.capsule_id,
             trusted_sha=capsule.expected_control_sha,
             operation=capsule.operation,
+            manifest_sha256=capsule.manifest_sha256,
         )
     if body.startswith("/gitstate-consumption-v2"):
         consumption = parse_consumption_comment(comment)
@@ -610,6 +611,7 @@ def _v2_history_record(comment: Mapping[str, Any]) -> OperatorHistoryRecord | No
             capsule_body_sha256=str(payload["capsule_body_sha256"]),
             run_id=int(payload["run_id"]),
             run_attempt=int(payload["run_attempt"]),
+            manifest_sha256=str(payload["manifest_sha256"]),
         )
     return None
 
@@ -674,6 +676,14 @@ def validate_operator_history(
             or record.capsule_body_sha256 != capsule.body_sha256
             or record.trusted_sha != capsule.trusted_sha
             or record.operation != capsule.operation
+            or (
+                capsule.record_kind == CAPSULE_CONTRACT
+                and (
+                    capsule.manifest_sha256 is None
+                    or record.manifest_sha256 is None
+                    or record.manifest_sha256 != capsule.manifest_sha256
+                )
+            )
             or record.run_attempt != 1
             or record.run_id is None
         ):
