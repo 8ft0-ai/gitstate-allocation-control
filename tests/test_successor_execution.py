@@ -1,3 +1,5 @@
+import os
+import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -112,6 +114,130 @@ class SuccessorExecutionTests(unittest.TestCase):
                 now=datetime(2026, 9, 7, 11, 0, tzinfo=timezone.utc),
             )
 
+
+    def test_consumed_old_control_v2_does_not_block_current_successor(self):
+        old = capsule_comment()
+        old_consumption = consumption_comment(old)
+
+        current_control = "9" * 40
+        current_capsule_id = "8" * 32
+        current_manifest = "7" * 64
+        payload = capsule_payload()
+        payload["capsule_id"] = current_capsule_id
+        payload["manifest_sha256"] = current_manifest
+        payload["expected_control_sha"] = current_control
+        payload["preflight_run"] = {
+            "run_id": 8101, "run_attempt": 1, "trusted_sha": current_control
+        }
+        body = CAPSULE_PREFIX + canonical_json(payload)
+        current = {
+            "id": 9101,
+            "body": body,
+            "user": {"login": "8ft0-ai"},
+            "created_at": "2026-09-07T10:01:00Z",
+            "updated_at": "2026-09-07T10:01:00Z",
+        }
+
+        with patch.object(capsule_runtime, "validate_public_subject"):
+            observed = capsule_runtime.discover_capsule(
+                CommentOnlyAPI([old, old_consumption, current]),
+                expected_control_sha=current_control,
+                expected_operation=OPERATION,
+                expected_capsule_id=current_capsule_id,
+                expected_manifest_sha256=current_manifest,
+                run_id=8102,
+                run_attempt=1,
+                now=datetime(2026, 9, 7, 10, 10, tzinfo=timezone.utc),
+            )
+        self.assertEqual(observed.capsule_id, current_capsule_id)
+        self.assertEqual(observed.expected_control_sha, current_control)
+
+
+    def test_malformed_consumed_historical_v2_still_blocks_discovery(self):
+        old = capsule_comment()
+        body_sha = sha256_text(old["body"])
+        malformed_payload = {
+            "contract": CONSUMPTION_CONTRACT,
+            "capsule_id": CAPSULE_ID,
+            "capsule_comment_id": old["id"],
+            "capsule_body_sha256": body_sha,
+            "manifest_sha256": MANIFEST_SHA,
+            "run_id": 8002,
+            "run_attempt": 1,
+            "trusted_sha": "f" * 40,
+            "operation": OPERATION,
+            "consumed_at": "2026-09-07T10:05:00Z",
+            "workstream_e_authorised": False,
+        }
+        malformed = {
+            "id": 9002,
+            "body": CONSUMPTION_PREFIX + canonical_json(malformed_payload),
+            "user": {"login": "github-actions[bot]"},
+            "created_at": "2026-09-07T10:05:00Z",
+            "updated_at": "2026-09-07T10:05:00Z",
+        }
+        with self.assertRaisesRegex(
+            capsule_runtime.SuccessorCapsuleError,
+            "OPERATOR_HISTORY_CONSUMPTION_MISMATCH",
+        ):
+            capsule_runtime.discover_capsule(
+                CommentOnlyAPI([old, malformed]),
+                expected_control_sha=CONTROL_SHA,
+                expected_operation=OPERATION,
+                run_id=8003,
+                run_attempt=1,
+                now=datetime(2026, 9, 7, 10, 10, tzinfo=timezone.utc),
+            )
+
+    def test_subprocess_environments_never_inherit_allocator_private_key(self):
+        with patch.dict(
+            os.environ,
+            {"PHASE2_ALLOCATOR_APP_PRIVATE_KEY": "fixture-key"},
+            clear=False,
+        ):
+            credential_free = runtime.live._credential_free_git_env()
+            with tempfile.TemporaryDirectory() as directory:
+                state_env = runtime.live._state_git_env(Path(directory), "state-token")
+        self.assertNotIn("PHASE2_ALLOCATOR_APP_PRIVATE_KEY", credential_free)
+        self.assertNotIn("PHASE2_ALLOCATOR_APP_PRIVATE_KEY", state_env)
+        self.assertEqual(state_env["PHASE2_STATE_TOKEN"], "state-token")
+
+    def test_execute_live_scrubs_allocator_key_before_legacy_stack(self):
+        values = {
+            "GITHUB_REPOSITORY": runtime.CONTROL_REPOSITORY,
+            "GITHUB_REF": "refs/heads/main",
+            "GITHUB_SHA": CONTROL_SHA,
+            "GITHUB_RUN_ID": "8002",
+            "GITHUB_RUN_ATTEMPT": "1",
+            "OPERATION_PROFILE": OPERATION,
+            "CAPSULE_ID": CAPSULE_ID,
+            "CAPSULE_COMMENT_ID": "9001",
+            "CAPSULE_BODY_SHA256": "2" * 64,
+            "CONSUMPTION_COMMENT_ID": "9002",
+            "CONSUMPTION_BODY_SHA256": "3" * 64,
+            "MANIFEST_SHA256": MANIFEST_SHA,
+            "PROJECTION_COMMENT_ID": "7001",
+            "PROJECTION_BODY_SHA256": "4" * 64,
+            "ATTEMPT_NONCE": sha256_text(f"8002:1:{CAPSULE_ID}:{'2' * 64}")[:16],
+            "PHASE2_ALLOCATOR_APP_PRIVATE_KEY": "fixture-key",
+        }
+        manifest = SimpleNamespace(payload={"protocol_sha": "5" * 64})
+        subject = SimpleNamespace(preflight_projection=SimpleNamespace(manifest=manifest))
+        result = runtime.live.LiveSuiteResult(
+            8002, 1, "wd-8002-1-test", CONTROL_SHA, "5" * 64, 14, (), "6" * 64, True, False
+        )
+
+        def legacy_stack(observed):
+            self.assertNotIn("PHASE2_ALLOCATOR_APP_PRIVATE_KEY", observed)
+            self.assertNotIn("PHASE2_ALLOCATOR_APP_PRIVATE_KEY", os.environ)
+            return result
+
+        with patch.dict(os.environ, values, clear=False), \
+             patch.object(runtime, "evaluate_stage", return_value=(subject, GuardResult.pass_result())), \
+             patch.object(runtime.revocation, "execute_live_suite", side_effect=legacy_stack):
+            runtime.execute_live()
+            self.assertNotIn("PHASE2_ALLOCATOR_APP_PRIVATE_KEY", os.environ)
+
     def test_l2_inventory_is_revoked_before_mutation_token_mint(self):
         events = []
         values = GuardedEnvironment({
@@ -138,10 +264,13 @@ class SuccessorExecutionTests(unittest.TestCase):
              patch.object(runtime, "verify_live_installation", return_value={"repository_selection":"selected"}), \
              patch.object(runtime, "prove_installation_inventory", side_effect=prove), patch.object(runtime, "mint_token", side_effect=mint), \
              patch.object(runtime, "require_cross_repository_denial"), patch.object(runtime, "require_public_repository_write_denial"):
-            lease, observed = runtime._mutation_credentials(values, context, legacy,
-                api_factory=lambda token, url: object(), jwt_factory=lambda app_id, key: "jwt")
+            lease, observed = runtime._mutation_credentials(
+                values, context, legacy, private_key="fixture-key",
+                api_factory=lambda token, url: object(),
+                jwt_factory=lambda app_id, key: events.append("private-key-used") or "jwt",
+            )
         self.assertIs(observed, inventory)
-        self.assertEqual(events[:5], ["live_l1", "legacy-context-valid", "private-key-read", "inventory-proved-revoked", "live_l2"])
+        self.assertEqual(events[:5], ["live_l1", "legacy-context-valid", "private-key-used", "inventory-proved-revoked", "live_l2"])
         self.assertEqual(events[5:], ["mint-control", "mint-state"])
         self.assertEqual(lease.control_token, "control-token")
 
@@ -195,8 +324,11 @@ class SuccessorExecutionTests(unittest.TestCase):
              patch.object(runtime, "verify_live_installation", return_value={"repository_selection":"selected"}), \
              patch.object(runtime, "prove_installation_inventory", side_effect=prove), patch.object(runtime, "mint_token", side_effect=mint):
             with self.assertRaisesRegex(runtime.SuccessorRuntimeError, "GOVERNANCE_SUPERSEDED"):
-                runtime._mutation_credentials(values, context, legacy,
-                    api_factory=lambda token, url: object(), jwt_factory=lambda app_id, key: "jwt")
+                runtime._mutation_credentials(
+                    values, context, legacy, private_key="fixture-key",
+                    api_factory=lambda token, url: object(),
+                    jwt_factory=lambda app_id, key: "jwt",
+                )
         self.assertNotIn("MUTATION-TOKEN-MINTED", events)
         self.assertEqual(events[-2:], ["inventory-proved-revoked", "live_l2"])
 

@@ -523,6 +523,7 @@ def _mutation_credentials(
     context: SuccessorRunContext,
     legacy_context: live.LiveRunContext,
     *,
+    private_key: str,
     api_factory: Callable[[str, str], GitHubAPI] = GitHubAPI,
     jwt_factory: Callable[[int, str], str] = create_app_jwt,
 ):
@@ -546,10 +547,8 @@ def _mutation_credentials(
     if guard_values.get(EXECUTION_VARIABLE, "") != "":
         raise SuccessorRuntimeError("EXECUTION_ENABLEMENT_CHANGED")
 
-    key_name = "PHASE2_ALLOCATOR_APP_PRIVATE_KEY"
-    private_key = guard_values[key_name]
-    if guard_values is os.environ:
-        os.environ.pop(key_name, None)
+    if not private_key:
+        raise SuccessorRuntimeError("ALLOCATOR_PRIVATE_KEY_MISSING")
     api_url = guard_values.get("GITHUB_API_URL", "https://api.github.com")
     jwt = jwt_factory(app_id, private_key)
     private_key = ""
@@ -643,7 +642,10 @@ def execute_live(
     env = os.environ if values is None else values
     context = _context(env)
 
-    subject, _ = evaluate_stage(env, context, stage="live_l1")
+    key_name = "PHASE2_ALLOCATOR_APP_PRIVATE_KEY"
+    guard_values = dict(env)
+    guard_values.pop(key_name, None)
+    subject, _ = evaluate_stage(guard_values, context, stage="live_l1")
     manifest = subject.preflight_projection.manifest
     protocol_sha = str(manifest.payload["protocol_sha"])
     legacy_context = live.LiveRunContext(
@@ -660,8 +662,18 @@ def execute_live(
         fixture_mode=FIXTURE_MODE,
     )
 
-    guard_values = dict(env)
-    legacy_values = dict(env)
+    try:
+        private_key = env[key_name]
+    except KeyError as exc:
+        raise SuccessorRuntimeError("ALLOCATOR_PRIVATE_KEY_MISSING") from exc
+    if not private_key:
+        raise SuccessorRuntimeError("ALLOCATOR_PRIVATE_KEY_MISSING")
+    if env is os.environ:
+        os.environ.pop(key_name, None)
+    elif hasattr(env, "pop"):
+        env.pop(key_name, None)  # type: ignore[attr-defined]
+
+    legacy_values = dict(guard_values)
     legacy_values[EXECUTION_VARIABLE] = "true"
 
     previous_context = live.context_from_environment
@@ -683,6 +695,7 @@ def execute_live(
             guard_values,
             context,
             legacy_context,
+            private_key=private_key,
             api_factory=api_factory,
             jwt_factory=jwt_factory,
         )
@@ -699,6 +712,7 @@ def execute_live(
         live.acquire_credentials = previous_acquire
         live.PROTOCOL_AUTHORITY = previous_protocol
         live.LIVE_EXECUTABLE_PATHS = previous_paths
+        private_key = ""
 
     return live.LiveSuiteResult(
         result.run_id,

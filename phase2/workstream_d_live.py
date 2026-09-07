@@ -433,6 +433,12 @@ def _remote_url() -> str:
     return f"https://github.com/{STATE_REPOSITORY}.git"
 
 
+def _sanitised_subprocess_env() -> dict[str, str]:
+    env = dict(os.environ)
+    env.pop("PHASE2_ALLOCATOR_APP_PRIVATE_KEY", None)
+    return env
+
+
 def _state_git_env(root: Path, token: str) -> dict[str, str]:
     askpass = root / "state-askpass.sh"
     askpass.write_text(
@@ -440,7 +446,7 @@ def _state_git_env(root: Path, token: str) -> dict[str, str]:
         encoding="utf-8",
     )
     askpass.chmod(0o700)
-    env = dict(os.environ)
+    env = _sanitised_subprocess_env()
     env.update(
         {
             "GIT_ASKPASS": str(askpass),
@@ -452,7 +458,7 @@ def _state_git_env(root: Path, token: str) -> dict[str, str]:
 
 
 def _credential_free_git_env() -> dict[str, str]:
-    env = dict(os.environ)
+    env = _sanitised_subprocess_env()
     for key in (
         "PHASE2_STATE_TOKEN",
         "GIT_ASKPASS",

@@ -22,6 +22,7 @@ from .successor_contract import (
     SuccessorContractError,
     parse_capsule_comment,
     parse_consumption_comment,
+    parse_operator_history,
     validate_capsule_governance,
 )
 
@@ -166,66 +167,44 @@ def discover_capsule(
     current = now or datetime.now(timezone.utc)
     comments = _list_operator_comments(api)
 
+    # Historical operator records are immutable evidence. Validate the complete
+    # mixed V1/V2 history against each record's own bound identities before
+    # applying current-run eligibility to any unconsumed V2 capsule.
+    try:
+        parse_operator_history(comments, require_closed=False)
+    except SuccessorContractError as exc:
+        raise SuccessorCapsuleError(str(exc)) from exc
+
     consumptions: list[SuccessorConsumption] = []
     candidates: list[SuccessorCapsule] = []
+    comments_by_id: dict[int, Mapping[str, Any]] = {}
     for comment in comments:
         try:
             consumption = parse_consumption_comment(comment)
             if consumption is not None:
                 consumptions.append(consumption)
                 continue
-            capsule = parse_capsule_comment(
-                comment,
-                now=None,
-                expected_control_sha=expected_control_sha,
-                expected_operation=expected_operation,
-            )
+            capsule = parse_capsule_comment(comment, now=None)
         except SuccessorContractError as exc:
             raise SuccessorCapsuleError(str(exc)) from exc
         if capsule is not None:
             candidates.append(capsule)
+            comments_by_id[capsule.comment_id] = comment
 
-    consumed_ids: set[str] = set()
-    for consumption in consumptions:
-        matching = [
-            capsule
-            for capsule in candidates
-            if capsule.capsule_id == consumption.capsule_id
-        ]
-        if not matching:
-            continue
-        capsule = matching[0]
-        payload = consumption.payload
-        if (
-            payload["capsule_comment_id"] != capsule.comment_id
-            or payload["capsule_body_sha256"] != capsule.body_sha256
-            or payload["manifest_sha256"] != capsule.manifest_sha256
-            or payload["trusted_sha"] != capsule.expected_control_sha
-            or payload["operation"] != capsule.operation
-        ):
-            raise SuccessorCapsuleError("SUCCESSOR_CONSUMPTION_MISMATCH")
-        if capsule.capsule_id in consumed_ids:
-            raise SuccessorCapsuleError("SUCCESSOR_DUPLICATE_CONSUMPTION")
-        consumed_ids.add(capsule.capsule_id)
-
-    eligible = [
-        capsule for capsule in candidates if capsule.capsule_id not in consumed_ids
-    ]
+    consumed_ids = {consumption.capsule_id for consumption in consumptions}
     live_eligible: list[SuccessorCapsule] = []
-    for capsule in eligible:
+    for capsule in candidates:
+        if capsule.capsule_id in consumed_ids:
+            continue
         try:
             reparsed = parse_capsule_comment(
-                next(
-                    comment
-                    for comment in comments
-                    if comment.get("id") == capsule.comment_id
-                ),
+                comments_by_id[capsule.comment_id],
                 now=current,
                 expected_control_sha=expected_control_sha,
                 expected_operation=expected_operation,
             )
-        except (StopIteration, SuccessorContractError) as exc:
-            if isinstance(exc, SuccessorContractError) and str(exc) in {
+        except SuccessorContractError as exc:
+            if str(exc) in {
                 "SUCCESSOR_CAPSULE_EXPIRED",
                 "SUCCESSOR_CAPSULE_NOT_YET_VALID",
             }:
@@ -234,42 +213,26 @@ def discover_capsule(
         if reparsed is None:
             raise SuccessorCapsuleError("SUCCESSOR_CAPSULE_NOT_FOUND")
         live_eligible.append(reparsed)
+
     eligible = live_eligible
     if expected_capsule_id:
-        eligible = [
-            capsule
-            for capsule in eligible
-            if capsule.capsule_id == expected_capsule_id
-        ]
+        eligible = [capsule for capsule in eligible if capsule.capsule_id == expected_capsule_id]
     if expected_capsule_body_sha256:
         if SHA256.fullmatch(expected_capsule_body_sha256) is None:
             raise SuccessorCapsuleError("EXPECTED_SUCCESSOR_CAPSULE_DIGEST_INVALID")
-        eligible = [
-            capsule
-            for capsule in eligible
-            if capsule.body_sha256 == expected_capsule_body_sha256
-        ]
+        eligible = [capsule for capsule in eligible if capsule.body_sha256 == expected_capsule_body_sha256]
     if expected_manifest_sha256:
         if SHA256.fullmatch(expected_manifest_sha256) is None:
             raise SuccessorCapsuleError("EXPECTED_SUCCESSOR_MANIFEST_DIGEST_INVALID")
-        eligible = [
-            capsule
-            for capsule in eligible
-            if capsule.manifest_sha256 == expected_manifest_sha256
-        ]
+        eligible = [capsule for capsule in eligible if capsule.manifest_sha256 == expected_manifest_sha256]
 
     if len(eligible) != 1:
         raise SuccessorCapsuleError(
-            "SUCCESSOR_CAPSULE_NOT_FOUND"
-            if not eligible
-            else "SUCCESSOR_CAPSULE_AMBIGUOUS"
+            "SUCCESSOR_CAPSULE_NOT_FOUND" if not eligible else "SUCCESSOR_CAPSULE_AMBIGUOUS"
         )
     capsule = eligible[0]
     validate_public_subject(
-        api,
-        capsule,
-        trusted_sha=expected_control_sha,
-        current_run_id=run_id,
+        api, capsule, trusted_sha=expected_control_sha, current_run_id=run_id
     )
     return capsule
 
