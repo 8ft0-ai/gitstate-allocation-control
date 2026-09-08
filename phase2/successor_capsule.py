@@ -8,7 +8,7 @@ from typing import Any, Mapping
 
 from .github_api import GitHubAPI, GitHubAPIError
 from .operator_capsule import LIVE_PROFILE, OPERATOR_ISSUE_NUMBER
-from .operator_manifest import SHA256, canonical_json, sha256_text
+from .operator_manifest import OPAQUE_ID, SHA256, canonical_json, sha256_text
 from .preflight_carrier_ledger import validate_carrier_ledger
 from .preflight_control_anchor import validate_ledger_only_control_descendant
 from . import preflight_projection as projection
@@ -334,6 +334,23 @@ def _require_workflow_identity(
     return sha, run_id, run_attempt, LIVE_PROFILE
 
 
+def _require_live_dispatch_bindings(
+    values: Mapping[str, str],
+) -> tuple[str, str, str]:
+    capsule_id = values.get("EXPECTED_SUCCESSOR_CAPSULE_ID", "")
+    capsule_body_sha256 = values.get("EXPECTED_SUCCESSOR_CAPSULE_BODY_SHA256", "")
+    manifest_sha256 = values.get("EXPECTED_SUCCESSOR_MANIFEST_SHA256", "")
+    if not capsule_id or not capsule_body_sha256 or not manifest_sha256:
+        raise SuccessorCapsuleError("SUCCESSOR_DISPATCH_BINDING_REQUIRED")
+    if OPAQUE_ID.fullmatch(capsule_id) is None:
+        raise SuccessorCapsuleError("EXPECTED_SUCCESSOR_CAPSULE_ID_INVALID")
+    if SHA256.fullmatch(capsule_body_sha256) is None:
+        raise SuccessorCapsuleError("EXPECTED_SUCCESSOR_CAPSULE_DIGEST_INVALID")
+    if SHA256.fullmatch(manifest_sha256) is None:
+        raise SuccessorCapsuleError("EXPECTED_SUCCESSOR_MANIFEST_DIGEST_INVALID")
+    return capsule_id, capsule_body_sha256, manifest_sha256
+
+
 def _write_outputs(path: str, values: Mapping[str, str]) -> None:
     if not path:
         raise SuccessorCapsuleError("GITHUB_OUTPUT_MISSING")
@@ -353,19 +370,16 @@ def _api_from_environment(values: Mapping[str, str]) -> GitHubAPI:
 
 def command_discover(values: Mapping[str, str]) -> None:
     sha, run_id, run_attempt, operation = _require_workflow_identity(values)
+    capsule_id, capsule_body_sha256, manifest_sha256 = _require_live_dispatch_bindings(values)
     capsule = discover_capsule(
         _api_from_environment(values),
         expected_control_sha=sha,
         expected_operation=operation,
         run_id=run_id,
         run_attempt=run_attempt,
-        expected_capsule_id=values.get("EXPECTED_SUCCESSOR_CAPSULE_ID", ""),
-        expected_capsule_body_sha256=values.get(
-            "EXPECTED_SUCCESSOR_CAPSULE_BODY_SHA256", ""
-        ),
-        expected_manifest_sha256=values.get(
-            "EXPECTED_SUCCESSOR_MANIFEST_SHA256", ""
-        ),
+        expected_capsule_id=capsule_id,
+        expected_capsule_body_sha256=capsule_body_sha256,
+        expected_manifest_sha256=manifest_sha256,
     )
     outputs = capsule.runtime_outputs(run_id=run_id, run_attempt=run_attempt)
     _write_outputs(values.get("GITHUB_OUTPUT", ""), outputs)
@@ -390,6 +404,7 @@ def command_discover(values: Mapping[str, str]) -> None:
 
 def command_consume(values: Mapping[str, str]) -> None:
     sha, run_id, run_attempt, operation = _require_workflow_identity(values)
+    capsule_id, capsule_body_sha256, manifest_sha256 = _require_live_dispatch_bindings(values)
     try:
         expected_comment_id = int(values["EXPECTED_SUCCESSOR_CAPSULE_COMMENT_ID"])
     except (KeyError, TypeError, ValueError) as exc:
@@ -400,14 +415,10 @@ def command_consume(values: Mapping[str, str]) -> None:
         _api_from_environment(values),
         expected_control_sha=sha,
         expected_operation=operation,
-        expected_capsule_id=values.get("EXPECTED_SUCCESSOR_CAPSULE_ID", ""),
+        expected_capsule_id=capsule_id,
         expected_capsule_comment_id=expected_comment_id,
-        expected_capsule_body_sha256=values.get(
-            "EXPECTED_SUCCESSOR_CAPSULE_BODY_SHA256", ""
-        ),
-        expected_manifest_sha256=values.get(
-            "EXPECTED_SUCCESSOR_MANIFEST_SHA256", ""
-        ),
+        expected_capsule_body_sha256=capsule_body_sha256,
+        expected_manifest_sha256=manifest_sha256,
         run_id=run_id,
         run_attempt=run_attempt,
     )
