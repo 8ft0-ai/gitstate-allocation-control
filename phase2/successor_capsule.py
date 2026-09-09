@@ -135,6 +135,8 @@ def require_current_manifest_approval_attestation(
     selected = same_id[0]
     if selected.body_sha256 != approval["attestation_body_sha256"]:
         raise SuccessorCapsuleError("SUCCESSOR_APPROVAL_ATTESTATION_BINDING_MISMATCH")
+    if selected.created_at >= capsule.created_at:
+        raise SuccessorCapsuleError("SUCCESSOR_APPROVAL_ATTESTATION_ORDER_INVALID")
 
     competing = [
         item for item in attestations

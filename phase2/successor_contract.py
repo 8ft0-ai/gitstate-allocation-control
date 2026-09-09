@@ -546,7 +546,7 @@ def validate_capsule_governance(
     ]
     approval = capsule.manifest_approval
     attested = attestation.payload
-    if attestation.created_at > capsule.created_at:
+    if attestation.created_at >= capsule.created_at:
         raise SuccessorContractError("SUCCESSOR_APPROVAL_ATTESTATION_ORDER_INVALID")
     if state.approval_status in {"ambiguous", "rejected"}:
         raise SuccessorContractError("SUCCESSOR_CAPSULE_APPROVAL_NOT_ACTIVE")
