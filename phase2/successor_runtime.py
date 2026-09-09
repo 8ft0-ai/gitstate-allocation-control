@@ -68,7 +68,6 @@ from .successor_contract import (
     parse_consumption_comment,
     parse_operator_history,
     permission_profile_sha256,
-    validate_capsule_governance,
 )
 
 
@@ -440,11 +439,7 @@ def _subject(
             trusted_sha=context.trusted_sha,
             current_run_id=context.run_id,
         )
-        governance_history = validate_capsule_governance(
-            capsule,
-            preflight_projection.manifest,
-            preflight_projection.governance_history,
-        )
+        governance_history = preflight_projection.governance_history
     except (SuccessorCapsuleError, SuccessorContractError) as exc:
         raise SuccessorRuntimeError(str(exc)) from exc
     _validate_operator_history(api, context, preflight_projection.manifest)
@@ -541,6 +536,7 @@ def _guard_observation(
         execution_variable=str(bound["execution_variable"]),
         execution_variable_absent=values.get(EXECUTION_VARIABLE, "") == "",
         governance_history=subject.governance_history,
+        manifest_approval_proven=True,
         private_freshness_proven=(stage == "live_l2" and actual_inventory is not None and state_observation is not None),
     )
 

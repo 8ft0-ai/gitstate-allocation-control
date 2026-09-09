@@ -485,6 +485,182 @@ class SuccessorFreshnessAndOpenHistoryTests(unittest.TestCase):
                 api_factory=lambda token, url: StateAPI(),
             )
 
+    def test_public_approval_attestation_is_independent_and_raw_source_is_rejected(self):
+        from datetime import datetime, timezone
+        from phase2.operator_manifest import canonical_json
+        from phase2.successor_contract import CAPSULE_PREFIX, SuccessorContractError
+        from tests.test_successor_execution import (
+            CONTROL_SHA, OPERATION, approval_attestation_comment, capsule_comment, capsule_payload
+        )
+
+        raw = capsule_payload()
+        raw["manifest_approval"]["source"] = {
+            "comment_id": 6001,
+            "body": "private source material",
+            "owner": "8ft0-ai",
+            "created_at": "2026-09-07T09:59:00Z",
+            "updated_at": "2026-09-07T09:59:00Z",
+        }
+        raw_comment = {
+            "id": 9001,
+            "body": CAPSULE_PREFIX + canonical_json(raw),
+            "user": {"login": "8ft0-ai"},
+            "created_at": "2026-09-07T10:01:00Z",
+            "updated_at": "2026-09-07T10:01:00Z",
+        }
+        with self.assertRaisesRegex(SuccessorContractError, "SUCCESSOR_CAPSULE_APPROVAL_INVALID"):
+            capsule_runtime.parse_capsule_comment(
+                raw_comment,
+                now=datetime(2026, 9, 7, 10, 10, tzinfo=timezone.utc),
+                expected_control_sha=CONTROL_SHA,
+                expected_operation=OPERATION,
+            )
+
+        current = capsule_comment()
+        capsule = capsule_runtime.parse_capsule_comment(
+            current,
+            now=datetime(2026, 9, 7, 10, 10, tzinfo=timezone.utc),
+            expected_control_sha=CONTROL_SHA,
+            expected_operation=OPERATION,
+        )
+        from tests.test_successor_execution import CommentOnlyAPI
+        with self.assertRaisesRegex(
+            capsule_runtime.SuccessorCapsuleError, "SUCCESSOR_APPROVAL_ATTESTATION_NOT_FOUND"
+        ):
+            capsule_runtime._require_manifest_approval_attestation(
+                CommentOnlyAPI([current]), capsule
+            )
+        observed = capsule_runtime._require_manifest_approval_attestation(
+            CommentOnlyAPI([approval_attestation_comment(), current]), capsule
+        )
+        self.assertEqual(observed.attestation_id, capsule.manifest_approval["attestation_id"])
+        self.assertNotIn("source", capsule.manifest_approval)
+
+    def test_conflicting_public_approval_attestations_fail_closed(self):
+        from tests.test_successor_execution import (
+            CommentOnlyAPI, approval_attestation_comment, capsule_comment
+        )
+        capsule = capsule_runtime.parse_capsule_comment(capsule_comment(), now=None)
+        competing = approval_attestation_comment(
+            comment_id=8989,
+            attestation_id="4" * 32,
+            approval={"record_id": "5" * 32, "body_sha256": "6" * 64},
+        )
+        with self.assertRaisesRegex(
+            capsule_runtime.SuccessorCapsuleError,
+            "SUCCESSOR_APPROVAL_ATTESTATION_AMBIGUOUS",
+        ):
+            capsule_runtime._require_manifest_approval_attestation(
+                CommentOnlyAPI([approval_attestation_comment(), competing, capsule_comment()]),
+                capsule,
+            )
+
+    def test_approval_attestation_is_owner_authenticated_immutable_and_predates_capsule(self):
+        from datetime import datetime, timezone
+        from phase2.successor_contract import (
+            SuccessorContractError, parse_manifest_approval_attestation
+        )
+        from tests.test_successor_execution import (
+            CONTROL_SHA, OPERATION, approval_attestation_comment, capsule_comment
+        )
+
+        wrong_owner = approval_attestation_comment()
+        wrong_owner["user"] = {"login": "someone-else"}
+        with self.assertRaisesRegex(SuccessorContractError, "WRONG_OWNER"):
+            parse_manifest_approval_attestation(wrong_owner)
+
+        edited = approval_attestation_comment()
+        edited["updated_at"] = "2026-09-07T10:00:00Z"
+        with self.assertRaisesRegex(SuccessorContractError, "SOURCE_EDITED"):
+            parse_manifest_approval_attestation(edited)
+
+        from phase2.governance_state import build_governance_history
+        from phase2.successor_contract import CAPSULE_PREFIX, validate_capsule_governance
+        from tests.test_operator_guard import make_state, parsed_records
+        from tests.test_successor_execution import capsule_payload
+        from phase2.operator_manifest import canonical_json, sha256_text
+
+        _, _, _, manifest, comments, _ = make_state()
+        records = parsed_records(comments)
+        authority_record = next(record for record in records if record.record_type == "authority")
+        authority_binding = {
+            "record_id": authority_record.record_id,
+            "body_sha256": authority_record.body_sha256,
+        }
+        late = approval_attestation_comment(
+            manifest_sha256=manifest.sha256, authority=authority_binding
+        )
+        late["created_at"] = late["updated_at"] = "2026-09-07T10:02:00Z"
+        attestation = parse_manifest_approval_attestation(late)
+        value = capsule_payload()
+        value["manifest_sha256"] = manifest.sha256
+        value["authority"] = authority_binding
+        value["expected_control_sha"] = str(manifest.payload["executor"]["commit_sha"])
+        value["preflight_run"]["trusted_sha"] = value["expected_control_sha"]
+        value["manifest_approval"]["attestation_body_sha256"] = sha256_text(late["body"])
+        body = CAPSULE_PREFIX + canonical_json(value)
+        capsule = capsule_runtime.parse_capsule_comment(
+            {
+                "id": 9001, "body": body, "user": {"login": "8ft0-ai"},
+                "created_at": "2026-09-07T10:01:00Z",
+                "updated_at": "2026-09-07T10:01:00Z",
+            },
+            now=datetime(2026, 9, 7, 10, 10, tzinfo=timezone.utc),
+            expected_control_sha=value["expected_control_sha"],
+            expected_operation=OPERATION,
+        )
+        history = build_governance_history(manifest.sha256, records)
+        with self.assertRaisesRegex(
+            SuccessorContractError, "SUCCESSOR_APPROVAL_ATTESTATION_ORDER_INVALID"
+        ):
+            validate_capsule_governance(capsule, manifest, history, attestation)
+
+        valid_comment = approval_attestation_comment(
+            manifest_sha256=manifest.sha256, authority=authority_binding
+        )
+        valid = parse_manifest_approval_attestation(valid_comment)
+        self.assertIs(validate_capsule_governance(capsule, manifest, history, valid), history)
+
+    def test_live_guard_requires_proven_external_approval_when_history_has_none(self):
+        from phase2.operator_guard import evaluate_guards
+        from tests.test_operator_guard import make_state, with_observation
+
+        _, _, _, manifest, _, observation = make_state()
+        missing = with_observation(
+            observation, stage="live_l1", manifest_approval_proven=False
+        )
+        self.assertEqual(evaluate_guards(manifest, missing).code, "AUTHORITY_NOT_GRANTED")
+        proven = with_observation(
+            observation, stage="live_l1", manifest_approval_proven=True
+        )
+        self.assertTrue(evaluate_guards(manifest, proven).passed)
+
+    def test_external_attestation_cannot_override_rejected_governance_approval(self):
+        from phase2.operator_guard import evaluate_guards
+        from tests.test_operator_guard import (
+            APPROVAL_ID, AUTHORITY_ID, binding, governance_comment, governance_payload,
+            make_state, manifest_subject, parsed_records, with_records, with_observation,
+        )
+
+        _, _, authority, manifest, comments, observation = make_state()
+        rejected = governance_comment(
+            104,
+            governance_payload(
+                "manifest_approval",
+                APPROVAL_ID,
+                manifest_subject(
+                    manifest.sha256,
+                    record_ids=(AUTHORITY_ID,),
+                    comment_bindings=(binding(authority),),
+                ),
+                {"disposition": "rejected"},
+            ),
+        )
+        records = parsed_records(comments + [rejected])
+        live = with_records(observation, manifest, records, stage="live_l1")
+        live = with_observation(live, manifest_approval_proven=True)
+        self.assertEqual(evaluate_guards(manifest, live).code, "AUTHORITY_NOT_GRANTED")
+
     def test_required_owner_observation_is_not_replayed_from_b2_projection(self):
         from datetime import datetime, timezone
         from tests.test_operator_guard import make_state

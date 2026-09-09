@@ -12,6 +12,7 @@ from phase2.operator_guard import GuardResult
 from phase2.operator_inventory import CONTROL_REPOSITORY_ID, STATE_REPOSITORY_ID, InventoryEvidence
 from phase2.operator_manifest import canonical_json, sha256_text
 from phase2.successor_contract import (
+    APPROVAL_ATTESTATION_CONTRACT, APPROVAL_ATTESTATION_PREFIX,
     CAPSULE_CONTRACT, CAPSULE_PREFIX, CONSUMPTION_CONTRACT, CONSUMPTION_PREFIX,
     SuccessorContractError, canonical_operator_history, parse_capsule_comment, parse_operator_history,
 )
@@ -19,11 +20,32 @@ from phase2.successor_contract import (
 CONTROL_SHA = "a" * 40
 MANIFEST_SHA = "b" * 64
 CAPSULE_ID = "c" * 32
+APPROVAL_RECORD_ID = "1" * 32
+APPROVAL_BODY_SHA256 = "2" * 64
+APPROVAL_ATTESTATION_ID = "3" * 32
 OPERATION = "workstream-d-scenarios-1-14/v1"
 
 
+
+def approval_attestation_comment(comment_id=8990, **changes):
+    value = {
+        "contract": APPROVAL_ATTESTATION_CONTRACT,
+        "attestation_id": APPROVAL_ATTESTATION_ID,
+        "manifest_sha256": MANIFEST_SHA,
+        "authority": {"record_id": "e" * 32, "body_sha256": "f" * 64},
+        "approval": {"record_id": APPROVAL_RECORD_ID, "body_sha256": APPROVAL_BODY_SHA256},
+        "disposition": "approved",
+        "workstream_e_authorised": False,
+    }
+    value.update(changes)
+    body = APPROVAL_ATTESTATION_PREFIX + canonical_json(value)
+    return {
+        "id": comment_id, "body": body, "user": {"login": "8ft0-ai"},
+        "created_at": "2026-09-07T09:59:00Z", "updated_at": "2026-09-07T09:59:00Z",
+    }
+
 def capsule_payload(*, created="2026-09-07T10:00:00Z", expires="2026-09-07T10:30:00Z"):
-    approval_body = "approval source"
+    attestation = approval_attestation_comment()
     return {
         "contract": CAPSULE_CONTRACT,
         "capsule_id": CAPSULE_ID,
@@ -32,15 +54,10 @@ def capsule_payload(*, created="2026-09-07T10:00:00Z", expires="2026-09-07T10:30
         "manifest_sha256": MANIFEST_SHA,
         "authority": {"record_id": "e" * 32, "body_sha256": "f" * 64},
         "manifest_approval": {
-            "record_id": "1" * 32,
-            "body_sha256": sha256_text(approval_body),
-            "source": {
-                "comment_id": 6001,
-                "body": approval_body,
-                "owner": "8ft0-ai",
-                "created_at": "2026-09-07T09:59:00Z",
-                "updated_at": "2026-09-07T09:59:00Z",
-            },
+            "record_id": APPROVAL_RECORD_ID,
+            "body_sha256": APPROVAL_BODY_SHA256,
+            "attestation_id": APPROVAL_ATTESTATION_ID,
+            "attestation_body_sha256": sha256_text(attestation["body"]),
         },
         "expected_control_sha": CONTROL_SHA,
         "preflight_run": {"run_id": 8001, "run_attempt": 1, "trusted_sha": CONTROL_SHA},

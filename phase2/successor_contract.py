@@ -11,7 +11,6 @@ from .governance_state import (
     GovernanceHistory,
     GovernanceStateError,
     GuardedExecutionManifest,
-    build_governance_history,
     reduce_governance_history,
 )
 from .operator_inventory import (
@@ -24,14 +23,11 @@ from .operator_manifest import (
     OPAQUE_ID,
     SHA40,
     SHA256,
-    GovernanceSource,
     HistoryBaseline,
-    OperatorContractError,
     OperatorHistoryRecord,
     V1_CAPSULE_CONTRACT,
     V1_CONSUMPTION_CONTRACT,
     canonical_json,
-    parse_governance_comments,
     parse_v1_operator_history_comment,
     sha256_text,
 )
@@ -47,10 +43,20 @@ CLOCK_SKEW = timedelta(minutes=1)
 BINDING_FIELDS = frozenset({"comment_id", "body_sha256"})
 RECORD_BINDING_FIELDS = frozenset({"record_id", "body_sha256"})
 PREFLIGHT_RUN_FIELDS = frozenset({"run_id", "run_attempt", "trusted_sha"})
-GOVERNANCE_SOURCE_FIELDS = frozenset(
-    {"comment_id", "body", "owner", "created_at", "updated_at"}
+APPROVAL_FIELDS = frozenset({"record_id", "body_sha256", "attestation_id", "attestation_body_sha256"})
+APPROVAL_ATTESTATION_CONTRACT = "gitstate-manifest-approval-attestation/v1"
+APPROVAL_ATTESTATION_PREFIX = "/gitstate-manifest-approval-attestation-v1 "
+APPROVAL_ATTESTATION_FIELDS = frozenset(
+    {
+        "contract",
+        "attestation_id",
+        "manifest_sha256",
+        "authority",
+        "approval",
+        "disposition",
+        "workstream_e_authorised",
+    }
 )
-APPROVAL_FIELDS = frozenset({"record_id", "body_sha256", "source"})
 
 CAPSULE_FIELDS = frozenset(
     {
@@ -226,31 +232,51 @@ def _parse_record_binding(value: Any, reason: str) -> Mapping[str, Any]:
     return _freeze(value)
 
 
-def _parse_source(value: Any, reason: str) -> Mapping[str, Any]:
-    if not isinstance(value, dict):
-        raise SuccessorContractError(reason)
-    _require_exact_keys(value, GOVERNANCE_SOURCE_FIELDS, reason)
-    _require_int(value.get("comment_id"), reason)
-    _require_string(value.get("body"), reason)
-    if value.get("owner") != GOVERNANCE_OWNER:
-        raise SuccessorContractError(f"{reason}_WRONG_OWNER")
-    created = _require_string(value.get("created_at"), reason)
-    updated = _require_string(value.get("updated_at"), reason)
-    _parse_time(created, reason)
-    _parse_time(updated, reason)
-    if created != updated:
-        raise SuccessorContractError(f"{reason}_SOURCE_EDITED")
-    return _freeze(value)
+@dataclass(frozen=True)
+class ManifestApprovalAttestation:
+    payload: Mapping[str, Any]
+    comment_id: int
+    body_sha256: str
+    created_at: datetime
+
+    @property
+    def attestation_id(self) -> str:
+        return str(self.payload["attestation_id"])
 
 
-def _source_comment(source: Mapping[str, Any]) -> dict[str, Any]:
-    return {
-        "id": int(source["comment_id"]),
-        "body": str(source["body"]),
-        "user": {"login": str(source["owner"])},
-        "created_at": str(source["created_at"]),
-        "updated_at": str(source["updated_at"]),
-    }
+def parse_manifest_approval_attestation(
+    comment: Mapping[str, Any],
+) -> ManifestApprovalAttestation | None:
+    body = comment.get("body")
+    if not isinstance(body, str):
+        raise SuccessorContractError("SUCCESSOR_APPROVAL_ATTESTATION_COMMENT_INVALID")
+    reserved_like = body.startswith("/gitstate-manifest-approval-attestation-v1")
+    if not reserved_like:
+        return None
+    if not body.startswith(APPROVAL_ATTESTATION_PREFIX) or "\n" in body:
+        raise SuccessorContractError("SUCCESSOR_APPROVAL_ATTESTATION_RESERVED_RECORD_INVALID")
+
+    comment_id, body, body_sha256, created_at = _comment_identity(
+        comment, owner=GOVERNANCE_OWNER, reason="SUCCESSOR_APPROVAL_ATTESTATION"
+    )
+    value = _strict_json(
+        body[len(APPROVAL_ATTESTATION_PREFIX):],
+        "SUCCESSOR_APPROVAL_ATTESTATION_JSON_INVALID",
+    )
+    _require_exact_keys(
+        value, APPROVAL_ATTESTATION_FIELDS, "SUCCESSOR_APPROVAL_ATTESTATION_SCHEMA_MISMATCH"
+    )
+    if value.get("contract") != APPROVAL_ATTESTATION_CONTRACT:
+        raise SuccessorContractError("SUCCESSOR_APPROVAL_ATTESTATION_CONTRACT_MISMATCH")
+    _require_hex(value.get("attestation_id"), OPAQUE_ID, "SUCCESSOR_APPROVAL_ATTESTATION_ID_INVALID")
+    _require_hex(value.get("manifest_sha256"), SHA256, "SUCCESSOR_APPROVAL_ATTESTATION_MANIFEST_INVALID")
+    _parse_record_binding(value.get("authority"), "SUCCESSOR_APPROVAL_ATTESTATION_AUTHORITY_INVALID")
+    _parse_record_binding(value.get("approval"), "SUCCESSOR_APPROVAL_ATTESTATION_APPROVAL_INVALID")
+    if value.get("disposition") != "approved":
+        raise SuccessorContractError("SUCCESSOR_APPROVAL_ATTESTATION_NOT_APPROVED")
+    if value.get("workstream_e_authorised") is not False:
+        raise SuccessorContractError("WORKSTREAM_E_NOT_AUTHORISED")
+    return ManifestApprovalAttestation(_freeze(value), comment_id, body_sha256, created_at)
 
 
 @dataclass(frozen=True)
@@ -377,22 +403,11 @@ def parse_capsule_comment(
     approval = value.get("manifest_approval")
     if not isinstance(approval, dict):
         raise SuccessorContractError("SUCCESSOR_CAPSULE_APPROVAL_INVALID")
-    _require_exact_keys(
-        approval, APPROVAL_FIELDS, "SUCCESSOR_CAPSULE_APPROVAL_INVALID"
-    )
-    _require_hex(
-        approval.get("record_id"), OPAQUE_ID, "SUCCESSOR_CAPSULE_APPROVAL_INVALID"
-    )
-    _require_hex(
-        approval.get("body_sha256"),
-        SHA256,
-        "SUCCESSOR_CAPSULE_APPROVAL_INVALID",
-    )
-    source = _parse_source(
-        approval.get("source"), "SUCCESSOR_CAPSULE_APPROVAL_SOURCE_INVALID"
-    )
-    if sha256_text(str(source["body"])) != approval["body_sha256"]:
-        raise SuccessorContractError("SUCCESSOR_CAPSULE_APPROVAL_DIGEST_MISMATCH")
+    _require_exact_keys(approval, APPROVAL_FIELDS, "SUCCESSOR_CAPSULE_APPROVAL_INVALID")
+    _require_hex(approval.get("record_id"), OPAQUE_ID, "SUCCESSOR_CAPSULE_APPROVAL_INVALID")
+    _require_hex(approval.get("body_sha256"), SHA256, "SUCCESSOR_CAPSULE_APPROVAL_INVALID")
+    _require_hex(approval.get("attestation_id"), OPAQUE_ID, "SUCCESSOR_CAPSULE_APPROVAL_INVALID")
+    _require_hex(approval.get("attestation_body_sha256"), SHA256, "SUCCESSOR_CAPSULE_APPROVAL_INVALID")
 
     expected_control = _require_hex(
         value.get("expected_control_sha"),
@@ -510,72 +525,56 @@ def validate_capsule_governance(
     capsule: SuccessorCapsule,
     manifest: GuardedExecutionManifest,
     base_history: GovernanceHistory,
+    attestation: ManifestApprovalAttestation,
 ) -> GovernanceHistory:
     if capsule.manifest_sha256 != manifest.sha256:
         raise SuccessorContractError("SUCCESSOR_CAPSULE_MANIFEST_MISMATCH")
     if not isinstance(base_history, GovernanceHistory):
         raise SuccessorContractError("SUCCESSOR_CAPSULE_GOVERNANCE_INVALID")
+    if not isinstance(attestation, ManifestApprovalAttestation):
+        raise SuccessorContractError("SUCCESSOR_APPROVAL_ATTESTATION_INVALID")
 
-    approval_source = capsule.manifest_approval["source"]
-    sources = tuple(base_history.sources) + (
-        GovernanceSource(
-            comment_id=int(approval_source["comment_id"]),
-            body=str(approval_source["body"]),
-            owner=str(approval_source["owner"]),
-            created_at=str(approval_source["created_at"]),
-            updated_at=str(approval_source["updated_at"]),
-        ),
-    )
-
-    source_comments = [
-        _source_comment(
-            {
-                "comment_id": source.comment_id,
-                "body": source.body,
-                "owner": source.owner,
-                "created_at": source.created_at,
-                "updated_at": source.updated_at,
-            }
-        )
-        for source in sources
-    ]
     try:
-        records = parse_governance_comments(
-            source_comments,
-            expected_owner=GOVERNANCE_OWNER,
-            expected_issue=manifest.governing_issue,
-        )
-        history = build_governance_history(manifest.sha256, records)
-        state = reduce_governance_history(manifest, history)
-    except (OperatorContractError, GovernanceStateError, TypeError, ValueError) as exc:
+        state = reduce_governance_history(manifest, base_history)
+    except (GovernanceStateError, TypeError, ValueError) as exc:
         raise SuccessorContractError("SUCCESSOR_CAPSULE_GOVERNANCE_INVALID") from exc
 
     authority_matches = [
-        record
-        for record in records
-        if record.record_type == "authority"
-        and record.record_id == capsule.authority["record_id"]
-        and record.body_sha256 == capsule.authority["body_sha256"]
+        source for source in base_history.sources
+        if source.comment_id == manifest.authority.comment_id
+        and sha256_text(source.body) == capsule.authority["body_sha256"]
     ]
-    approval_matches = [
-        record
-        for record in records
-        if record.record_type == "manifest_approval"
-        and record.record_id == capsule.manifest_approval["record_id"]
-        and record.body_sha256 == capsule.manifest_approval["body_sha256"]
-    ]
-    if len(authority_matches) != 1 or len(approval_matches) != 1:
+    approval = capsule.manifest_approval
+    attested = attestation.payload
+    if attestation.created_at > capsule.created_at:
+        raise SuccessorContractError("SUCCESSOR_APPROVAL_ATTESTATION_ORDER_INVALID")
+    if state.approval_status in {"ambiguous", "rejected"}:
+        raise SuccessorContractError("SUCCESSOR_CAPSULE_APPROVAL_NOT_ACTIVE")
+    if state.approval_status == "approved" and (
+        state.active_approval is None
+        or state.active_approval.record_id != approval["record_id"]
+        or state.active_approval.body_sha256 != approval["body_sha256"]
+    ):
+        raise SuccessorContractError("SUCCESSOR_CAPSULE_APPROVAL_BINDING_MISMATCH")
+    if len(authority_matches) != 1:
         raise SuccessorContractError("SUCCESSOR_CAPSULE_GOVERNANCE_BINDING_MISMATCH")
-    if state.authority_status != "active" or state.approval_status != "approved":
+    if state.authority_status != "active":
         raise SuccessorContractError("SUCCESSOR_CAPSULE_AUTHORITY_NOT_ACTIVE")
     if state.authority.record_id != capsule.authority["record_id"]:
         raise SuccessorContractError("SUCCESSOR_CAPSULE_AUTHORITY_BINDING_MISMATCH")
     if (
-        state.active_approval is None
-        or state.active_approval.record_id != capsule.manifest_approval["record_id"]
+        attestation.attestation_id != approval["attestation_id"]
+        or attestation.body_sha256 != approval["attestation_body_sha256"]
+        or attested["manifest_sha256"] != capsule.manifest_sha256
+        or attested["authority"]["record_id"] != capsule.authority["record_id"]
+        or attested["authority"]["body_sha256"] != capsule.authority["body_sha256"]
+        or attested["approval"]["record_id"] != approval["record_id"]
+        or attested["approval"]["body_sha256"] != approval["body_sha256"]
+        or attested["disposition"] != "approved"
+        or attested["workstream_e_authorised"] is not False
     ):
         raise SuccessorContractError("SUCCESSOR_CAPSULE_APPROVAL_BINDING_MISMATCH")
-    return history
+    return base_history
 
 
 def _v2_history_record(comment: Mapping[str, Any]) -> OperatorHistoryRecord | None:

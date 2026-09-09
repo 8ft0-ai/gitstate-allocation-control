@@ -32,6 +32,7 @@ from .successor_contract import (
     SuccessorContractError,
     parse_capsule_comment,
     parse_consumption_comment,
+    parse_manifest_approval_attestation,
     operator_history_baseline,
     parse_operator_history,
     validate_capsule_governance,
@@ -107,6 +108,46 @@ def _validate_preflight_evidence(
         raise SuccessorCapsuleError("SUCCESSOR_PREFLIGHT_ORDER_INVALID")
 
 
+
+def _require_manifest_approval_attestation(
+    api: GitHubAPI, capsule: SuccessorCapsule
+):
+    approval = capsule.manifest_approval
+    attestations = []
+    for comment in _list_operator_comments(api):
+        try:
+            attestation = parse_manifest_approval_attestation(comment)
+        except SuccessorContractError as exc:
+            raise SuccessorCapsuleError(str(exc)) from exc
+        if attestation is not None:
+            attestations.append(attestation)
+
+    same_id = [
+        item for item in attestations
+        if item.attestation_id == approval["attestation_id"]
+    ]
+    if len(same_id) != 1:
+        raise SuccessorCapsuleError(
+            "SUCCESSOR_APPROVAL_ATTESTATION_NOT_FOUND"
+            if not same_id
+            else "SUCCESSOR_APPROVAL_ATTESTATION_AMBIGUOUS"
+        )
+    selected = same_id[0]
+    if selected.body_sha256 != approval["attestation_body_sha256"]:
+        raise SuccessorCapsuleError("SUCCESSOR_APPROVAL_ATTESTATION_BINDING_MISMATCH")
+
+    competing = [
+        item for item in attestations
+        if item.payload["manifest_sha256"] == capsule.manifest_sha256
+        and item.payload["authority"]["record_id"] == capsule.authority["record_id"]
+        and item.payload["authority"]["body_sha256"] == capsule.authority["body_sha256"]
+        and item.attestation_id != selected.attestation_id
+    ]
+    if competing:
+        raise SuccessorCapsuleError("SUCCESSOR_APPROVAL_ATTESTATION_AMBIGUOUS")
+    return selected
+
+
 def validate_public_subject(
     api: GitHubAPI,
     capsule: SuccessorCapsule,
@@ -148,10 +189,12 @@ def validate_public_subject(
         projected_control_sha=projected_control_sha,
         trusted_sha=trusted_sha,
     )
+    attestation = _require_manifest_approval_attestation(api, capsule)
     validate_capsule_governance(
         capsule,
         preflight_projection.manifest,
         preflight_projection.governance_history,
+        attestation,
     )
     _validate_preflight_evidence(
         api,

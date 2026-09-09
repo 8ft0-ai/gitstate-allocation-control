@@ -79,6 +79,7 @@ class GuardObservation:
     execution_variable: str
     execution_variable_absent: bool
     governance_history: GovernanceHistory
+    manifest_approval_proven: bool = False
     private_freshness_proven: bool = False
 
 
@@ -220,6 +221,8 @@ def _valid_complete_observation(observation: GuardObservation) -> bool:
         return False
     if not isinstance(observation.governance_history, GovernanceHistory):
         return False
+    if type(observation.manifest_approval_proven) is not bool:
+        return False
     if type(observation.private_freshness_proven) is not bool:
         return False
     return True
@@ -246,7 +249,11 @@ def _evaluate_governance(
     if observation.stage != "preflight":
         if state.approval_status == "ambiguous":
             return GuardResult.failure("GOVERNANCE_AMBIGUOUS")
-        if state.approval_status != "approved":
+        if state.approval_status == "approved":
+            pass
+        elif state.approval_status == "absent" and observation.manifest_approval_proven:
+            pass
+        else:
             return GuardResult.failure("AUTHORITY_NOT_GRANTED")
     return None
 
