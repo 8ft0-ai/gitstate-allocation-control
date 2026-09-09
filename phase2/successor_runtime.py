@@ -4,6 +4,7 @@ import json
 import os
 import sys
 from dataclasses import dataclass
+from urllib.parse import quote
 from datetime import datetime, timezone
 from typing import Any, Callable, Mapping
 
@@ -17,6 +18,8 @@ from .credentials import (
     mint_token,
     require_cross_repository_denial,
     require_public_repository_write_denial,
+    require_state_repository_access,
+    state_observation_profile,
     state_profile,
     verify_live_installation,
 )
@@ -32,6 +35,7 @@ from .operator_inventory import (
 from .operator_manifest import (
     SHA40,
     SHA256,
+    canonical_json,
     sha256_text,
     workflow_history_baseline,
 )
@@ -67,6 +71,9 @@ from .successor_contract import (
 
 
 CONTROL_REPOSITORY = projection.CONTROL_REPOSITORY
+STATE_REPOSITORY = live.STATE_REPOSITORY
+STATE_REPOSITORY_REF = live.STATE_REPOSITORY_BASELINE_REF
+GUARD_PROTOCOL_AUTHORITY = live.PROTOCOL_AUTHORITY
 EXECUTION_VARIABLE = "PHASE2_WORKSTREAM_D_EXECUTION_ENABLED"
 FIXTURE_MODE = live.FIXTURE_MODE
 EXECUTABLE_PATH = "phase2/successor_runtime.py"
@@ -74,6 +81,99 @@ EXECUTABLE_PATH = "phase2/successor_runtime.py"
 
 class SuccessorRuntimeError(RuntimeError):
     pass
+
+
+def _environment_policy_material(payload: Mapping[str, Any], expected_name: str) -> Mapping[str, Any]:
+    if payload.get("name") != expected_name:
+        raise SuccessorRuntimeError("ENVIRONMENT_BOUNDARY_CHANGED")
+    rules = payload.get("protection_rules")
+    if not isinstance(rules, list) or any(not isinstance(rule, Mapping) for rule in rules):
+        raise SuccessorRuntimeError("READ_EVIDENCE_AMBIGUOUS")
+    normalised_rules: list[dict[str, Any]] = []
+    for rule in rules:
+        rule_type = rule.get("type")
+        if rule_type == "wait_timer":
+            timer = rule.get("wait_timer")
+            if type(timer) is not int or timer < 0:
+                raise SuccessorRuntimeError("READ_EVIDENCE_AMBIGUOUS")
+            normalised_rules.append({"type": "wait_timer", "wait_timer": timer})
+            continue
+        if rule_type == "required_reviewers":
+            reviewers = rule.get("reviewers")
+            prevent_self_review = rule.get("prevent_self_review")
+            if not isinstance(reviewers, list) or type(prevent_self_review) is not bool:
+                raise SuccessorRuntimeError("READ_EVIDENCE_AMBIGUOUS")
+            normalised_reviewers: list[dict[str, Any]] = []
+            for entry in reviewers:
+                if not isinstance(entry, Mapping):
+                    raise SuccessorRuntimeError("READ_EVIDENCE_AMBIGUOUS")
+                reviewer = entry.get("reviewer")
+                reviewer_type = entry.get("type")
+                if not isinstance(reviewer, Mapping) or not isinstance(reviewer_type, str):
+                    raise SuccessorRuntimeError("READ_EVIDENCE_AMBIGUOUS")
+                reviewer_id = reviewer.get("id")
+                if type(reviewer_id) is not int or reviewer_id <= 0:
+                    raise SuccessorRuntimeError("READ_EVIDENCE_AMBIGUOUS")
+                normalised_reviewers.append({"id": reviewer_id, "type": reviewer_type})
+            normalised_reviewers.sort(key=lambda item: (item["type"], item["id"]))
+            normalised_rules.append(
+                {
+                    "type": "required_reviewers",
+                    "prevent_self_review": prevent_self_review,
+                    "reviewers": normalised_reviewers,
+                }
+            )
+            continue
+        if rule_type == "branch_policy":
+            normalised_rules.append({"type": "branch_policy"})
+            continue
+        raise SuccessorRuntimeError("READ_EVIDENCE_AMBIGUOUS")
+    normalised_rules.sort(key=canonical_json)
+
+    branch_policy = payload.get("deployment_branch_policy")
+    if branch_policy is None:
+        normalised_branch_policy: Mapping[str, Any] | None = None
+    elif isinstance(branch_policy, Mapping):
+        protected = branch_policy.get("protected_branches")
+        custom = branch_policy.get("custom_branch_policies")
+        if type(protected) is not bool or type(custom) is not bool:
+            raise SuccessorRuntimeError("READ_EVIDENCE_AMBIGUOUS")
+        normalised_branch_policy = {
+            "custom_branch_policies": custom,
+            "protected_branches": protected,
+        }
+    else:
+        raise SuccessorRuntimeError("READ_EVIDENCE_AMBIGUOUS")
+    return {
+        "deployment_branch_policy": normalised_branch_policy,
+        "name": expected_name,
+        "protection_rules": normalised_rules,
+    }
+
+
+def environment_policy_sha256(payload: Mapping[str, Any], expected_name: str) -> str:
+    return sha256_text(canonical_json(_environment_policy_material(payload, expected_name)))
+
+
+def state_observation_sha256(
+    *, repository_id: int, ref: str, commit_sha: str, tree_sha: str
+) -> str:
+    if repository_id != STATE_REPOSITORY_ID:
+        raise SuccessorRuntimeError("STATE_REPOSITORY_ID_MISMATCH")
+    if ref != STATE_REPOSITORY_REF:
+        raise SuccessorRuntimeError("STATE_BASELINE_CHANGED")
+    if SHA40.fullmatch(commit_sha) is None or SHA40.fullmatch(tree_sha) is None:
+        raise SuccessorRuntimeError("READ_EVIDENCE_AMBIGUOUS")
+    return sha256_text(
+        canonical_json(
+            {
+                "commit_sha": commit_sha,
+                "ref": ref,
+                "repository_id": repository_id,
+                "tree_sha": tree_sha,
+            }
+        )
+    )
 
 
 @dataclass(frozen=True)
@@ -369,6 +469,7 @@ def _guard_observation(
     api,
     evaluated_at: datetime,
     actual_inventory: InventoryEvidence | None = None,
+    state_observation: tuple[str, str] | None = None,
 ) -> GuardObservation:
     manifest = subject.preflight_projection.manifest
     projected_control_sha = str(manifest.payload["executor"]["commit_sha"])
@@ -378,9 +479,20 @@ def _guard_observation(
         trusted_sha=projected_control_sha,
     )
     bound = subject.preflight_projection.bound_observation
-    owner_observation = projection._parse_owner_observation(
-        dict(bound["owner_observation"])
+    environment_name = str(manifest.payload["environment"]["name"])
+    environment_payload = api.get(
+        f"/repos/{CONTROL_REPOSITORY}/environments/{quote(environment_name, safe='')}"
     )
+    if not isinstance(environment_payload, Mapping):
+        raise SuccessorRuntimeError("READ_EVIDENCE_AMBIGUOUS")
+    environment_digest = environment_policy_sha256(environment_payload, environment_name)
+
+    owner_requirement = manifest.payload["allocator_app"]["owner_observation"]
+    if stage == "live_l2" and owner_requirement["required"] is True:
+        # No conforming retained current owner-observation provider exists in B3.
+        # Fail closed rather than replaying the B2 projection's validity bit.
+        raise SuccessorRuntimeError("READ_EVIDENCE_UNAVAILABLE")
+    owner_observation = None
 
     if actual_inventory is None:
         app_id = int(bound["app_id"])
@@ -407,9 +519,13 @@ def _guard_observation(
         control_tree_sha=tree_sha,
         workflow_blob_sha=workflow_sha,
         module_blobs=tuple(module_blobs),
-        protocol_sha=str(bound["protocol_sha"]),
-        state_commit_sha=str(bound["state_commit_sha"]),
-        state_digest_sha256=str(bound["state_digest_sha256"]),
+        protocol_sha=GUARD_PROTOCOL_AUTHORITY,
+        state_commit_sha=(
+            str(state_observation[0]) if state_observation is not None else str(bound["state_commit_sha"])
+        ),
+        state_digest_sha256=(
+            str(state_observation[1]) if state_observation is not None else str(bound["state_digest_sha256"])
+        ),
         operator_history=manifest.operator_history,
         workflow_history=manifest.workflow_history,
         app_id=app_id,
@@ -418,11 +534,12 @@ def _guard_observation(
         selected_repository_ids=selected_repository_ids,
         permission_profile_sha256=permission_digest,
         owner_observation=owner_observation,
-        environment_name=str(bound["environment_name"]),
-        environment_policy_sha256=str(bound["environment_policy_sha256"]),
+        environment_name=environment_name,
+        environment_policy_sha256=environment_digest,
         execution_variable=str(bound["execution_variable"]),
         execution_variable_absent=values.get(EXECUTION_VARIABLE, "") == "",
         governance_history=subject.governance_history,
+        private_freshness_proven=(stage == "live_l2" and actual_inventory is not None and state_observation is not None),
     )
 
 
@@ -459,6 +576,7 @@ def evaluate_stage(
     api_factory=GitHubAPI,
     now: datetime | None = None,
     actual_inventory: InventoryEvidence | None = None,
+    state_observation: tuple[str, str] | None = None,
 ) -> tuple[SubjectState, GuardResult]:
     if stage not in {"live_l1", "live_l2"}:
         raise SuccessorRuntimeError("SUCCESSOR_STAGE_INVALID")
@@ -478,6 +596,7 @@ def evaluate_stage(
         api=api,
         evaluated_at=evaluated_at,
         actual_inventory=actual_inventory,
+        state_observation=state_observation,
     )
     result = evaluate_guards(subject.preflight_projection.manifest, observation)
     if not result.passed:
@@ -516,6 +635,61 @@ def run_l1(
         "canonical_state_mutated": False,
         "workstream_e_authorised": False,
     }
+
+
+def _observe_state_baseline(
+    app_api,
+    *,
+    installation_id: int,
+    api_url: str,
+    api_factory: Callable[[str, str], GitHubAPI] = GitHubAPI,
+) -> tuple[str, str]:
+    profile = state_observation_profile(STATE_REPOSITORY_ID)
+    token = mint_token(app_api, installation_id, profile)
+    state_api = api_factory(token, api_url)
+    primary_error: Exception | None = None
+    try:
+        require_state_repository_access(
+            token,
+            "8ft0-ai",
+            "gitstate-allocation-state",
+            STATE_REPOSITORY_ID,
+            api_url,
+            api_factory=api_factory,
+        )
+        ref_payload = state_api.get(
+            f"/repos/{STATE_REPOSITORY}/git/ref/heads/main"
+        )
+        obj = ref_payload.get("object") if isinstance(ref_payload, Mapping) else None
+        commit_sha = obj.get("sha") if isinstance(obj, Mapping) else None
+        if not isinstance(commit_sha, str) or SHA40.fullmatch(commit_sha) is None:
+            raise SuccessorRuntimeError("READ_EVIDENCE_AMBIGUOUS")
+        commit_payload = state_api.get(
+            f"/repos/{STATE_REPOSITORY}/git/commits/{commit_sha}"
+        )
+        tree = commit_payload.get("tree") if isinstance(commit_payload, Mapping) else None
+        tree_sha = tree.get("sha") if isinstance(tree, Mapping) else None
+        if not isinstance(tree_sha, str) or SHA40.fullmatch(tree_sha) is None:
+            raise SuccessorRuntimeError("READ_EVIDENCE_AMBIGUOUS")
+        digest = state_observation_sha256(
+            repository_id=STATE_REPOSITORY_ID,
+            ref=STATE_REPOSITORY_REF,
+            commit_sha=commit_sha,
+            tree_sha=tree_sha,
+        )
+        return commit_sha, digest
+    except Exception as exc:
+        primary_error = exc
+        raise
+    finally:
+        try:
+            _, _, status = state_api.request_with_status("DELETE", "/installation/token")
+            if status != 204:
+                raise SuccessorRuntimeError("STATE_OBSERVATION_TOKEN_REVOCATION_FAILED")
+        except Exception as revoke_exc:
+            if primary_error is None:
+                raise SuccessorRuntimeError("STATE_OBSERVATION_TOKEN_REVOCATION_FAILED") from revoke_exc
+            raise SuccessorRuntimeError("STATE_OBSERVATION_TOKEN_REVOCATION_FAILED") from revoke_exc
 
 
 def _mutation_credentials(
@@ -577,6 +751,12 @@ def _mutation_credentials(
         api_url=api_url,
         api_factory=api_factory,
     )
+    state_observation = _observe_state_baseline(
+        app_api,
+        installation_id=installation_id,
+        api_url=api_url,
+        api_factory=api_factory,
+    )
     jwt = ""
 
     subject, _ = evaluate_stage(
@@ -585,6 +765,7 @@ def _mutation_credentials(
         stage="live_l2",
         api_factory=api_factory,
         actual_inventory=inventory,
+        state_observation=state_observation,
     )
     if (
         subject.preflight_projection.manifest.sha256

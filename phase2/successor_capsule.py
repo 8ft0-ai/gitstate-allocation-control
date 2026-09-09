@@ -8,7 +8,14 @@ from typing import Any, Mapping
 
 from .github_api import GitHubAPI, GitHubAPIError
 from .operator_capsule import LIVE_PROFILE, OPERATOR_ISSUE_NUMBER
-from .operator_manifest import OPAQUE_ID, SHA256, canonical_json, sha256_text
+from .operator_manifest import (
+    OPAQUE_ID,
+    SHA256,
+    V1_CAPSULE_CONTRACT,
+    V1_CONSUMPTION_CONTRACT,
+    canonical_json,
+    sha256_text,
+)
 from .preflight_carrier_ledger import validate_carrier_ledger
 from .preflight_control_anchor import validate_ledger_only_control_descendant
 from . import preflight_projection as projection
@@ -22,6 +29,7 @@ from .successor_contract import (
     SuccessorContractError,
     parse_capsule_comment,
     parse_consumption_comment,
+    operator_history_baseline,
     parse_operator_history,
     validate_capsule_governance,
 )
@@ -150,6 +158,54 @@ def validate_public_subject(
     return preflight_projection
 
 
+def _open_operator_capsules(comments: list[Mapping[str, Any]]):
+    try:
+        records = parse_operator_history(comments, require_closed=False)
+    except SuccessorContractError as exc:
+        raise SuccessorCapsuleError(str(exc)) from exc
+    consumption_kinds = {V1_CONSUMPTION_CONTRACT, CONSUMPTION_CONTRACT}
+    capsule_kinds = {V1_CAPSULE_CONTRACT, "gitstate-operator/v2"}
+    consumed = {
+        record.capsule_id for record in records if record.record_kind in consumption_kinds
+    }
+    return tuple(
+        record
+        for record in records
+        if record.record_kind in capsule_kinds and record.capsule_id not in consumed
+    )
+
+
+def _require_preconsumption_history(
+    comments: list[Mapping[str, Any]],
+    capsule: SuccessorCapsule,
+    manifest,
+) -> None:
+    try:
+        records = parse_operator_history(comments, require_closed=False)
+    except SuccessorContractError as exc:
+        raise SuccessorCapsuleError(str(exc)) from exc
+    baseline = manifest.operator_history
+    prefix = tuple(record for record in records if record.comment_id <= baseline.through_id)
+    if operator_history_baseline(prefix) != baseline:
+        raise SuccessorCapsuleError("OPERATOR_HISTORY_CHANGED")
+    suffix = tuple(record for record in records if record.comment_id > baseline.through_id)
+    if (
+        len(suffix) != 1
+        or suffix[0].record_kind != "gitstate-operator/v2"
+        or suffix[0].comment_id != capsule.comment_id
+        or suffix[0].capsule_id != capsule.capsule_id
+        or suffix[0].body_sha256 != capsule.body_sha256
+        or suffix[0].manifest_sha256 != capsule.manifest_sha256
+    ):
+        raise SuccessorCapsuleError("OPERATOR_HISTORY_PRECONSUMPTION_INVALID")
+
+
+def _require_current_preconsumption_history(
+    api: GitHubAPI, capsule: SuccessorCapsule, manifest
+) -> None:
+    _require_preconsumption_history(_list_operator_comments(api), capsule, manifest)
+
+
 def discover_capsule(
     api: GitHubAPI,
     *,
@@ -170,10 +226,7 @@ def discover_capsule(
     # Historical operator records are immutable evidence. Validate the complete
     # mixed V1/V2 history against each record's own bound identities before
     # applying current-run eligibility to any unconsumed V2 capsule.
-    try:
-        parse_operator_history(comments, require_closed=False)
-    except SuccessorContractError as exc:
-        raise SuccessorCapsuleError(str(exc)) from exc
+    open_capsules = _open_operator_capsules(comments)
 
     consumptions: list[SuccessorConsumption] = []
     candidates: list[SuccessorCapsule] = []
@@ -231,9 +284,12 @@ def discover_capsule(
             "SUCCESSOR_CAPSULE_NOT_FOUND" if not eligible else "SUCCESSOR_CAPSULE_AMBIGUOUS"
         )
     capsule = eligible[0]
-    validate_public_subject(
+    if len(open_capsules) != 1 or open_capsules[0].capsule_id != capsule.capsule_id:
+        raise SuccessorCapsuleError("OPERATOR_HISTORY_OPEN_SET_INVALID")
+    preflight_projection = validate_public_subject(
         api, capsule, trusted_sha=expected_control_sha, current_run_id=run_id
     )
+    _require_preconsumption_history(comments, capsule, preflight_projection.manifest)
     return capsule
 
 
@@ -265,11 +321,15 @@ def consume_capsule(
     if capsule.comment_id != expected_capsule_comment_id:
         raise SuccessorCapsuleError("SUCCESSOR_CAPSULE_CHANGED_BEFORE_CONSUMPTION")
 
-    validate_public_subject(
+    preflight_projection = validate_public_subject(
         api,
         capsule,
         trusted_sha=expected_control_sha,
         current_run_id=run_id,
+    )
+
+    _require_current_preconsumption_history(
+        api, capsule, preflight_projection.manifest
     )
 
     payload = {

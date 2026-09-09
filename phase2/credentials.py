@@ -64,13 +64,22 @@ def state_profile(repository_id: int) -> TokenProfile:
     return TokenProfile("state", repository_id, {"contents": "write", "metadata": "read"})
 
 
+def state_observation_profile(repository_id: int) -> TokenProfile:
+    return TokenProfile("state-observation", repository_id, {"contents": "read", "metadata": "read"})
+
+
 def token_request(profile: TokenProfile) -> dict[str, Any]:
     if not isinstance(profile.repository_id, int) or profile.repository_id <= 0:
         raise CredentialPolicyError("INVALID_REPOSITORY_SCOPE")
-    allowed = {"control", "state"}
+    allowed = {"control", "state", "state-observation"}
     if profile.name not in allowed:
         raise CredentialPolicyError("UNAPPROVED_TOKEN_PROFILE")
-    expected = control_profile(profile.repository_id) if profile.name == "control" else state_profile(profile.repository_id)
+    if profile.name == "control":
+        expected = control_profile(profile.repository_id)
+    elif profile.name == "state":
+        expected = state_profile(profile.repository_id)
+    else:
+        expected = state_observation_profile(profile.repository_id)
     if profile.permissions != expected.permissions:
         raise CredentialPolicyError("UNAPPROVED_TOKEN_PERMISSIONS")
     return {"repository_ids": [profile.repository_id], "permissions": dict(profile.permissions)}

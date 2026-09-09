@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping, Sequence
 
-from .credentials import control_profile, state_profile
+from .credentials import control_profile, state_observation_profile, state_profile
 from .governance_state import (
     GovernanceHistory,
     GovernanceStateError,
@@ -745,6 +745,10 @@ def permission_profile_sha256() -> str:
         "control": {
             "repository_id": CONTROL_REPOSITORY_ID,
             "permissions": dict(control.permissions),
+        },
+        "state_observation": {
+            "repository_id": STATE_REPOSITORY_ID,
+            "permissions": dict(state_observation_profile(STATE_REPOSITORY_ID).permissions),
         },
         "state": {
             "repository_id": STATE_REPOSITORY_ID,

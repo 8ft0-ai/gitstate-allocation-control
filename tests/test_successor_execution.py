@@ -172,7 +172,13 @@ class SuccessorExecutionTests(unittest.TestCase):
             "updated_at": "2026-09-07T10:01:00Z",
         }
 
-        with patch.object(capsule_runtime, "validate_public_subject"):
+        historical_records = parse_operator_history([old, old_consumption], require_closed=True)
+        projection = SimpleNamespace(
+            manifest=SimpleNamespace(
+                operator_history=capsule_runtime.operator_history_baseline(historical_records)
+            )
+        )
+        with patch.object(capsule_runtime, "validate_public_subject", return_value=projection):
             observed = capsule_runtime.discover_capsule(
                 CommentOnlyAPI([old, old_consumption, current]),
                 expected_control_sha=current_control,
@@ -297,6 +303,7 @@ class SuccessorExecutionTests(unittest.TestCase):
         with patch.object(runtime, "evaluate_stage", side_effect=evaluate), patch.object(runtime, "load_policy", return_value=policy), \
              patch.object(runtime, "verify_live_installation", return_value={"repository_selection":"selected"}), \
              patch.object(runtime, "prove_installation_inventory", side_effect=prove), patch.object(runtime, "mint_token", side_effect=mint), \
+             patch.object(runtime, "_observe_state_baseline", side_effect=lambda *a, **k: events.append("state-observed-revoked") or ("4" * 40, "5" * 64)), \
              patch.object(runtime, "require_cross_repository_denial"), patch.object(runtime, "require_public_repository_write_denial"):
             lease, observed = runtime._mutation_credentials(
                 values, context, legacy, private_key="fixture-key",
@@ -304,8 +311,8 @@ class SuccessorExecutionTests(unittest.TestCase):
                 jwt_factory=lambda app_id, key: events.append("private-key-used") or "jwt",
             )
         self.assertIs(observed, inventory)
-        self.assertEqual(events[:5], ["live_l1", "legacy-context-valid", "private-key-used", "inventory-proved-revoked", "live_l2"])
-        self.assertEqual(events[5:], ["mint-control", "mint-state"])
+        self.assertEqual(events[:6], ["live_l1", "legacy-context-valid", "private-key-used", "inventory-proved-revoked", "state-observed-revoked", "live_l2"])
+        self.assertEqual(events[6:], ["mint-control", "mint-state"])
         self.assertEqual(lease.control_token, "control-token")
 
 
@@ -356,7 +363,7 @@ class SuccessorExecutionTests(unittest.TestCase):
                   "state_repository_id_env":"PHASE2_STATE_REPOSITORY_ID"}
         with patch.object(runtime, "evaluate_stage", side_effect=evaluate), patch.object(runtime, "load_policy", return_value=policy), \
              patch.object(runtime, "verify_live_installation", return_value={"repository_selection":"selected"}), \
-             patch.object(runtime, "prove_installation_inventory", side_effect=prove), patch.object(runtime, "mint_token", side_effect=mint):
+             patch.object(runtime, "prove_installation_inventory", side_effect=prove), patch.object(runtime, "_observe_state_baseline", side_effect=lambda *a, **k: events.append("state-observed-revoked") or ("4" * 40, "5" * 64)), patch.object(runtime, "mint_token", side_effect=mint):
             with self.assertRaisesRegex(runtime.SuccessorRuntimeError, "GOVERNANCE_SUPERSEDED"):
                 runtime._mutation_credentials(
                     values, context, legacy, private_key="fixture-key",
@@ -364,7 +371,7 @@ class SuccessorExecutionTests(unittest.TestCase):
                     jwt_factory=lambda app_id, key: "jwt",
                 )
         self.assertNotIn("MUTATION-TOKEN-MINTED", events)
-        self.assertEqual(events[-2:], ["inventory-proved-revoked", "live_l2"])
+        self.assertEqual(events[-3:], ["inventory-proved-revoked", "state-observed-revoked", "live_l2"])
 
     def test_workflow_activates_successor_only_after_capability_denied_l1(self):
         workflow = Path(".github/workflows/phase2-adversarial.yml").read_text()

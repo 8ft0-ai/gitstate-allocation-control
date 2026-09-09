@@ -8,6 +8,7 @@ from phase2.credentials import (
     control_profile,
     require_cross_repository_denial,
     require_public_repository_write_denial,
+    state_observation_profile,
     state_profile,
     token_request,
     validate_token_response,
@@ -54,6 +55,13 @@ class CredentialsInventoryTests(unittest.TestCase):
                 "permissions": {"contents": "write", "metadata": "read"},
             },
         )
+        self.assertEqual(
+            token_request(state_observation_profile(2002)),
+            {
+                "repository_ids": [2002],
+                "permissions": {"contents": "read", "metadata": "read"},
+            },
+        )
 
     def test_unapproved_profiles_fail_before_mint(self):
         profiles = [
@@ -61,6 +69,7 @@ class CredentialsInventoryTests(unittest.TestCase):
             TokenProfile("control", 0, {"contents": "read", "issues": "write", "metadata": "read"}),
             TokenProfile("control", 1001, {"contents": "write", "issues": "write", "metadata": "read"}),
             TokenProfile("state", 2002, {"contents": "write", "issues": "write", "metadata": "read"}),
+            TokenProfile("state-observation", 2002, {"contents": "write", "metadata": "read"}),
         ]
         for profile in profiles:
             with self.subTest(profile=profile):
