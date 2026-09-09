@@ -7,11 +7,17 @@ from datetime import datetime, timezone
 from typing import Callable, Mapping
 
 from . import preflight_runtime_legacy as _legacy
+from .operator_guard import GuardObservation
 from .preflight_carrier_ledger import (
     _require_current_protected_main,
     validate_carrier_ledger,
 )
 from .preflight_control_anchor import validate_ledger_only_control_descendant
+from .successor_contract import (
+    SuccessorContractError,
+    operator_history_baseline,
+    parse_operator_history,
+)
 
 # Re-export the exact reviewed implementation surface so existing callers and
 # regressions retain their established imports while this wrapper adds only the
@@ -25,6 +31,23 @@ def _carrier_ledger_required(api: object) -> bool:
     return type(api) is GitHubAPI or getattr(
         api, "carrier_ledger_production_test_double", False
     ) is True
+
+
+def _with_combined_operator_history(
+    observation: GuardObservation,
+    api,
+) -> GuardObservation:
+    comments = projection._list_issue_comments(
+        api, projection.OPERATOR_HISTORY_ISSUE_NUMBER
+    )
+    try:
+        records = parse_operator_history(comments, require_closed=True)
+        baseline = operator_history_baseline(records)
+    except SuccessorContractError as exc:
+        raise PreflightRuntimeError("OPERATOR_HISTORY_CHANGED") from exc
+    values = dict(observation.__dict__)
+    values["operator_history"] = baseline
+    return GuardObservation(**values)
 
 
 def run_preflight(
@@ -122,6 +145,7 @@ def run_preflight(
         evaluated_at=evaluated_at,
         execution_variable_absent=execution_variable_absent,
     )
+    observation = _with_combined_operator_history(observation, api)
     result = evaluate_guards(preflight_projection.manifest, observation)
 
     # A positive B2 result is valid only at a point where the durable ledger

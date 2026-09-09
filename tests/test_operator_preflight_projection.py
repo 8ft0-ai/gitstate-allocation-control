@@ -602,7 +602,7 @@ class PreflightProjectionTests(unittest.TestCase):
         self.assertNotIn("GITSTATE_PREFLIGHT_PASS", runtime_source)
         self.assertNotIn('"guard_passed"', runtime_source)
 
-    def test_workflow_preflight_route_is_capability_denied_and_live_v1_path_is_preserved(self):
+    def test_workflow_preflight_route_is_capability_denied_and_successor_live_path_is_separate(self):
         workflow = Path(".github/workflows/phase2-adversarial.yml").read_text(encoding="utf-8")
         preflight_job = workflow.split("\n  operator-preflight:\n", 1)[1]
         self.assertIn("needs: [contract-check]", preflight_job)
@@ -630,10 +630,13 @@ class PreflightProjectionTests(unittest.TestCase):
         capsule_prefix = workflow.split("\n  live-scenario-suite:\n", 1)[0]
         self.assertEqual(
             capsule_prefix.count("if: ${{ inputs.operation == 'live_scenario_suite' }}"),
-            2,
+            3,
         )
-        self.assertIn("PYTHONPATH=. python3 -m phase2.operator_capsule discover", capsule_prefix)
-        self.assertIn("PYTHONPATH=. python3 -m phase2.operator_capsule consume", capsule_prefix)
+        self.assertIn("PYTHONPATH=. python3 -m phase2.successor_capsule discover", capsule_prefix)
+        self.assertIn("PYTHONPATH=. python3 -m phase2.successor_capsule consume", capsule_prefix)
+        self.assertIn("PYTHONPATH=. python3 -m phase2.successor_runtime l1", capsule_prefix)
+        self.assertNotIn("phase2.operator_capsule discover", capsule_prefix)
+        self.assertNotIn("phase2.operator_capsule consume", capsule_prefix)
         self.assertEqual(workflow.count("${{ secrets.PHASE2_ALLOCATOR_APP_PRIVATE_KEY }}"), 1)
 
 

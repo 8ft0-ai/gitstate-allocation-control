@@ -714,6 +714,7 @@ class OperatorHistoryRecord:
     capsule_body_sha256: str | None = None
     run_id: int | None = None
     run_attempt: int | None = None
+    manifest_sha256: str | None = None
 
 
 def _v1_comment_identity(comment: Mapping[str, Any]) -> tuple[int, str, str]:

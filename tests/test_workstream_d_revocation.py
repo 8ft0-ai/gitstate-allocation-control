@@ -207,18 +207,16 @@ class WorkstreamDRevocationRemediationTests(unittest.TestCase):
         finally:
             live.LIVE_EXECUTABLE_PATHS = original
 
-    def test_workflow_routes_only_live_execution_to_revocation_wrapper(self):
+    def test_workflow_routes_live_execution_through_successor_wrapper(self):
         workflow = Path(".github/workflows/phase2-adversarial.yml").read_text(
             encoding="utf-8"
         )
         self.assertIn(
-            'PYTHONPATH=. "$RUNTIME_PYTHON" -m phase2.workstream_d_revocation',
+            '-m phase2.successor_runtime live',
             workflow,
         )
-        self.assertIn(
-            "from phase2.workstream_d_live import context_from_environment",
-            workflow,
-        )
+        successor_source = Path("phase2/successor_runtime.py").read_text(encoding="utf-8")
+        self.assertIn("revocation.execute_live_suite", successor_source)
         self.assertNotIn(
             'PYTHONPATH=. "$RUNTIME_PYTHON" -m phase2.workstream_d_live\n',
             workflow,

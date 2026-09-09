@@ -244,13 +244,16 @@ class OperatorRuntimeTests(unittest.TestCase):
         self.assertEqual(payload["reason_code"], "OPERATOR_TEST_FAILURE")
         self.assertNotIn("failure_phase", payload)
 
-    def test_workflow_has_projected_preflight_and_preserves_one_live_operator_entry(self):
+    def test_workflow_has_projected_preflight_and_successor_live_operator_entry(self):
         workflow = Path(".github/workflows/phase2-adversarial.yml").read_text(encoding="utf-8")
         self.assertIn("operator_preflight", workflow)
         self.assertIn("PYTHONPATH=. python3 -m phase2.preflight_runtime preflight", workflow)
-        self.assertIn("PYTHONPATH=. python3 -m phase2.operator_capsule discover", workflow)
-        self.assertIn("PYTHONPATH=. python3 -m phase2.operator_capsule consume", workflow)
-        self.assertIn('PYTHONPATH=. "$RUNTIME_PYTHON" -m phase2.operator_runtime live', workflow)
+        self.assertIn("PYTHONPATH=. python3 -m phase2.successor_capsule discover", workflow)
+        self.assertIn("PYTHONPATH=. python3 -m phase2.successor_capsule consume", workflow)
+        self.assertIn("PYTHONPATH=. python3 -m phase2.successor_runtime l1", workflow)
+        self.assertIn('-m phase2.successor_runtime live', workflow)
+        self.assertNotIn("phase2.operator_capsule discover", workflow)
+        self.assertNotIn("phase2.operator_capsule consume", workflow)
         self.assertNotIn("expected_control_sha:\n", workflow)
         self.assertNotIn("expected_protocol_sha:\n", workflow)
         self.assertNotIn("attempt_nonce:\n", workflow)

@@ -1,0 +1,1399 @@
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import phase2.successor_capsule as capsule_runtime
+import phase2.successor_runtime as runtime
+from phase2.credentials import CredentialPolicyError
+
+
+CONTROL_SHA = "a" * 40
+CAPSULE_ID = "b" * 32
+CAPSULE_BODY_SHA256 = "c" * 64
+MANIFEST_SHA256 = "d" * 64
+
+
+def workflow_values() -> dict[str, str]:
+    return {
+        "GITHUB_REPOSITORY": capsule_runtime.CONTROL_REPOSITORY,
+        "GITHUB_REF": "refs/heads/main",
+        "GITHUB_SHA": CONTROL_SHA,
+        "GITHUB_RUN_ID": "9001",
+        "GITHUB_RUN_ATTEMPT": "1",
+        "INPUT_OPERATION": "live_scenario_suite",
+        "GITHUB_TOKEN": "read-only-fixture-token",
+        "EXPECTED_SUCCESSOR_CAPSULE_ID": CAPSULE_ID,
+        "EXPECTED_SUCCESSOR_CAPSULE_BODY_SHA256": CAPSULE_BODY_SHA256,
+        "EXPECTED_SUCCESSOR_MANIFEST_SHA256": MANIFEST_SHA256,
+        "EXPECTED_SUCCESSOR_CAPSULE_COMMENT_ID": "8001",
+    }
+
+
+class GuardedEnvironment(dict):
+    def __init__(self, *args, events: list[str], **kwargs):
+        super().__init__(*args, **kwargs)
+        self.events = events
+
+    def __getitem__(self, key):
+        if key == "PHASE2_ALLOCATOR_APP_PRIVATE_KEY":
+            self.events.append("private-key-read")
+        return super().__getitem__(key)
+
+
+class SuccessorRemediationTests(unittest.TestCase):
+    def test_discovery_requires_all_exact_bindings_before_api_access(self):
+        required = (
+            "EXPECTED_SUCCESSOR_CAPSULE_ID",
+            "EXPECTED_SUCCESSOR_CAPSULE_BODY_SHA256",
+            "EXPECTED_SUCCESSOR_MANIFEST_SHA256",
+        )
+        for missing in required:
+            with self.subTest(missing=missing):
+                values = workflow_values()
+                values[missing] = ""
+                with patch.object(capsule_runtime, "_api_from_environment") as api:
+                    with self.assertRaisesRegex(
+                        capsule_runtime.SuccessorCapsuleError,
+                        "SUCCESSOR_DISPATCH_BINDING_REQUIRED",
+                    ):
+                        capsule_runtime.command_discover(values)
+                api.assert_not_called()
+
+    def test_discovery_rejects_malformed_bindings_before_api_access(self):
+        cases = (
+            ("EXPECTED_SUCCESSOR_CAPSULE_ID", "not-an-id", "EXPECTED_SUCCESSOR_CAPSULE_ID_INVALID"),
+            ("EXPECTED_SUCCESSOR_CAPSULE_BODY_SHA256", "f" * 63, "EXPECTED_SUCCESSOR_CAPSULE_DIGEST_INVALID"),
+            ("EXPECTED_SUCCESSOR_MANIFEST_SHA256", "g" * 64, "EXPECTED_SUCCESSOR_MANIFEST_DIGEST_INVALID"),
+        )
+        for key, value, reason in cases:
+            with self.subTest(key=key):
+                values = workflow_values()
+                values[key] = value
+                with patch.object(capsule_runtime, "_api_from_environment") as api:
+                    with self.assertRaisesRegex(
+                        capsule_runtime.SuccessorCapsuleError,
+                        reason,
+                    ):
+                        capsule_runtime.command_discover(values)
+                api.assert_not_called()
+
+    def test_consumption_revalidates_bindings_before_api_or_issue_write_path(self):
+        values = workflow_values()
+        values["EXPECTED_SUCCESSOR_MANIFEST_SHA256"] = ""
+        with patch.object(capsule_runtime, "_api_from_environment") as api, patch.object(
+            capsule_runtime, "consume_capsule"
+        ) as consume:
+            with self.assertRaisesRegex(
+                capsule_runtime.SuccessorCapsuleError,
+                "SUCCESSOR_DISPATCH_BINDING_REQUIRED",
+            ):
+                capsule_runtime.command_consume(values)
+        api.assert_not_called()
+        consume.assert_not_called()
+
+    def test_exact_binding_validator_preserves_valid_live_identity(self):
+        values = workflow_values()
+        self.assertEqual(
+            capsule_runtime._require_live_dispatch_bindings(values),
+            (CAPSULE_ID, CAPSULE_BODY_SHA256, MANIFEST_SHA256),
+        )
+
+    def test_successor_l1_and_l2_receive_external_enablement_observation(self):
+        workflow = Path(".github/workflows/phase2-adversarial.yml").read_text()
+        l1 = workflow.split("  successor-live-l1:", 1)[1].split(
+            "  live-scenario-suite:", 1
+        )[0]
+        live = workflow.split("  live-scenario-suite:", 1)[1].split(
+            "  operator-preflight:", 1
+        )[0]
+        binding = (
+            "PHASE2_WORKSTREAM_D_EXECUTION_ENABLED: "
+            "${{ vars.PHASE2_WORKSTREAM_D_EXECUTION_ENABLED }}"
+        )
+        self.assertIn(binding, l1)
+        self.assertIn(binding, live)
+        self.assertEqual(workflow.count(binding), 3)
+
+    def test_nonempty_external_enablement_blocks_before_explicit_key_read(self):
+        events: list[str] = []
+        values = GuardedEnvironment(
+            {
+                "GITHUB_REPOSITORY": runtime.CONTROL_REPOSITORY,
+                "GITHUB_REF": "refs/heads/main",
+                "GITHUB_SHA": CONTROL_SHA,
+                "GITHUB_RUN_ID": "9001",
+                "GITHUB_RUN_ATTEMPT": "1",
+                "OPERATION_PROFILE": runtime.LIVE_PROFILE,
+                "CAPSULE_ID": CAPSULE_ID,
+                "CAPSULE_COMMENT_ID": "8001",
+                "CAPSULE_BODY_SHA256": CAPSULE_BODY_SHA256,
+                "CONSUMPTION_COMMENT_ID": "8002",
+                "CONSUMPTION_BODY_SHA256": "e" * 64,
+                "MANIFEST_SHA256": MANIFEST_SHA256,
+                "PROJECTION_COMMENT_ID": "7001",
+                "PROJECTION_BODY_SHA256": "f" * 64,
+                "ATTEMPT_NONCE": runtime.sha256_text(
+                    f"9001:1:{CAPSULE_ID}:{CAPSULE_BODY_SHA256}"
+                )[:16],
+                "PHASE2_WORKSTREAM_D_EXECUTION_ENABLED": "true",
+                "PHASE2_ALLOCATOR_APP_PRIVATE_KEY": "fixture-key",
+            },
+            events=events,
+        )
+        with patch.object(
+            runtime,
+            "evaluate_stage",
+            side_effect=runtime.SuccessorRuntimeError("EXECUTION_ENABLEMENT_CHANGED"),
+        ), patch.object(runtime.revocation, "execute_live_suite") as legacy:
+            with self.assertRaisesRegex(
+                runtime.SuccessorRuntimeError,
+                "EXECUTION_ENABLEMENT_CHANGED",
+            ):
+                runtime.execute_live(values)
+        self.assertNotIn("private-key-read", events)
+        legacy.assert_not_called()
+
+    def test_existing_history_and_key_regressions_remain_in_successor_suite(self):
+        existing = Path("tests/test_successor_execution.py").read_text()
+        self.assertIn("test_consumed_old_control_v2_does_not_block_current_successor", existing)
+        self.assertIn("test_v2_consumption_manifest_must_match_capsule", existing)
+        self.assertIn("test_execute_live_scrubs_allocator_key_before_legacy_stack", existing)
+        self.assertIn("test_subprocess_environments_never_inherit_allocator_private_key", existing)
+
+
+class SuccessorFreshnessAndOpenHistoryTests(unittest.TestCase):
+    @staticmethod
+    def _approved_live_state():
+        from tests.test_operator_guard import (
+            APPROVAL_ID,
+            AUTHORITY_ID,
+            binding,
+            governance_comment,
+            governance_payload,
+            make_state,
+            manifest_subject,
+            parsed_records,
+            with_records,
+        )
+
+        _, _, authority, manifest, comments, observation = make_state()
+        approved = governance_comment(
+            104,
+            governance_payload(
+                "manifest_approval",
+                APPROVAL_ID,
+                manifest_subject(
+                    manifest.sha256,
+                    record_ids=(AUTHORITY_ID,),
+                    comment_bindings=(binding(authority),),
+                ),
+                {"disposition": "approved"},
+            ),
+        )
+        records = parsed_records(comments + [approved])
+        return manifest, with_records(
+            observation, manifest, records, stage="live_l1"
+        )
+
+    def test_live_l2_requires_private_freshness_and_detects_state_or_environment_movement(self):
+        from tests.test_operator_guard import with_observation
+        from phase2.operator_guard import evaluate_guards
+
+        manifest, observation = self._approved_live_state()
+        l2_missing = with_observation(
+            observation,
+            stage="live_l2",
+            private_freshness_proven=False,
+        )
+        self.assertEqual(evaluate_guards(manifest, l2_missing).code, "READ_EVIDENCE_UNAVAILABLE")
+
+        l2_state_moved = with_observation(
+            observation,
+            stage="live_l2",
+            private_freshness_proven=True,
+            state_commit_sha="9" * 40,
+        )
+        self.assertEqual(evaluate_guards(manifest, l2_state_moved).code, "STATE_BASELINE_CHANGED")
+
+        l2_environment_moved = with_observation(
+            observation,
+            stage="live_l2",
+            private_freshness_proven=True,
+            environment_policy_sha256="9" * 64,
+        )
+        self.assertEqual(
+            evaluate_guards(manifest, l2_environment_moved).code,
+            "ENVIRONMENT_BOUNDARY_CHANGED",
+        )
+
+    def test_live_l1_does_not_claim_private_state_or_app_freshness(self):
+        from tests.test_operator_guard import with_observation
+        from phase2.operator_guard import evaluate_guards
+
+        manifest, observation = self._approved_live_state()
+        l1 = with_observation(
+            observation,
+            stage="live_l1",
+            private_freshness_proven=False,
+            state_commit_sha="9" * 40,
+            state_digest_sha256="8" * 64,
+            app_id=999,
+            installation_id=998,
+            selected_repository_ids=(997,),
+            permission_profile_sha256="7" * 64,
+        )
+        self.assertTrue(evaluate_guards(manifest, l1).passed)
+
+    def test_environment_policy_digest_is_current_canonical_material(self):
+        payload = {
+            "name": "phase-2-allocator",
+            "protection_rules": [
+                {
+                    "type": "required_reviewers",
+                    "prevent_self_review": False,
+                    "reviewers": [
+                        {"type": "User", "reviewer": {"id": 20, "login": "b"}},
+                        {"type": "User", "reviewer": {"id": 10, "login": "a"}},
+                    ],
+                },
+                {"type": "wait_timer", "wait_timer": 0},
+            ],
+            "deployment_branch_policy": {
+                "protected_branches": True,
+                "custom_branch_policies": False,
+            },
+        }
+        first = runtime.environment_policy_sha256(payload, "phase-2-allocator")
+        reordered = dict(payload)
+        reordered["protection_rules"] = list(reversed(payload["protection_rules"]))
+        self.assertEqual(
+            first,
+            runtime.environment_policy_sha256(reordered, "phase-2-allocator"),
+        )
+        moved = dict(payload)
+        moved["deployment_branch_policy"] = {
+            "protected_branches": False,
+            "custom_branch_policies": True,
+        }
+        self.assertNotEqual(
+            first,
+            runtime.environment_policy_sha256(moved, "phase-2-allocator"),
+        )
+        reviewer_moved = dict(payload)
+        reviewer_rule = dict(payload["protection_rules"][0])
+        reviewer_rule["prevent_self_review"] = True
+        reviewer_moved["protection_rules"] = [
+            reviewer_rule,
+            payload["protection_rules"][1],
+        ]
+        self.assertNotEqual(
+            first,
+            runtime.environment_policy_sha256(
+                reviewer_moved, "phase-2-allocator"
+            ),
+        )
+
+    def test_state_observation_token_is_read_only_and_revoked_before_return(self):
+        from phase2.operator_inventory import STATE_REPOSITORY_ID
+
+        events: list[str] = []
+        profile = runtime.state_observation_profile(STATE_REPOSITORY_ID)
+
+        class AppAPI:
+            def post(self, path, payload):
+                events.append("mint-state-observation")
+                self.request = payload
+                return {
+                    "token": "read-only-state-token",
+                    "repositories": [{"id": STATE_REPOSITORY_ID}],
+                    "permissions": dict(profile.permissions),
+                }
+
+        class StateAPI:
+            def get(self, path):
+                events.append(f"get:{path}")
+                if path == f"/repos/{runtime.STATE_REPOSITORY}/git/ref/heads/main":
+                    return {"object": {"sha": "4" * 40}}
+                if path == f"/repos/{runtime.STATE_REPOSITORY}/git/commits/{'4' * 40}":
+                    return {"tree": {"sha": "5" * 40}}
+                if path == f"/repos/8ft0-ai/gitstate-allocation-state":
+                    return {"id": STATE_REPOSITORY_ID, "full_name": "8ft0-ai/gitstate-allocation-state"}
+                raise AssertionError(path)
+
+            def request_with_status(self, method, path):
+                events.append(f"{method}:{path}")
+                return None, {}, 204
+
+        app_api = AppAPI()
+        state_api = StateAPI()
+        commit, digest = runtime._observe_state_baseline(
+            app_api,
+            installation_id=20,
+            api_url="https://api.invalid",
+            api_factory=lambda token, url: state_api,
+        )
+        self.assertEqual(
+            app_api.request,
+            {
+                "repository_ids": [STATE_REPOSITORY_ID],
+                "permissions": {"contents": "read", "metadata": "read"},
+            },
+        )
+        self.assertEqual(commit, "4" * 40)
+        self.assertEqual(events[-1], "DELETE:/installation/token")
+        self.assertEqual(
+            digest,
+            runtime.state_observation_sha256(
+                repository_id=STATE_REPOSITORY_ID,
+                ref=runtime.STATE_REPOSITORY_REF,
+                commit_sha="4" * 40,
+                tree_sha="5" * 40,
+            ),
+        )
+
+    def test_state_observation_scope_failure_still_revokes(self):
+        from phase2.operator_inventory import STATE_REPOSITORY_ID
+
+        events: list[str] = []
+        profile = runtime.state_observation_profile(STATE_REPOSITORY_ID)
+
+        class AppAPI:
+            def post(self, path, payload):
+                return {
+                    "token": "issued-token",
+                    "repositories": [{"id": STATE_REPOSITORY_ID}, {"id": 999999}],
+                    "permissions": dict(profile.permissions),
+                }
+
+        class RevokeAPI:
+            def request_with_status(self, method, path):
+                events.append(f"{method}:{path}")
+                return None, {}, 204
+
+        with self.assertRaises(CredentialPolicyError):
+            runtime._observe_state_baseline(
+                AppAPI(),
+                installation_id=20,
+                api_url="https://api.invalid",
+                api_factory=lambda token, url: RevokeAPI(),
+            )
+        self.assertEqual(events, ["DELETE:/installation/token"])
+
+    def test_state_observation_wrong_or_malformed_scope_still_revokes(self):
+        from phase2.operator_inventory import STATE_REPOSITORY_ID
+
+        profile = runtime.state_observation_profile(STATE_REPOSITORY_ID)
+        cases = (
+            {
+                "token": "issued-token",
+                "repositories": [{"id": 999999}],
+                "permissions": dict(profile.permissions),
+            },
+            {
+                "token": "issued-token",
+                "repositories": "not-a-list",
+                "permissions": dict(profile.permissions),
+            },
+            {
+                "token": "issued-token",
+                "repositories": [{"id": STATE_REPOSITORY_ID}],
+                "permissions": {"contents": "write", "metadata": "read"},
+            },
+        )
+        for response in cases:
+            events = []
+
+            class AppAPI:
+                def post(self, path, payload):
+                    return response
+
+            class RevokeAPI:
+                def request_with_status(self, method, path):
+                    events.append("revoke")
+                    return None, {}, 204
+
+            with self.subTest(response=response), self.assertRaises(CredentialPolicyError):
+                runtime._observe_state_baseline(
+                    AppAPI(),
+                    installation_id=20,
+                    api_url="https://api.invalid",
+                    api_factory=lambda token, url: RevokeAPI(),
+                )
+            self.assertEqual(events, ["revoke"])
+
+    def test_state_observation_client_failure_still_attempts_revocation(self):
+        from phase2.operator_inventory import STATE_REPOSITORY_ID
+
+        profile = runtime.state_observation_profile(STATE_REPOSITORY_ID)
+        calls = []
+
+        class AppAPI:
+            def post(self, path, payload):
+                return {
+                    "token": "issued-token",
+                    "repositories": [{"id": STATE_REPOSITORY_ID}],
+                    "permissions": dict(profile.permissions),
+                }
+
+        class RevokeAPI:
+            def request_with_status(self, method, path):
+                calls.append("revoke")
+                return None, {}, 204
+
+        def factory(token, url):
+            calls.append("construct")
+            if calls.count("construct") == 1:
+                raise RuntimeError("client-construction-failed")
+            return RevokeAPI()
+
+        with self.assertRaisesRegex(RuntimeError, "client-construction-failed"):
+            runtime._observe_state_baseline(
+                AppAPI(), installation_id=20, api_url="https://api.invalid", api_factory=factory
+            )
+        self.assertEqual(calls, ["construct", "construct", "revoke"])
+
+    def test_state_observation_revocation_failure_dominates_primary_failure(self):
+        from phase2.operator_inventory import STATE_REPOSITORY_ID
+
+        profile = runtime.state_observation_profile(STATE_REPOSITORY_ID)
+
+        class AppAPI:
+            def post(self, path, payload):
+                return {
+                    "token": "issued-token",
+                    "repositories": [{"id": STATE_REPOSITORY_ID}],
+                    "permissions": dict(profile.permissions),
+                }
+
+        class StateAPI:
+            def get(self, path):
+                if path == f"/repos/8ft0-ai/gitstate-allocation-state":
+                    return {"id": STATE_REPOSITORY_ID, "full_name": "8ft0-ai/gitstate-allocation-state"}
+                raise RuntimeError("primary-read-failed")
+
+            def request_with_status(self, method, path):
+                return None, {}, 500
+
+        with self.assertRaisesRegex(
+            runtime.SuccessorRuntimeError, "STATE_OBSERVATION_TOKEN_REVOCATION_FAILED"
+        ):
+            runtime._observe_state_baseline(
+                AppAPI(),
+                installation_id=20,
+                api_url="https://api.invalid",
+                api_factory=lambda token, url: StateAPI(),
+            )
+
+    def test_public_approval_attestation_is_independent_and_raw_source_is_rejected(self):
+        from datetime import datetime, timezone
+        from phase2.operator_manifest import canonical_json
+        from phase2.successor_contract import CAPSULE_PREFIX, SuccessorContractError
+        from tests.test_successor_execution import (
+            CONTROL_SHA, OPERATION, approval_attestation_comment, capsule_comment, capsule_payload
+        )
+
+        raw = capsule_payload()
+        raw["manifest_approval"]["source"] = {
+            "comment_id": 6001,
+            "body": "private source material",
+            "owner": "8ft0-ai",
+            "created_at": "2026-09-07T09:59:00Z",
+            "updated_at": "2026-09-07T09:59:00Z",
+        }
+        raw_comment = {
+            "id": 9001,
+            "body": CAPSULE_PREFIX + canonical_json(raw),
+            "user": {"login": "8ft0-ai"},
+            "created_at": "2026-09-07T10:01:00Z",
+            "updated_at": "2026-09-07T10:01:00Z",
+        }
+        with self.assertRaisesRegex(SuccessorContractError, "SUCCESSOR_CAPSULE_APPROVAL_INVALID"):
+            capsule_runtime.parse_capsule_comment(
+                raw_comment,
+                now=datetime(2026, 9, 7, 10, 10, tzinfo=timezone.utc),
+                expected_control_sha=CONTROL_SHA,
+                expected_operation=OPERATION,
+            )
+
+        current = capsule_comment()
+        capsule = capsule_runtime.parse_capsule_comment(
+            current,
+            now=datetime(2026, 9, 7, 10, 10, tzinfo=timezone.utc),
+            expected_control_sha=CONTROL_SHA,
+            expected_operation=OPERATION,
+        )
+        from tests.test_successor_execution import CommentOnlyAPI
+        with self.assertRaisesRegex(
+            capsule_runtime.SuccessorCapsuleError, "SUCCESSOR_APPROVAL_ATTESTATION_NOT_FOUND"
+        ):
+            capsule_runtime.require_current_manifest_approval_attestation(
+                CommentOnlyAPI([current]), capsule
+            )
+        observed = capsule_runtime.require_current_manifest_approval_attestation(
+            CommentOnlyAPI([approval_attestation_comment(), current]), capsule
+        )
+        self.assertEqual(observed.attestation_id, capsule.manifest_approval["attestation_id"])
+        self.assertNotIn("source", capsule.manifest_approval)
+
+
+    def test_current_attestation_reissue_and_equal_timestamp_fail_closed(self):
+        from tests.test_successor_execution import (
+            CommentOnlyAPI, approval_attestation_comment, capsule_comment
+        )
+
+        current = capsule_comment()
+        capsule = capsule_runtime.parse_capsule_comment(current, now=None)
+
+        genuine = approval_attestation_comment()
+        observed = capsule_runtime.require_current_manifest_approval_attestation(
+            CommentOnlyAPI([genuine, current]), capsule
+        )
+        self.assertEqual(observed.body_sha256, capsule.manifest_approval["attestation_body_sha256"])
+
+        for name, created in (
+            ("equal", current["created_at"]),
+            ("reposted-after", "2026-09-07T10:02:00Z"),
+        ):
+            with self.subTest(name=name):
+                replacement = approval_attestation_comment(comment_id=9990)
+                replacement["created_at"] = replacement["updated_at"] = created
+                self.assertEqual(replacement["body"], genuine["body"])
+                with self.assertRaisesRegex(
+                    capsule_runtime.SuccessorCapsuleError,
+                    "SUCCESSOR_APPROVAL_ATTESTATION_ORDER_INVALID",
+                ):
+                    capsule_runtime.require_current_manifest_approval_attestation(
+                        CommentOnlyAPI([replacement, current]), capsule
+                    )
+
+    def test_consumption_verbatim_attestation_repost_blocks_before_post(self):
+        from datetime import datetime, timezone
+        from tests.test_successor_execution import (
+            CAPSULE_ID, CONTROL_SHA, MANIFEST_SHA, OPERATION,
+            approval_attestation_comment, capsule_comment, CommentOnlyAPI,
+        )
+
+        current = capsule_comment()
+        parsed = capsule_runtime.parse_capsule_comment(
+            current,
+            now=datetime(2026, 9, 7, 10, 10, tzinfo=timezone.utc),
+            expected_control_sha=CONTROL_SHA,
+            expected_operation=OPERATION,
+        )
+        replacement = approval_attestation_comment(comment_id=9990)
+        replacement["created_at"] = replacement["updated_at"] = "2026-09-07T10:02:00Z"
+        api = CommentOnlyAPI([replacement, current])
+        api.posts = []
+        api.post = lambda path, body: api.posts.append((path, body)) or {"id": 9999}
+        projection = SimpleNamespace(
+            manifest=SimpleNamespace(
+                operator_history=capsule_runtime.operator_history_baseline(())
+            )
+        )
+        with patch.object(capsule_runtime, "discover_capsule", return_value=parsed), \
+             patch.object(capsule_runtime, "validate_public_subject", return_value=projection), \
+             patch.object(capsule_runtime, "_require_current_preconsumption_history"), \
+             patch.object(capsule_runtime, "_require_current_protected_main"):
+            with self.assertRaisesRegex(
+                capsule_runtime.SuccessorCapsuleError,
+                "SUCCESSOR_APPROVAL_ATTESTATION_ORDER_INVALID",
+            ):
+                capsule_runtime.consume_capsule(
+                    api, expected_control_sha=CONTROL_SHA,
+                    expected_operation=OPERATION, expected_capsule_id=CAPSULE_ID,
+                    expected_capsule_comment_id=current["id"],
+                    expected_capsule_body_sha256=parsed.body_sha256,
+                    expected_manifest_sha256=MANIFEST_SHA, run_id=8002, run_attempt=1,
+                    now=datetime(2026, 9, 7, 10, 10, tzinfo=timezone.utc),
+                )
+        self.assertEqual(api.posts, [])
+
+    def test_conflicting_public_approval_attestations_fail_closed(self):
+        from tests.test_successor_execution import (
+            CommentOnlyAPI, approval_attestation_comment, capsule_comment
+        )
+        capsule = capsule_runtime.parse_capsule_comment(capsule_comment(), now=None)
+        competing = approval_attestation_comment(
+            comment_id=8989,
+            attestation_id="4" * 32,
+            approval={"record_id": "5" * 32, "body_sha256": "6" * 64},
+        )
+        with self.assertRaisesRegex(
+            capsule_runtime.SuccessorCapsuleError,
+            "SUCCESSOR_APPROVAL_ATTESTATION_AMBIGUOUS",
+        ):
+            capsule_runtime.require_current_manifest_approval_attestation(
+                CommentOnlyAPI([approval_attestation_comment(), competing, capsule_comment()]),
+                capsule,
+            )
+
+    def test_approval_attestation_is_owner_authenticated_immutable_and_predates_capsule(self):
+        from datetime import datetime, timezone
+        from phase2.successor_contract import (
+            SuccessorContractError, parse_manifest_approval_attestation
+        )
+        from tests.test_successor_execution import (
+            CONTROL_SHA, OPERATION, approval_attestation_comment, capsule_comment
+        )
+
+        wrong_owner = approval_attestation_comment()
+        wrong_owner["user"] = {"login": "someone-else"}
+        with self.assertRaisesRegex(SuccessorContractError, "WRONG_OWNER"):
+            parse_manifest_approval_attestation(wrong_owner)
+
+        edited = approval_attestation_comment()
+        edited["updated_at"] = "2026-09-07T10:00:00Z"
+        with self.assertRaisesRegex(SuccessorContractError, "SOURCE_EDITED"):
+            parse_manifest_approval_attestation(edited)
+
+        from phase2.governance_state import build_governance_history
+        from phase2.successor_contract import CAPSULE_PREFIX, validate_capsule_governance
+        from tests.test_operator_guard import make_state, parsed_records
+        from tests.test_successor_execution import capsule_payload
+        from phase2.operator_manifest import canonical_json, sha256_text
+
+        _, _, _, manifest, comments, _ = make_state()
+        records = parsed_records(comments)
+        authority_record = next(record for record in records if record.record_type == "authority")
+        authority_binding = {
+            "record_id": authority_record.record_id,
+            "body_sha256": authority_record.body_sha256,
+        }
+        late = approval_attestation_comment(
+            manifest_sha256=manifest.sha256, authority=authority_binding
+        )
+        late["created_at"] = late["updated_at"] = "2026-09-07T10:02:00Z"
+        attestation = parse_manifest_approval_attestation(late)
+        value = capsule_payload()
+        value["manifest_sha256"] = manifest.sha256
+        value["authority"] = authority_binding
+        value["expected_control_sha"] = str(manifest.payload["executor"]["commit_sha"])
+        value["preflight_run"]["trusted_sha"] = value["expected_control_sha"]
+        value["manifest_approval"]["attestation_body_sha256"] = sha256_text(late["body"])
+        body = CAPSULE_PREFIX + canonical_json(value)
+        capsule = capsule_runtime.parse_capsule_comment(
+            {
+                "id": 9001, "body": body, "user": {"login": "8ft0-ai"},
+                "created_at": "2026-09-07T10:01:00Z",
+                "updated_at": "2026-09-07T10:01:00Z",
+            },
+            now=datetime(2026, 9, 7, 10, 10, tzinfo=timezone.utc),
+            expected_control_sha=value["expected_control_sha"],
+            expected_operation=OPERATION,
+        )
+        history = build_governance_history(manifest.sha256, records)
+        with self.assertRaisesRegex(
+            SuccessorContractError, "SUCCESSOR_APPROVAL_ATTESTATION_ORDER_INVALID"
+        ):
+            validate_capsule_governance(capsule, manifest, history, attestation)
+
+        valid_comment = approval_attestation_comment(
+            manifest_sha256=manifest.sha256, authority=authority_binding
+        )
+        valid = parse_manifest_approval_attestation(valid_comment)
+        self.assertIs(validate_capsule_governance(capsule, manifest, history, valid), history)
+
+    def test_live_guard_requires_proven_external_approval_when_history_has_none(self):
+        from phase2.operator_guard import evaluate_guards
+        from tests.test_operator_guard import make_state, with_observation
+
+        _, _, _, manifest, _, observation = make_state()
+        missing = with_observation(
+            observation, stage="live_l1", manifest_approval_proven=False
+        )
+        self.assertEqual(evaluate_guards(manifest, missing).code, "AUTHORITY_NOT_GRANTED")
+        proven = with_observation(
+            observation, stage="live_l1", manifest_approval_proven=True
+        )
+        self.assertTrue(evaluate_guards(manifest, proven).passed)
+
+    def test_external_attestation_cannot_override_rejected_governance_approval(self):
+        from phase2.operator_guard import evaluate_guards
+        from tests.test_operator_guard import (
+            APPROVAL_ID, AUTHORITY_ID, binding, governance_comment, governance_payload,
+            make_state, manifest_subject, parsed_records, with_records, with_observation,
+        )
+
+        _, _, authority, manifest, comments, observation = make_state()
+        rejected = governance_comment(
+            104,
+            governance_payload(
+                "manifest_approval",
+                APPROVAL_ID,
+                manifest_subject(
+                    manifest.sha256,
+                    record_ids=(AUTHORITY_ID,),
+                    comment_bindings=(binding(authority),),
+                ),
+                {"disposition": "rejected"},
+            ),
+        )
+        records = parsed_records(comments + [rejected])
+        live = with_records(observation, manifest, records, stage="live_l1")
+        live = with_observation(live, manifest_approval_proven=True)
+        self.assertEqual(evaluate_guards(manifest, live).code, "AUTHORITY_NOT_GRANTED")
+
+    def test_required_owner_observation_is_not_replayed_from_b2_projection(self):
+        from datetime import datetime, timezone
+        from tests.test_operator_guard import make_state
+
+        owner_requirement = {
+            "required": True,
+            "observation_id": "owner-observation-1",
+            "observation_sha256": "a" * 64,
+            "valid_through": "2026-09-10T00:00:00Z",
+        }
+        _, _, _, manifest, _, _ = make_state(owner_observation=owner_requirement)
+        subject = SimpleNamespace(
+            preflight_projection=SimpleNamespace(
+                manifest=manifest,
+                bound_observation={
+                    "app_id": 10,
+                    "installation_id": 20,
+                    "repository_selection": "selected",
+                    "selected_repository_ids": [100, 200],
+                    "permission_profile_sha256": "3" * 64,
+                    "protocol_sha": "e" * 40,
+                    "state_commit_sha": "f" * 40,
+                    "state_digest_sha256": "1" * 64,
+                    "environment_name": "phase-2-allocator",
+                    "environment_policy_sha256": "2" * 64,
+                    "execution_variable": runtime.EXECUTION_VARIABLE,
+                    "owner_observation": {
+                        "required": True,
+                        "observation_id": "owner-observation-1",
+                        "observation_sha256": "a" * 64,
+                        "valid": True,
+                    },
+                },
+            ),
+            governance_history=SimpleNamespace(),
+        )
+        context = SimpleNamespace()
+
+        class API:
+            def get(self, path):
+                if "/environments/phase-2-allocator" in path:
+                    return {
+                        "name": "phase-2-allocator",
+                        "protection_rules": [],
+                        "deployment_branch_policy": None,
+                    }
+                raise AssertionError(path)
+
+        with patch.object(runtime.projection, "_control_identity", return_value=("b" * 40, "c" * 40, manifest.module_blobs)):
+            with self.assertRaisesRegex(runtime.SuccessorRuntimeError, "READ_EVIDENCE_UNAVAILABLE"):
+                runtime._guard_observation(
+                    {},
+                    context,
+                    subject,
+                    stage="live_l2",
+                    api=API(),
+                    evaluated_at=datetime(2026, 9, 9, tzinfo=timezone.utc),
+                    actual_inventory=SimpleNamespace(
+                        app_id=10,
+                        installation_id=20,
+                        repository_selection="selected",
+                        repository_ids=(100, 200),
+                    ),
+                    state_observation=("f" * 40, "1" * 64),
+                )
+
+    def _capsule_comment_with(self, *, capsule_id: str, created: str, expires: str, comment_id: int, comment_time: str):
+        from tests.test_successor_execution import capsule_payload
+        from phase2.successor_contract import CAPSULE_PREFIX
+        from phase2.operator_manifest import canonical_json
+
+        payload = capsule_payload(created=created, expires=expires)
+        payload["capsule_id"] = capsule_id
+        body = CAPSULE_PREFIX + canonical_json(payload)
+        return {
+            "id": comment_id,
+            "body": body,
+            "user": {"login": "8ft0-ai"},
+            "created_at": comment_time,
+            "updated_at": comment_time,
+        }
+
+    def test_other_open_capsules_block_before_consumption_post(self):
+        from datetime import datetime, timezone
+        from tests.test_successor_execution import (
+            CAPSULE_ID as CURRENT_ID,
+            CONTROL_SHA,
+            MANIFEST_SHA,
+            OPERATION,
+            CommentOnlyAPI,
+            capsule_comment,
+        )
+
+        current = capsule_comment()
+        cases = (
+            self._capsule_comment_with(
+                capsule_id="1" * 32,
+                created="2026-09-07T09:00:00Z",
+                expires="2026-09-07T09:30:00Z",
+                comment_id=8991,
+                comment_time="2026-09-07T09:01:00Z",
+            ),
+            self._capsule_comment_with(
+                capsule_id="2" * 32,
+                created="2026-09-07T11:00:00Z",
+                expires="2026-09-07T11:30:00Z",
+                comment_id=8992,
+                comment_time="2026-09-07T11:01:00Z",
+            ),
+            self._capsule_comment_with(
+                capsule_id="3" * 32,
+                created="2026-09-07T10:00:00Z",
+                expires="2026-09-07T10:30:00Z",
+                comment_id=8993,
+                comment_time="2026-09-07T10:01:00Z",
+            ),
+        )
+        for other in cases:
+            with self.subTest(other=other["id"]):
+                api = CommentOnlyAPI([other, current])
+                api.posts = []
+                api.post = lambda path, body: api.posts.append((path, body)) or {"id": 9999}
+                with patch.object(capsule_runtime, "validate_public_subject"):
+                    with self.assertRaisesRegex(
+                        capsule_runtime.SuccessorCapsuleError,
+                        "OPERATOR_HISTORY_OPEN_SET_INVALID",
+                    ):
+                        capsule_runtime.discover_capsule(
+                            api,
+                            expected_control_sha=CONTROL_SHA,
+                            expected_operation=OPERATION,
+                            run_id=8002,
+                            run_attempt=1,
+                            expected_capsule_id=CURRENT_ID,
+                            expected_capsule_body_sha256=runtime.sha256_text(current["body"]),
+                            expected_manifest_sha256=MANIFEST_SHA,
+                            now=datetime(2026, 9, 7, 10, 10, tzinfo=timezone.utc),
+                        )
+                self.assertEqual(api.posts, [])
+
+    def test_closed_pair_after_manifest_baseline_blocks_current_consumption(self):
+        from datetime import datetime, timezone
+        from tests.test_successor_execution import (
+            CAPSULE_ID,
+            CONTROL_SHA,
+            MANIFEST_SHA,
+            OPERATION,
+            CommentOnlyAPI,
+            capsule_comment,
+            consumption_comment,
+        )
+
+        old = self._capsule_comment_with(
+            capsule_id="5" * 32,
+            created="2026-09-07T09:00:00Z",
+            expires="2026-09-07T09:30:00Z",
+            comment_id=8901,
+            comment_time="2026-09-07T09:01:00Z",
+        )
+        # Build a valid closed consumption for the old capsule with its own ID.
+        from phase2.successor_contract import CONSUMPTION_PREFIX, CONSUMPTION_CONTRACT
+        from phase2.operator_manifest import canonical_json, sha256_text
+        old_payload = capsule_runtime.parse_capsule_comment(old, now=None).payload
+        consumed_payload = {
+            "contract": CONSUMPTION_CONTRACT,
+            "capsule_id": str(old_payload["capsule_id"]),
+            "capsule_comment_id": old["id"],
+            "capsule_body_sha256": sha256_text(old["body"]),
+            "manifest_sha256": str(old_payload["manifest_sha256"]),
+            "run_id": 7900,
+            "run_attempt": 1,
+            "trusted_sha": str(old_payload["expected_control_sha"]),
+            "operation": str(old_payload["operation"]),
+            "consumed_at": "2026-09-07T09:05:00Z",
+            "workstream_e_authorised": False,
+        }
+        old_consumption = {
+            "id": 8902,
+            "body": CONSUMPTION_PREFIX + canonical_json(consumed_payload),
+            "user": {"login": "github-actions[bot]"},
+            "created_at": "2026-09-07T09:05:00Z",
+            "updated_at": "2026-09-07T09:05:00Z",
+        }
+        current = capsule_comment()
+        api = CommentOnlyAPI([old, old_consumption, current])
+        projection = SimpleNamespace(
+            manifest=SimpleNamespace(
+                operator_history=capsule_runtime.operator_history_baseline(())
+            )
+        )
+        with patch.object(
+            capsule_runtime, "validate_public_subject", return_value=projection
+        ):
+            with self.assertRaisesRegex(
+                capsule_runtime.SuccessorCapsuleError,
+                "OPERATOR_HISTORY_PRECONSUMPTION_INVALID",
+            ):
+                capsule_runtime.discover_capsule(
+                    api,
+                    expected_control_sha=CONTROL_SHA,
+                    expected_operation=OPERATION,
+                    run_id=8002,
+                    run_attempt=1,
+                    expected_capsule_id=CAPSULE_ID,
+                    expected_capsule_body_sha256=sha256_text(current["body"]),
+                    expected_manifest_sha256=MANIFEST_SHA,
+                    now=datetime(2026, 9, 7, 10, 10, tzinfo=timezone.utc),
+                )
+
+    def test_history_change_between_discovery_and_consumption_blocks_before_post(self):
+        from datetime import datetime, timezone
+        from tests.test_successor_execution import (
+            CAPSULE_ID, CONTROL_SHA, MANIFEST_SHA, OPERATION, capsule_comment,
+        )
+
+        current = capsule_comment()
+        parsed = capsule_runtime.parse_capsule_comment(
+            current,
+            now=datetime(2026, 9, 7, 10, 10, tzinfo=timezone.utc),
+            expected_control_sha=CONTROL_SHA,
+            expected_operation=OPERATION,
+        )
+        self.assertIsNotNone(parsed)
+        extra = self._capsule_comment_with(
+            capsule_id="4" * 32,
+            created="2026-09-07T10:00:00Z",
+            expires="2026-09-07T10:30:00Z",
+            comment_id=9010,
+            comment_time="2026-09-07T10:01:00Z",
+        )
+
+        class ChangingAPI:
+            def __init__(self):
+                self.list_reads = 0
+                self.posts = []
+
+            def get(self, path):
+                if "/issues/17/comments" in path:
+                    if "page=1" in path:
+                        self.list_reads += 1
+                        return [current, extra]
+                    return []
+                raise AssertionError(path)
+
+            def post(self, path, body):
+                self.posts.append((path, body))
+                return {"id": 9999}
+
+        api = ChangingAPI()
+        projection = SimpleNamespace(
+            manifest=SimpleNamespace(
+                operator_history=capsule_runtime.operator_history_baseline(())
+            )
+        )
+        with patch.object(capsule_runtime, "discover_capsule", return_value=parsed), patch.object(
+            capsule_runtime, "validate_public_subject", return_value=projection
+        ):
+            with self.assertRaisesRegex(
+                capsule_runtime.SuccessorCapsuleError,
+                "OPERATOR_HISTORY_PRECONSUMPTION_INVALID",
+            ):
+                capsule_runtime.consume_capsule(
+                    api,
+                    expected_control_sha=CONTROL_SHA,
+                    expected_operation=OPERATION,
+                    expected_capsule_id=CAPSULE_ID,
+                    expected_capsule_comment_id=current["id"],
+                    expected_capsule_body_sha256=parsed.body_sha256,
+                    expected_manifest_sha256=MANIFEST_SHA,
+                    run_id=8002,
+                    run_attempt=1,
+                    now=datetime(2026, 9, 7, 10, 10, tzinfo=timezone.utc),
+                )
+        self.assertEqual(api.posts, [])
+
+    def test_state_observation_failure_blocks_before_mutation_token_mint(self):
+        from phase2.operator_inventory import CONTROL_REPOSITORY_ID, STATE_REPOSITORY_ID, InventoryEvidence
+        from phase2.operator_guard import GuardResult
+
+        events = []
+        values = {
+            "PHASE2_ALLOCATOR_APP_ID": "10",
+            "PHASE2_ALLOCATOR_INSTALLATION_ID": "20",
+            "PHASE2_STATE_REPOSITORY_ID": str(STATE_REPOSITORY_ID),
+            "GITHUB_API_URL": "https://api.invalid",
+        }
+        context = SimpleNamespace(
+            run_id=8002, run_attempt=1, trusted_sha="a" * 40,
+            capsule_id="b" * 32, capsule_body_sha256="c" * 64,
+        )
+        legacy = SimpleNamespace(validate=lambda: None)
+        subject = SimpleNamespace(
+            preflight_projection=SimpleNamespace(manifest=SimpleNamespace(sha256="d" * 64))
+        )
+        inventory = InventoryEvidence(
+            10, 20, "selected", tuple(sorted((CONTROL_REPOSITORY_ID, STATE_REPOSITORY_ID))),
+            "2026-09-07T10:06:00Z", 8002, 1, "a" * 40, "b" * 32, "c" * 64,
+            {"metadata": "read"}, True, "e" * 64,
+        )
+        policy = {
+            "control_repository": runtime.CONTROL_REPOSITORY,
+            "control_repository_id": CONTROL_REPOSITORY_ID,
+            "allocator": {
+                "app_id_env": "PHASE2_ALLOCATOR_APP_ID",
+                "installation_id_env": "PHASE2_ALLOCATOR_INSTALLATION_ID",
+                "app_slug": "gitstate-phase-2-allocator",
+                "owner": "8ft0-ai",
+            },
+            "state_repository_id_env": "PHASE2_STATE_REPOSITORY_ID",
+        }
+        with patch.object(runtime, "evaluate_stage", return_value=(subject, GuardResult.pass_result())), \
+             patch.object(runtime, "load_policy", return_value=policy), \
+             patch.object(runtime, "verify_live_installation", return_value={"repository_selection": "selected"}), \
+             patch.object(runtime, "prove_installation_inventory", return_value=inventory), \
+             patch.object(runtime, "_observe_state_baseline", side_effect=runtime.SuccessorRuntimeError("STATE_OBSERVATION_TOKEN_REVOCATION_FAILED")), \
+             patch.object(runtime, "mint_token", side_effect=lambda *a, **k: events.append("mutation-mint") or "token"):
+            with self.assertRaisesRegex(
+                runtime.SuccessorRuntimeError, "STATE_OBSERVATION_TOKEN_REVOCATION_FAILED"
+            ):
+                runtime._mutation_credentials(
+                    values, context, legacy, private_key="fixture-key",
+                    api_factory=lambda token, url: object(),
+                    jwt_factory=lambda app_id, key: "jwt",
+                )
+        self.assertEqual(events, [])
+
+
+    def test_consumption_attestation_edit_delete_or_competitor_blocks_before_post(self):
+        from datetime import datetime, timezone
+        from tests.test_successor_execution import (
+            CAPSULE_ID, CONTROL_SHA, MANIFEST_SHA, OPERATION,
+            approval_attestation_comment, capsule_comment, CommentOnlyAPI,
+        )
+
+        current = capsule_comment()
+        parsed = capsule_runtime.parse_capsule_comment(
+            current,
+            now=datetime(2026, 9, 7, 10, 10, tzinfo=timezone.utc),
+            expected_control_sha=CONTROL_SHA,
+            expected_operation=OPERATION,
+        )
+        projection = SimpleNamespace(
+            manifest=SimpleNamespace(
+                operator_history=capsule_runtime.operator_history_baseline(())
+            )
+        )
+
+        cases = {}
+        edited = approval_attestation_comment()
+        edited["updated_at"] = "2026-09-07T10:00:00Z"
+        cases["edit"] = [edited, current]
+        cases["delete"] = [current]
+        competing = approval_attestation_comment(
+            comment_id=8989, attestation_id="4" * 32,
+            approval={"record_id": "5" * 32, "body_sha256": "6" * 64},
+        )
+        cases["competitor"] = [approval_attestation_comment(), competing, current]
+
+        for name, comments in cases.items():
+            api = CommentOnlyAPI(comments)
+            api.posts = []
+            api.post = lambda path, body: api.posts.append((path, body)) or {"id": 9999}
+            with self.subTest(name=name), \
+                 patch.object(capsule_runtime, "discover_capsule", return_value=parsed), \
+                 patch.object(capsule_runtime, "validate_public_subject", return_value=projection), \
+                 patch.object(capsule_runtime, "_require_current_preconsumption_history"), \
+                 patch.object(capsule_runtime, "_require_current_protected_main"):
+                with self.assertRaises((capsule_runtime.SuccessorCapsuleError, capsule_runtime.SuccessorContractError)):
+                    capsule_runtime.consume_capsule(
+                        api, expected_control_sha=CONTROL_SHA,
+                        expected_operation=OPERATION, expected_capsule_id=CAPSULE_ID,
+                        expected_capsule_comment_id=current["id"],
+                        expected_capsule_body_sha256=parsed.body_sha256,
+                        expected_manifest_sha256=MANIFEST_SHA, run_id=8002, run_attempt=1,
+                        now=datetime(2026, 9, 7, 10, 10, tzinfo=timezone.utc),
+                    )
+            self.assertEqual(api.posts, [])
+
+    def test_final_public_fence_revalidates_attestation_before_stage_pass(self):
+        events = []
+        subject = SimpleNamespace(
+            capsule=SimpleNamespace(),
+            preflight_projection=SimpleNamespace(
+                manifest=SimpleNamespace(payload={"executor": {"commit_sha": "a" * 40}})
+            ),
+        )
+        context = SimpleNamespace(
+            trusted_sha="a" * 40, projection_comment_id=1,
+            projection_body_sha256="b" * 64, manifest_sha256="c" * 64,
+        )
+        with patch.object(runtime, "validate_carrier_ledger", side_effect=lambda *a, **k: events.append("ledger")), \
+             patch.object(runtime, "validate_ledger_only_control_descendant", side_effect=lambda *a, **k: events.append("ancestry")), \
+             patch.object(runtime, "require_current_manifest_approval_attestation", side_effect=lambda *a, **k: events.append("attestation")), \
+             patch.object(runtime, "_require_current_protected_main", side_effect=lambda *a, **k: events.append("main")):
+            runtime._final_public_fence({}, context, subject, api=object())
+        self.assertEqual(events, ["ledger", "ancestry", "attestation", "main"])
+
+
+    def test_l1_and_l2_do_not_return_pass_when_final_attestation_fence_moves(self):
+        from phase2.operator_guard import GuardResult
+        subject = SimpleNamespace(preflight_projection=SimpleNamespace(manifest=SimpleNamespace()))
+        context = SimpleNamespace()
+        for stage in ("live_l1", "live_l2"):
+            with self.subTest(stage=stage), \
+                 patch.object(runtime, "_subject", return_value=subject), \
+                 patch.object(runtime, "_api", return_value=object()), \
+                 patch.object(runtime, "_guard_observation", return_value=SimpleNamespace()), \
+                 patch.object(runtime, "evaluate_guards", return_value=GuardResult.pass_result()), \
+                 patch.object(
+                     runtime, "_final_public_fence",
+                     side_effect=runtime.SuccessorRuntimeError(
+                         "SUCCESSOR_APPROVAL_ATTESTATION_BINDING_MISMATCH"
+                     ),
+                 ):
+                with self.assertRaisesRegex(
+                    runtime.SuccessorRuntimeError,
+                    "SUCCESSOR_APPROVAL_ATTESTATION_BINDING_MISMATCH",
+                ):
+                    runtime.evaluate_stage({}, context, stage=stage)
+
+    def test_l2_attestation_freshness_failure_blocks_before_mutation_token_mint(self):
+        from phase2.operator_guard import GuardResult
+        events = []
+        subject = SimpleNamespace(preflight_projection=SimpleNamespace(manifest=SimpleNamespace(sha256="d" * 64)))
+        context = SimpleNamespace(
+            run_id=8002, run_attempt=1, trusted_sha="a" * 40,
+            capsule_id="b" * 32, capsule_body_sha256="c" * 64,
+        )
+        legacy = SimpleNamespace(validate=lambda: None)
+        values = {
+            "PHASE2_ALLOCATOR_APP_ID": "10",
+            "PHASE2_ALLOCATOR_INSTALLATION_ID": "20",
+            "PHASE2_STATE_REPOSITORY_ID": str(runtime.STATE_REPOSITORY_ID),
+            "GITHUB_API_URL": "https://api.invalid",
+        }
+        inventory = SimpleNamespace(
+            app_id=10, installation_id=20, repository_selection="selected",
+            repository_ids=(runtime.CONTROL_REPOSITORY_ID, runtime.STATE_REPOSITORY_ID),
+        )
+        policy = {
+            "control_repository": runtime.CONTROL_REPOSITORY,
+            "control_repository_id": runtime.CONTROL_REPOSITORY_ID,
+            "allocator": {
+                "app_id_env": "PHASE2_ALLOCATOR_APP_ID",
+                "installation_id_env": "PHASE2_ALLOCATOR_INSTALLATION_ID",
+                "app_slug": "gitstate-phase-2-allocator", "owner": "8ft0-ai",
+            },
+            "state_repository_id_env": "PHASE2_STATE_REPOSITORY_ID",
+        }
+        def eval_stage(*args, stage, **kwargs):
+            if stage == "live_l1":
+                return subject, GuardResult.pass_result()
+            raise runtime.SuccessorRuntimeError("SUCCESSOR_APPROVAL_ATTESTATION_NOT_FOUND")
+        with patch.object(runtime, "evaluate_stage", side_effect=eval_stage), \
+             patch.object(runtime, "load_policy", return_value=policy), \
+             patch.object(runtime, "verify_live_installation", return_value={"repository_selection": "selected"}), \
+             patch.object(runtime, "prove_installation_inventory", return_value=inventory), \
+             patch.object(runtime, "_observe_state_baseline", return_value=("f" * 40, "1" * 64)), \
+             patch.object(runtime, "mint_token", side_effect=lambda *a, **k: events.append("mutation-mint") or "token"):
+            with self.assertRaisesRegex(runtime.SuccessorRuntimeError, "SUCCESSOR_APPROVAL_ATTESTATION_NOT_FOUND"):
+                runtime._mutation_credentials(
+                    values, context, legacy, private_key="fixture-key",
+                    api_factory=lambda token, url: object(), jwt_factory=lambda app_id, key: "jwt",
+                )
+        self.assertEqual(events, [])
+
+
+
+    def test_l1_verbatim_attestation_repost_cannot_return_pass(self):
+        from phase2.operator_guard import GuardResult
+        from tests.test_successor_execution import approval_attestation_comment, capsule_comment, CommentOnlyAPI
+
+        current = capsule_comment()
+        capsule = capsule_runtime.parse_capsule_comment(current, now=None)
+        replacement = approval_attestation_comment(comment_id=9990)
+        replacement["created_at"] = replacement["updated_at"] = "2026-09-07T10:02:00Z"
+        subject = SimpleNamespace(
+            capsule=capsule,
+            preflight_projection=SimpleNamespace(
+                manifest=SimpleNamespace(payload={"executor": {"commit_sha": "a" * 40}})
+            ),
+        )
+        context = SimpleNamespace(
+            trusted_sha="a" * 40, projection_comment_id=1,
+            projection_body_sha256="b" * 64, manifest_sha256="c" * 64,
+        )
+        api = CommentOnlyAPI([replacement, current])
+        with patch.object(runtime, "_subject", return_value=subject), \
+             patch.object(runtime, "_api", return_value=api), \
+             patch.object(runtime, "_guard_observation", return_value=SimpleNamespace()), \
+             patch.object(runtime, "evaluate_guards", return_value=GuardResult.pass_result()), \
+             patch.object(runtime, "validate_carrier_ledger"), \
+             patch.object(runtime, "validate_ledger_only_control_descendant"), \
+             patch.object(runtime, "_require_current_protected_main"):
+            with self.assertRaisesRegex(
+                capsule_runtime.SuccessorCapsuleError,
+                "SUCCESSOR_APPROVAL_ATTESTATION_ORDER_INVALID",
+            ):
+                runtime.evaluate_stage({}, context, stage="live_l1")
+
+    def test_l2_verbatim_attestation_repost_blocks_before_mutation_token_mint(self):
+        from phase2.operator_guard import GuardResult
+        events = []
+        subject = SimpleNamespace(preflight_projection=SimpleNamespace(manifest=SimpleNamespace(sha256="d" * 64)))
+        context = SimpleNamespace(
+            run_id=8002, run_attempt=1, trusted_sha="a" * 40,
+            capsule_id="b" * 32, capsule_body_sha256="c" * 64,
+        )
+        legacy = SimpleNamespace(validate=lambda: None)
+        values = {
+            "PHASE2_ALLOCATOR_APP_ID": "10",
+            "PHASE2_ALLOCATOR_INSTALLATION_ID": "20",
+            "PHASE2_STATE_REPOSITORY_ID": str(runtime.STATE_REPOSITORY_ID),
+            "GITHUB_API_URL": "https://api.invalid",
+        }
+        inventory = SimpleNamespace(
+            app_id=10, installation_id=20, repository_selection="selected",
+            repository_ids=(runtime.CONTROL_REPOSITORY_ID, runtime.STATE_REPOSITORY_ID),
+        )
+        policy = {
+            "control_repository": runtime.CONTROL_REPOSITORY,
+            "control_repository_id": runtime.CONTROL_REPOSITORY_ID,
+            "allocator": {
+                "app_id_env": "PHASE2_ALLOCATOR_APP_ID",
+                "installation_id_env": "PHASE2_ALLOCATOR_INSTALLATION_ID",
+                "app_slug": "gitstate-phase-2-allocator", "owner": "8ft0-ai",
+            },
+            "state_repository_id_env": "PHASE2_STATE_REPOSITORY_ID",
+        }
+        def eval_stage(*args, stage, **kwargs):
+            if stage == "live_l1":
+                return subject, GuardResult.pass_result()
+            raise runtime.SuccessorRuntimeError("SUCCESSOR_APPROVAL_ATTESTATION_ORDER_INVALID")
+        with patch.object(runtime, "evaluate_stage", side_effect=eval_stage), \
+             patch.object(runtime, "load_policy", return_value=policy), \
+             patch.object(runtime, "verify_live_installation", return_value={"repository_selection": "selected"}), \
+             patch.object(runtime, "prove_installation_inventory", return_value=inventory), \
+             patch.object(runtime, "_observe_state_baseline", return_value=("f" * 40, "1" * 64)), \
+             patch.object(runtime, "mint_token", side_effect=lambda *a, **k: events.append("mutation-mint") or "token"):
+            with self.assertRaisesRegex(
+                runtime.SuccessorRuntimeError, "SUCCESSOR_APPROVAL_ATTESTATION_ORDER_INVALID"
+            ):
+                runtime._mutation_credentials(
+                    values, context, legacy, private_key="fixture-key",
+                    api_factory=lambda token, url: object(), jwt_factory=lambda app_id, key: "jwt",
+                )
+        self.assertEqual(events, [])
+
+    def test_final_protected_main_fence_blocks_consumption_post(self):
+        from datetime import datetime, timezone
+        from tests.test_successor_execution import (
+            CAPSULE_ID, CONTROL_SHA, MANIFEST_SHA, OPERATION, capsule_comment
+        )
+
+        current = capsule_comment()
+        parsed = capsule_runtime.parse_capsule_comment(
+            current,
+            now=datetime(2026, 9, 7, 10, 10, tzinfo=timezone.utc),
+            expected_control_sha=CONTROL_SHA,
+            expected_operation=OPERATION,
+        )
+        api = SimpleNamespace(posts=[])
+        api.post = lambda path, body: api.posts.append((path, body)) or {"id": 9999}
+        projection = SimpleNamespace(
+            manifest=SimpleNamespace(
+                operator_history=capsule_runtime.operator_history_baseline(())
+            )
+        )
+        with patch.object(capsule_runtime, "discover_capsule", return_value=parsed), \
+             patch.object(capsule_runtime, "validate_public_subject", return_value=projection), \
+             patch.object(capsule_runtime, "_require_current_preconsumption_history"), \
+             patch.object(capsule_runtime, "require_current_manifest_approval_attestation"), \
+             patch.object(
+                 capsule_runtime,
+                 "_require_current_protected_main",
+                 side_effect=RuntimeError("PUBLIC_CARRIER_LEDGER_MAIN_MOVED"),
+             ):
+            with self.assertRaisesRegex(RuntimeError, "PUBLIC_CARRIER_LEDGER_MAIN_MOVED"):
+                capsule_runtime.consume_capsule(
+                    api,
+                    expected_control_sha=CONTROL_SHA,
+                    expected_operation=OPERATION,
+                    expected_capsule_id=CAPSULE_ID,
+                    expected_capsule_comment_id=current["id"],
+                    expected_capsule_body_sha256=parsed.body_sha256,
+                    expected_manifest_sha256=MANIFEST_SHA,
+                    run_id=8002,
+                    run_attempt=1,
+                    now=datetime(2026, 9, 7, 10, 10, tzinfo=timezone.utc),
+                )
+        self.assertEqual(api.posts, [])
+
+    def test_final_protected_main_fence_runs_after_history_reread_before_post(self):
+        from datetime import datetime, timezone
+        from tests.test_successor_execution import (
+            CAPSULE_ID, CONTROL_SHA, MANIFEST_SHA, OPERATION, capsule_comment
+        )
+
+        events = []
+        current = capsule_comment()
+        parsed = capsule_runtime.parse_capsule_comment(
+            current,
+            now=datetime(2026, 9, 7, 10, 10, tzinfo=timezone.utc),
+            expected_control_sha=CONTROL_SHA,
+            expected_operation=OPERATION,
+        )
+        observed_body = None
+
+        class API:
+            def post(self, path, body):
+                nonlocal observed_body
+                events.append("post")
+                observed_body = body["body"]
+                return {"id": 9999}
+            def get(self, path):
+                if path.endswith("/issues/comments/9999"):
+                    events.append("reread")
+                    return {
+                        "id": 9999,
+                        "body": observed_body,
+                        "user": {"login": "github-actions[bot]"},
+                        "created_at": "2026-09-07T10:10:00Z",
+                        "updated_at": "2026-09-07T10:10:00Z",
+                    }
+                raise AssertionError(path)
+
+        projection = SimpleNamespace(
+            manifest=SimpleNamespace(
+                operator_history=capsule_runtime.operator_history_baseline(())
+            )
+        )
+        with patch.object(capsule_runtime, "discover_capsule", return_value=parsed), \
+             patch.object(capsule_runtime, "validate_public_subject", return_value=projection), \
+             patch.object(
+                 capsule_runtime, "_require_current_preconsumption_history",
+                 side_effect=lambda *a, **k: events.append("history"),
+             ), \
+             patch.object(
+                 capsule_runtime, "require_current_manifest_approval_attestation",
+                 side_effect=lambda *a, **k: events.append("attestation"),
+             ), \
+             patch.object(
+                 capsule_runtime, "_require_current_protected_main",
+                 side_effect=lambda *a, **k: events.append("main-fence"),
+             ):
+            capsule_runtime.consume_capsule(
+                API(),
+                expected_control_sha=CONTROL_SHA,
+                expected_operation=OPERATION,
+                expected_capsule_id=CAPSULE_ID,
+                expected_capsule_comment_id=current["id"],
+                expected_capsule_body_sha256=parsed.body_sha256,
+                expected_manifest_sha256=MANIFEST_SHA,
+                run_id=8002,
+                run_attempt=1,
+                now=datetime(2026, 9, 7, 10, 10, tzinfo=timezone.utc),
+            )
+        self.assertEqual(events[:4], ["history", "attestation", "main-fence", "post"])
+
+
+
+if __name__ == "__main__":
+    unittest.main()
