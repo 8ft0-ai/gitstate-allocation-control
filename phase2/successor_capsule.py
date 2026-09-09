@@ -16,7 +16,10 @@ from .operator_manifest import (
     canonical_json,
     sha256_text,
 )
-from .preflight_carrier_ledger import validate_carrier_ledger
+from .preflight_carrier_ledger import (
+    _require_current_protected_main,
+    validate_carrier_ledger,
+)
 from .preflight_control_anchor import validate_ledger_only_control_descendant
 from . import preflight_projection as projection
 from . import preflight_runtime as preflight_runtime
@@ -331,6 +334,10 @@ def consume_capsule(
     _require_current_preconsumption_history(
         api, capsule, preflight_projection.manifest
     )
+    # Linearise irreversible consumption against the same protected-main
+    # identity that was validated throughout discovery. Any newly effective
+    # invalidation or other main movement must block before the write.
+    _require_current_protected_main(api, expected_control_sha)
 
     payload = {
         "contract": CONSUMPTION_CONTRACT,

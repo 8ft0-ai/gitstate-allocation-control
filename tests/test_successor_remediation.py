@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 import phase2.successor_capsule as capsule_runtime
 import phase2.successor_runtime as runtime
+from phase2.credentials import CredentialPolicyError
 
 
 CONTROL_SHA = "a" * 40
@@ -297,6 +298,17 @@ class SuccessorFreshnessAndOpenHistoryTests(unittest.TestCase):
         from phase2.operator_inventory import STATE_REPOSITORY_ID
 
         events: list[str] = []
+        profile = runtime.state_observation_profile(STATE_REPOSITORY_ID)
+
+        class AppAPI:
+            def post(self, path, payload):
+                events.append("mint-state-observation")
+                self.request = payload
+                return {
+                    "token": "read-only-state-token",
+                    "repositories": [{"id": STATE_REPOSITORY_ID}],
+                    "permissions": dict(profile.permissions),
+                }
 
         class StateAPI:
             def get(self, path):
@@ -311,29 +323,24 @@ class SuccessorFreshnessAndOpenHistoryTests(unittest.TestCase):
 
             def request_with_status(self, method, path):
                 events.append(f"{method}:{path}")
-                self.assertions = True
                 return None, {}, 204
 
+        app_api = AppAPI()
         state_api = StateAPI()
-        seen_profile = []
-
-        def mint(_app_api, _installation_id, profile):
-            seen_profile.append(profile)
-            events.append("mint-state-observation")
-            return "read-only-state-token"
-
-        with patch.object(runtime, "mint_token", side_effect=mint):
-            commit, digest = runtime._observe_state_baseline(
-                object(),
-                installation_id=20,
-                api_url="https://api.invalid",
-                api_factory=lambda token, url: state_api,
-            )
-        self.assertEqual(commit, "4" * 40)
-        self.assertEqual(
-            seen_profile[0].permissions,
-            {"contents": "read", "metadata": "read"},
+        commit, digest = runtime._observe_state_baseline(
+            app_api,
+            installation_id=20,
+            api_url="https://api.invalid",
+            api_factory=lambda token, url: state_api,
         )
+        self.assertEqual(
+            app_api.request,
+            {
+                "repository_ids": [STATE_REPOSITORY_ID],
+                "permissions": {"contents": "read", "metadata": "read"},
+            },
+        )
+        self.assertEqual(commit, "4" * 40)
         self.assertEqual(events[-1], "DELETE:/installation/token")
         self.assertEqual(
             digest,
@@ -344,6 +351,139 @@ class SuccessorFreshnessAndOpenHistoryTests(unittest.TestCase):
                 tree_sha="5" * 40,
             ),
         )
+
+    def test_state_observation_scope_failure_still_revokes(self):
+        from phase2.operator_inventory import STATE_REPOSITORY_ID
+
+        events: list[str] = []
+        profile = runtime.state_observation_profile(STATE_REPOSITORY_ID)
+
+        class AppAPI:
+            def post(self, path, payload):
+                return {
+                    "token": "issued-token",
+                    "repositories": [{"id": STATE_REPOSITORY_ID}, {"id": 999999}],
+                    "permissions": dict(profile.permissions),
+                }
+
+        class RevokeAPI:
+            def request_with_status(self, method, path):
+                events.append(f"{method}:{path}")
+                return None, {}, 204
+
+        with self.assertRaises(CredentialPolicyError):
+            runtime._observe_state_baseline(
+                AppAPI(),
+                installation_id=20,
+                api_url="https://api.invalid",
+                api_factory=lambda token, url: RevokeAPI(),
+            )
+        self.assertEqual(events, ["DELETE:/installation/token"])
+
+    def test_state_observation_wrong_or_malformed_scope_still_revokes(self):
+        from phase2.operator_inventory import STATE_REPOSITORY_ID
+
+        profile = runtime.state_observation_profile(STATE_REPOSITORY_ID)
+        cases = (
+            {
+                "token": "issued-token",
+                "repositories": [{"id": 999999}],
+                "permissions": dict(profile.permissions),
+            },
+            {
+                "token": "issued-token",
+                "repositories": "not-a-list",
+                "permissions": dict(profile.permissions),
+            },
+            {
+                "token": "issued-token",
+                "repositories": [{"id": STATE_REPOSITORY_ID}],
+                "permissions": {"contents": "write", "metadata": "read"},
+            },
+        )
+        for response in cases:
+            events = []
+
+            class AppAPI:
+                def post(self, path, payload):
+                    return response
+
+            class RevokeAPI:
+                def request_with_status(self, method, path):
+                    events.append("revoke")
+                    return None, {}, 204
+
+            with self.subTest(response=response), self.assertRaises(CredentialPolicyError):
+                runtime._observe_state_baseline(
+                    AppAPI(),
+                    installation_id=20,
+                    api_url="https://api.invalid",
+                    api_factory=lambda token, url: RevokeAPI(),
+                )
+            self.assertEqual(events, ["revoke"])
+
+    def test_state_observation_client_failure_still_attempts_revocation(self):
+        from phase2.operator_inventory import STATE_REPOSITORY_ID
+
+        profile = runtime.state_observation_profile(STATE_REPOSITORY_ID)
+        calls = []
+
+        class AppAPI:
+            def post(self, path, payload):
+                return {
+                    "token": "issued-token",
+                    "repositories": [{"id": STATE_REPOSITORY_ID}],
+                    "permissions": dict(profile.permissions),
+                }
+
+        class RevokeAPI:
+            def request_with_status(self, method, path):
+                calls.append("revoke")
+                return None, {}, 204
+
+        def factory(token, url):
+            calls.append("construct")
+            if calls.count("construct") == 1:
+                raise RuntimeError("client-construction-failed")
+            return RevokeAPI()
+
+        with self.assertRaisesRegex(RuntimeError, "client-construction-failed"):
+            runtime._observe_state_baseline(
+                AppAPI(), installation_id=20, api_url="https://api.invalid", api_factory=factory
+            )
+        self.assertEqual(calls, ["construct", "construct", "revoke"])
+
+    def test_state_observation_revocation_failure_dominates_primary_failure(self):
+        from phase2.operator_inventory import STATE_REPOSITORY_ID
+
+        profile = runtime.state_observation_profile(STATE_REPOSITORY_ID)
+
+        class AppAPI:
+            def post(self, path, payload):
+                return {
+                    "token": "issued-token",
+                    "repositories": [{"id": STATE_REPOSITORY_ID}],
+                    "permissions": dict(profile.permissions),
+                }
+
+        class StateAPI:
+            def get(self, path):
+                if path == f"/repos/8ft0-ai/gitstate-allocation-state":
+                    return {"id": STATE_REPOSITORY_ID, "full_name": "8ft0-ai/gitstate-allocation-state"}
+                raise RuntimeError("primary-read-failed")
+
+            def request_with_status(self, method, path):
+                return None, {}, 500
+
+        with self.assertRaisesRegex(
+            runtime.SuccessorRuntimeError, "STATE_OBSERVATION_TOKEN_REVOCATION_FAILED"
+        ):
+            runtime._observe_state_baseline(
+                AppAPI(),
+                installation_id=20,
+                api_url="https://api.invalid",
+                api_factory=lambda token, url: StateAPI(),
+            )
 
     def test_required_owner_observation_is_not_replayed_from_b2_projection(self):
         from datetime import datetime, timezone
@@ -619,6 +759,164 @@ class SuccessorFreshnessAndOpenHistoryTests(unittest.TestCase):
                     now=datetime(2026, 9, 7, 10, 10, tzinfo=timezone.utc),
                 )
         self.assertEqual(api.posts, [])
+
+    def test_state_observation_failure_blocks_before_mutation_token_mint(self):
+        from phase2.operator_inventory import CONTROL_REPOSITORY_ID, STATE_REPOSITORY_ID, InventoryEvidence
+        from phase2.operator_guard import GuardResult
+
+        events = []
+        values = {
+            "PHASE2_ALLOCATOR_APP_ID": "10",
+            "PHASE2_ALLOCATOR_INSTALLATION_ID": "20",
+            "PHASE2_STATE_REPOSITORY_ID": str(STATE_REPOSITORY_ID),
+            "GITHUB_API_URL": "https://api.invalid",
+        }
+        context = SimpleNamespace(
+            run_id=8002, run_attempt=1, trusted_sha="a" * 40,
+            capsule_id="b" * 32, capsule_body_sha256="c" * 64,
+        )
+        legacy = SimpleNamespace(validate=lambda: None)
+        subject = SimpleNamespace(
+            preflight_projection=SimpleNamespace(manifest=SimpleNamespace(sha256="d" * 64))
+        )
+        inventory = InventoryEvidence(
+            10, 20, "selected", tuple(sorted((CONTROL_REPOSITORY_ID, STATE_REPOSITORY_ID))),
+            "2026-09-07T10:06:00Z", 8002, 1, "a" * 40, "b" * 32, "c" * 64,
+            {"metadata": "read"}, True, "e" * 64,
+        )
+        policy = {
+            "control_repository": runtime.CONTROL_REPOSITORY,
+            "control_repository_id": CONTROL_REPOSITORY_ID,
+            "allocator": {
+                "app_id_env": "PHASE2_ALLOCATOR_APP_ID",
+                "installation_id_env": "PHASE2_ALLOCATOR_INSTALLATION_ID",
+                "app_slug": "gitstate-phase-2-allocator",
+                "owner": "8ft0-ai",
+            },
+            "state_repository_id_env": "PHASE2_STATE_REPOSITORY_ID",
+        }
+        with patch.object(runtime, "evaluate_stage", return_value=(subject, GuardResult.pass_result())), \
+             patch.object(runtime, "load_policy", return_value=policy), \
+             patch.object(runtime, "verify_live_installation", return_value={"repository_selection": "selected"}), \
+             patch.object(runtime, "prove_installation_inventory", return_value=inventory), \
+             patch.object(runtime, "_observe_state_baseline", side_effect=runtime.SuccessorRuntimeError("STATE_OBSERVATION_TOKEN_REVOCATION_FAILED")), \
+             patch.object(runtime, "mint_token", side_effect=lambda *a, **k: events.append("mutation-mint") or "token"):
+            with self.assertRaisesRegex(
+                runtime.SuccessorRuntimeError, "STATE_OBSERVATION_TOKEN_REVOCATION_FAILED"
+            ):
+                runtime._mutation_credentials(
+                    values, context, legacy, private_key="fixture-key",
+                    api_factory=lambda token, url: object(),
+                    jwt_factory=lambda app_id, key: "jwt",
+                )
+        self.assertEqual(events, [])
+
+    def test_final_protected_main_fence_blocks_consumption_post(self):
+        from datetime import datetime, timezone
+        from tests.test_successor_execution import (
+            CAPSULE_ID, CONTROL_SHA, MANIFEST_SHA, OPERATION, capsule_comment
+        )
+
+        current = capsule_comment()
+        parsed = capsule_runtime.parse_capsule_comment(
+            current,
+            now=datetime(2026, 9, 7, 10, 10, tzinfo=timezone.utc),
+            expected_control_sha=CONTROL_SHA,
+            expected_operation=OPERATION,
+        )
+        api = SimpleNamespace(posts=[])
+        api.post = lambda path, body: api.posts.append((path, body)) or {"id": 9999}
+        projection = SimpleNamespace(
+            manifest=SimpleNamespace(
+                operator_history=capsule_runtime.operator_history_baseline(())
+            )
+        )
+        with patch.object(capsule_runtime, "discover_capsule", return_value=parsed), \
+             patch.object(capsule_runtime, "validate_public_subject", return_value=projection), \
+             patch.object(capsule_runtime, "_require_current_preconsumption_history"), \
+             patch.object(
+                 capsule_runtime,
+                 "_require_current_protected_main",
+                 side_effect=RuntimeError("PUBLIC_CARRIER_LEDGER_MAIN_MOVED"),
+             ):
+            with self.assertRaisesRegex(RuntimeError, "PUBLIC_CARRIER_LEDGER_MAIN_MOVED"):
+                capsule_runtime.consume_capsule(
+                    api,
+                    expected_control_sha=CONTROL_SHA,
+                    expected_operation=OPERATION,
+                    expected_capsule_id=CAPSULE_ID,
+                    expected_capsule_comment_id=current["id"],
+                    expected_capsule_body_sha256=parsed.body_sha256,
+                    expected_manifest_sha256=MANIFEST_SHA,
+                    run_id=8002,
+                    run_attempt=1,
+                    now=datetime(2026, 9, 7, 10, 10, tzinfo=timezone.utc),
+                )
+        self.assertEqual(api.posts, [])
+
+    def test_final_protected_main_fence_runs_after_history_reread_before_post(self):
+        from datetime import datetime, timezone
+        from tests.test_successor_execution import (
+            CAPSULE_ID, CONTROL_SHA, MANIFEST_SHA, OPERATION, capsule_comment
+        )
+
+        events = []
+        current = capsule_comment()
+        parsed = capsule_runtime.parse_capsule_comment(
+            current,
+            now=datetime(2026, 9, 7, 10, 10, tzinfo=timezone.utc),
+            expected_control_sha=CONTROL_SHA,
+            expected_operation=OPERATION,
+        )
+        observed_body = None
+
+        class API:
+            def post(self, path, body):
+                nonlocal observed_body
+                events.append("post")
+                observed_body = body["body"]
+                return {"id": 9999}
+            def get(self, path):
+                if path.endswith("/issues/comments/9999"):
+                    events.append("reread")
+                    return {
+                        "id": 9999,
+                        "body": observed_body,
+                        "user": {"login": "github-actions[bot]"},
+                        "created_at": "2026-09-07T10:10:00Z",
+                        "updated_at": "2026-09-07T10:10:00Z",
+                    }
+                raise AssertionError(path)
+
+        projection = SimpleNamespace(
+            manifest=SimpleNamespace(
+                operator_history=capsule_runtime.operator_history_baseline(())
+            )
+        )
+        with patch.object(capsule_runtime, "discover_capsule", return_value=parsed), \
+             patch.object(capsule_runtime, "validate_public_subject", return_value=projection), \
+             patch.object(
+                 capsule_runtime, "_require_current_preconsumption_history",
+                 side_effect=lambda *a, **k: events.append("history"),
+             ), \
+             patch.object(
+                 capsule_runtime, "_require_current_protected_main",
+                 side_effect=lambda *a, **k: events.append("main-fence"),
+             ):
+            capsule_runtime.consume_capsule(
+                API(),
+                expected_control_sha=CONTROL_SHA,
+                expected_operation=OPERATION,
+                expected_capsule_id=CAPSULE_ID,
+                expected_capsule_comment_id=current["id"],
+                expected_capsule_body_sha256=parsed.body_sha256,
+                expected_manifest_sha256=MANIFEST_SHA,
+                run_id=8002,
+                run_attempt=1,
+                now=datetime(2026, 9, 7, 10, 10, tzinfo=timezone.utc),
+            )
+        self.assertEqual(events[:3], ["history", "main-fence", "post"])
+
 
 
 if __name__ == "__main__":

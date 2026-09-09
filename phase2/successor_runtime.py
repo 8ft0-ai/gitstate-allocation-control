@@ -21,6 +21,8 @@ from .credentials import (
     require_state_repository_access,
     state_observation_profile,
     state_profile,
+    token_request,
+    validate_token_response,
     verify_live_installation,
 )
 from .github_api import GitHubAPI, GitHubAPIError
@@ -645,10 +647,22 @@ def _observe_state_baseline(
     api_factory: Callable[[str, str], GitHubAPI] = GitHubAPI,
 ) -> tuple[str, str]:
     profile = state_observation_profile(STATE_REPOSITORY_ID)
-    token = mint_token(app_api, installation_id, profile)
-    state_api = api_factory(token, api_url)
+    response = app_api.post(
+        f"/app/installations/{installation_id}/access_tokens",
+        token_request(profile),
+    )
+    if not isinstance(response, dict):
+        raise SuccessorRuntimeError("STATE_OBSERVATION_TOKEN_RESPONSE_INVALID")
+    token = response.get("token")
+    if not isinstance(token, str) or not token:
+        raise SuccessorRuntimeError("STATE_OBSERVATION_TOKEN_MISSING")
+
     primary_error: Exception | None = None
+    state_api = None
+    result: tuple[str, str] | None = None
     try:
+        validate_token_response(response, profile)
+        state_api = api_factory(token, api_url)
         require_state_repository_access(
             token,
             "8ft0-ai",
@@ -671,25 +685,37 @@ def _observe_state_baseline(
         tree_sha = tree.get("sha") if isinstance(tree, Mapping) else None
         if not isinstance(tree_sha, str) or SHA40.fullmatch(tree_sha) is None:
             raise SuccessorRuntimeError("READ_EVIDENCE_AMBIGUOUS")
-        digest = state_observation_sha256(
-            repository_id=STATE_REPOSITORY_ID,
-            ref=STATE_REPOSITORY_REF,
-            commit_sha=commit_sha,
-            tree_sha=tree_sha,
+        result = (
+            commit_sha,
+            state_observation_sha256(
+                repository_id=STATE_REPOSITORY_ID,
+                ref=STATE_REPOSITORY_REF,
+                commit_sha=commit_sha,
+                tree_sha=tree_sha,
+            ),
         )
-        return commit_sha, digest
     except Exception as exc:
         primary_error = exc
-        raise
+
+    try:
+        revocation_api = state_api if state_api is not None else api_factory(token, api_url)
+        _, _, status = revocation_api.request_with_status(
+            "DELETE", "/installation/token"
+        )
+        if status != 204:
+            raise SuccessorRuntimeError("STATE_OBSERVATION_TOKEN_REVOCATION_FAILED")
+    except Exception as revoke_exc:
+        raise SuccessorRuntimeError("STATE_OBSERVATION_TOKEN_REVOCATION_FAILED") from (
+            primary_error or revoke_exc
+        )
     finally:
-        try:
-            _, _, status = state_api.request_with_status("DELETE", "/installation/token")
-            if status != 204:
-                raise SuccessorRuntimeError("STATE_OBSERVATION_TOKEN_REVOCATION_FAILED")
-        except Exception as revoke_exc:
-            if primary_error is None:
-                raise SuccessorRuntimeError("STATE_OBSERVATION_TOKEN_REVOCATION_FAILED") from revoke_exc
-            raise SuccessorRuntimeError("STATE_OBSERVATION_TOKEN_REVOCATION_FAILED") from revoke_exc
+        token = ""
+
+    if primary_error is not None:
+        raise primary_error
+    if result is None:
+        raise SuccessorRuntimeError("STATE_OBSERVATION_EVIDENCE_MISSING")
+    return result
 
 
 def _mutation_credentials(
