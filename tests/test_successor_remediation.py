@@ -527,10 +527,10 @@ class SuccessorFreshnessAndOpenHistoryTests(unittest.TestCase):
         with self.assertRaisesRegex(
             capsule_runtime.SuccessorCapsuleError, "SUCCESSOR_APPROVAL_ATTESTATION_NOT_FOUND"
         ):
-            capsule_runtime._require_manifest_approval_attestation(
+            capsule_runtime.require_current_manifest_approval_attestation(
                 CommentOnlyAPI([current]), capsule
             )
-        observed = capsule_runtime._require_manifest_approval_attestation(
+        observed = capsule_runtime.require_current_manifest_approval_attestation(
             CommentOnlyAPI([approval_attestation_comment(), current]), capsule
         )
         self.assertEqual(observed.attestation_id, capsule.manifest_approval["attestation_id"])
@@ -550,7 +550,7 @@ class SuccessorFreshnessAndOpenHistoryTests(unittest.TestCase):
             capsule_runtime.SuccessorCapsuleError,
             "SUCCESSOR_APPROVAL_ATTESTATION_AMBIGUOUS",
         ):
-            capsule_runtime._require_manifest_approval_attestation(
+            capsule_runtime.require_current_manifest_approval_attestation(
                 CommentOnlyAPI([approval_attestation_comment(), competing, capsule_comment()]),
                 capsule,
             )
@@ -987,6 +987,146 @@ class SuccessorFreshnessAndOpenHistoryTests(unittest.TestCase):
                 )
         self.assertEqual(events, [])
 
+
+    def test_consumption_attestation_edit_delete_or_competitor_blocks_before_post(self):
+        from datetime import datetime, timezone
+        from tests.test_successor_execution import (
+            CAPSULE_ID, CONTROL_SHA, MANIFEST_SHA, OPERATION,
+            approval_attestation_comment, capsule_comment, CommentOnlyAPI,
+        )
+
+        current = capsule_comment()
+        parsed = capsule_runtime.parse_capsule_comment(
+            current,
+            now=datetime(2026, 9, 7, 10, 10, tzinfo=timezone.utc),
+            expected_control_sha=CONTROL_SHA,
+            expected_operation=OPERATION,
+        )
+        projection = SimpleNamespace(
+            manifest=SimpleNamespace(
+                operator_history=capsule_runtime.operator_history_baseline(())
+            )
+        )
+
+        cases = {}
+        edited = approval_attestation_comment()
+        edited["updated_at"] = "2026-09-07T10:00:00Z"
+        cases["edit"] = [edited, current]
+        cases["delete"] = [current]
+        competing = approval_attestation_comment(
+            comment_id=8989, attestation_id="4" * 32,
+            approval={"record_id": "5" * 32, "body_sha256": "6" * 64},
+        )
+        cases["competitor"] = [approval_attestation_comment(), competing, current]
+
+        for name, comments in cases.items():
+            api = CommentOnlyAPI(comments)
+            api.posts = []
+            api.post = lambda path, body: api.posts.append((path, body)) or {"id": 9999}
+            with self.subTest(name=name), \
+                 patch.object(capsule_runtime, "discover_capsule", return_value=parsed), \
+                 patch.object(capsule_runtime, "validate_public_subject", return_value=projection), \
+                 patch.object(capsule_runtime, "_require_current_preconsumption_history"), \
+                 patch.object(capsule_runtime, "_require_current_protected_main"):
+                with self.assertRaises((capsule_runtime.SuccessorCapsuleError, capsule_runtime.SuccessorContractError)):
+                    capsule_runtime.consume_capsule(
+                        api, expected_control_sha=CONTROL_SHA,
+                        expected_operation=OPERATION, expected_capsule_id=CAPSULE_ID,
+                        expected_capsule_comment_id=current["id"],
+                        expected_capsule_body_sha256=parsed.body_sha256,
+                        expected_manifest_sha256=MANIFEST_SHA, run_id=8002, run_attempt=1,
+                        now=datetime(2026, 9, 7, 10, 10, tzinfo=timezone.utc),
+                    )
+            self.assertEqual(api.posts, [])
+
+    def test_final_public_fence_revalidates_attestation_before_stage_pass(self):
+        events = []
+        subject = SimpleNamespace(
+            capsule=SimpleNamespace(),
+            preflight_projection=SimpleNamespace(
+                manifest=SimpleNamespace(payload={"executor": {"commit_sha": "a" * 40}})
+            ),
+        )
+        context = SimpleNamespace(
+            trusted_sha="a" * 40, projection_comment_id=1,
+            projection_body_sha256="b" * 64, manifest_sha256="c" * 64,
+        )
+        with patch.object(runtime, "validate_carrier_ledger", side_effect=lambda *a, **k: events.append("ledger")), \
+             patch.object(runtime, "validate_ledger_only_control_descendant", side_effect=lambda *a, **k: events.append("ancestry")), \
+             patch.object(runtime, "require_current_manifest_approval_attestation", side_effect=lambda *a, **k: events.append("attestation")), \
+             patch.object(runtime, "_require_current_protected_main", side_effect=lambda *a, **k: events.append("main")):
+            runtime._final_public_fence({}, context, subject, api=object())
+        self.assertEqual(events, ["ledger", "ancestry", "attestation", "main"])
+
+
+    def test_l1_and_l2_do_not_return_pass_when_final_attestation_fence_moves(self):
+        from phase2.operator_guard import GuardResult
+        subject = SimpleNamespace(preflight_projection=SimpleNamespace(manifest=SimpleNamespace()))
+        context = SimpleNamespace()
+        for stage in ("live_l1", "live_l2"):
+            with self.subTest(stage=stage), \
+                 patch.object(runtime, "_subject", return_value=subject), \
+                 patch.object(runtime, "_api", return_value=object()), \
+                 patch.object(runtime, "_guard_observation", return_value=SimpleNamespace()), \
+                 patch.object(runtime, "evaluate_guards", return_value=GuardResult.pass_result()), \
+                 patch.object(
+                     runtime, "_final_public_fence",
+                     side_effect=runtime.SuccessorRuntimeError(
+                         "SUCCESSOR_APPROVAL_ATTESTATION_BINDING_MISMATCH"
+                     ),
+                 ):
+                with self.assertRaisesRegex(
+                    runtime.SuccessorRuntimeError,
+                    "SUCCESSOR_APPROVAL_ATTESTATION_BINDING_MISMATCH",
+                ):
+                    runtime.evaluate_stage({}, context, stage=stage)
+
+    def test_l2_attestation_freshness_failure_blocks_before_mutation_token_mint(self):
+        from phase2.operator_guard import GuardResult
+        events = []
+        subject = SimpleNamespace(preflight_projection=SimpleNamespace(manifest=SimpleNamespace(sha256="d" * 64)))
+        context = SimpleNamespace(
+            run_id=8002, run_attempt=1, trusted_sha="a" * 40,
+            capsule_id="b" * 32, capsule_body_sha256="c" * 64,
+        )
+        legacy = SimpleNamespace(validate=lambda: None)
+        values = {
+            "PHASE2_ALLOCATOR_APP_ID": "10",
+            "PHASE2_ALLOCATOR_INSTALLATION_ID": "20",
+            "PHASE2_STATE_REPOSITORY_ID": str(runtime.STATE_REPOSITORY_ID),
+            "GITHUB_API_URL": "https://api.invalid",
+        }
+        inventory = SimpleNamespace(
+            app_id=10, installation_id=20, repository_selection="selected",
+            repository_ids=(runtime.CONTROL_REPOSITORY_ID, runtime.STATE_REPOSITORY_ID),
+        )
+        policy = {
+            "control_repository": runtime.CONTROL_REPOSITORY,
+            "control_repository_id": runtime.CONTROL_REPOSITORY_ID,
+            "allocator": {
+                "app_id_env": "PHASE2_ALLOCATOR_APP_ID",
+                "installation_id_env": "PHASE2_ALLOCATOR_INSTALLATION_ID",
+                "app_slug": "gitstate-phase-2-allocator", "owner": "8ft0-ai",
+            },
+            "state_repository_id_env": "PHASE2_STATE_REPOSITORY_ID",
+        }
+        def eval_stage(*args, stage, **kwargs):
+            if stage == "live_l1":
+                return subject, GuardResult.pass_result()
+            raise runtime.SuccessorRuntimeError("SUCCESSOR_APPROVAL_ATTESTATION_NOT_FOUND")
+        with patch.object(runtime, "evaluate_stage", side_effect=eval_stage), \
+             patch.object(runtime, "load_policy", return_value=policy), \
+             patch.object(runtime, "verify_live_installation", return_value={"repository_selection": "selected"}), \
+             patch.object(runtime, "prove_installation_inventory", return_value=inventory), \
+             patch.object(runtime, "_observe_state_baseline", return_value=("f" * 40, "1" * 64)), \
+             patch.object(runtime, "mint_token", side_effect=lambda *a, **k: events.append("mutation-mint") or "token"):
+            with self.assertRaisesRegex(runtime.SuccessorRuntimeError, "SUCCESSOR_APPROVAL_ATTESTATION_NOT_FOUND"):
+                runtime._mutation_credentials(
+                    values, context, legacy, private_key="fixture-key",
+                    api_factory=lambda token, url: object(), jwt_factory=lambda app_id, key: "jwt",
+                )
+        self.assertEqual(events, [])
+
     def test_final_protected_main_fence_blocks_consumption_post(self):
         from datetime import datetime, timezone
         from tests.test_successor_execution import (
@@ -1010,6 +1150,7 @@ class SuccessorFreshnessAndOpenHistoryTests(unittest.TestCase):
         with patch.object(capsule_runtime, "discover_capsule", return_value=parsed), \
              patch.object(capsule_runtime, "validate_public_subject", return_value=projection), \
              patch.object(capsule_runtime, "_require_current_preconsumption_history"), \
+             patch.object(capsule_runtime, "require_current_manifest_approval_attestation"), \
              patch.object(
                  capsule_runtime,
                  "_require_current_protected_main",
@@ -1076,6 +1217,10 @@ class SuccessorFreshnessAndOpenHistoryTests(unittest.TestCase):
                  side_effect=lambda *a, **k: events.append("history"),
              ), \
              patch.object(
+                 capsule_runtime, "require_current_manifest_approval_attestation",
+                 side_effect=lambda *a, **k: events.append("attestation"),
+             ), \
+             patch.object(
                  capsule_runtime, "_require_current_protected_main",
                  side_effect=lambda *a, **k: events.append("main-fence"),
              ):
@@ -1091,7 +1236,7 @@ class SuccessorFreshnessAndOpenHistoryTests(unittest.TestCase):
                 run_attempt=1,
                 now=datetime(2026, 9, 7, 10, 10, tzinfo=timezone.utc),
             )
-        self.assertEqual(events[:3], ["history", "main-fence", "post"])
+        self.assertEqual(events[:4], ["history", "attestation", "main-fence", "post"])
 
 
 

@@ -55,6 +55,7 @@ from .preflight_runtime_legacy import (
 from .successor_capsule import (
     SuccessorCapsuleError,
     _list_operator_comments,
+    require_current_manifest_approval_attestation,
     validate_public_subject,
 )
 from .successor_contract import (
@@ -563,6 +564,10 @@ def _final_public_fence(
         projected_control_sha=projected_control_sha,
         trusted_sha=context.trusted_sha,
     )
+    # Approval attestation is independently mutable issue-comment evidence.
+    # Revalidate the exact binding and absence of competitors at the same final
+    # public fence used to linearise each live guard stage.
+    require_current_manifest_approval_attestation(api, subject.capsule)
     _require_current_protected_main(api, context.trusted_sha)
 
 

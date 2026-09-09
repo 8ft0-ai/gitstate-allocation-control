@@ -109,7 +109,7 @@ def _validate_preflight_evidence(
 
 
 
-def _require_manifest_approval_attestation(
+def require_current_manifest_approval_attestation(
     api: GitHubAPI, capsule: SuccessorCapsule
 ):
     approval = capsule.manifest_approval
@@ -189,7 +189,7 @@ def validate_public_subject(
         projected_control_sha=projected_control_sha,
         trusted_sha=trusted_sha,
     )
-    attestation = _require_manifest_approval_attestation(api, capsule)
+    attestation = require_current_manifest_approval_attestation(api, capsule)
     validate_capsule_governance(
         capsule,
         preflight_projection.manifest,
@@ -377,6 +377,10 @@ def consume_capsule(
     _require_current_preconsumption_history(
         api, capsule, preflight_projection.manifest
     )
+    # Revalidate movement-sensitive approval authority immediately before the
+    # irreversible write. Operator history and protected-main movement do not
+    # cover edits, deletion or a newly competing public attestation comment.
+    require_current_manifest_approval_attestation(api, capsule)
     # Linearise irreversible consumption against the same protected-main
     # identity that was validated throughout discovery. Any newly effective
     # invalidation or other main movement must block before the write.
