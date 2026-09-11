@@ -7,9 +7,11 @@ _V1_EXPORTS = {
 }
 _ORIGINAL_DISCOVER = _v1.discover_capsule
 _ORIGINAL_CONSUME = _v1.consume_capsule
+_ORIGINAL_REQUIRE_APPROVAL = _v1.require_current_manifest_approval_attestation
 globals().update(_V1_EXPORTS)
 
 from .governance_state_v2 import GuardedExecutionManifestV2
+from .successor_contract import APPROVAL_ATTESTATION_V2_CONTRACT
 
 
 def _sync_v1_globals() -> None:
@@ -21,6 +23,55 @@ def _sync_v1_globals() -> None:
             continue
         if name in globals():
             setattr(_v1, name, globals()[name])
+
+
+def require_current_manifest_approval_attestation(
+    api: GitHubAPI, capsule: SuccessorCapsule
+):
+    # Preserve the complete historical selection and v1 ambiguity contract.
+    selected = _ORIGINAL_REQUIRE_APPROVAL(api, capsule)
+    if selected.payload.get("contract") != APPROVAL_ATTESTATION_V2_CONTRACT:
+        return selected
+
+    # V2 authority belongs to the exact immutable manifest object, not to the
+    # authority record already selected by a downstream capsule. Re-read the
+    # public evidence so the selected attestation must still exist unchanged
+    # and any newly competing authority for the same manifest fails closed.
+    attestations = []
+    for comment in _list_operator_comments(api):
+        try:
+            attestation = parse_manifest_approval_attestation(comment)
+        except SuccessorContractError as exc:
+            raise SuccessorCapsuleError(str(exc)) from exc
+        if attestation is not None:
+            attestations.append(attestation)
+
+    current_selected = [
+        item
+        for item in attestations
+        if item.attestation_id == selected.attestation_id
+        and item.body_sha256 == selected.body_sha256
+    ]
+    if len(current_selected) != 1:
+        raise SuccessorCapsuleError(
+            "SUCCESSOR_APPROVAL_ATTESTATION_NOT_FOUND"
+            if not current_selected
+            else "SUCCESSOR_APPROVAL_ATTESTATION_AMBIGUOUS"
+        )
+    selected = current_selected[0]
+
+    manifest_comment_id = selected.payload.get("manifest_comment_id")
+    competing = [
+        item
+        for item in attestations
+        if item.payload.get("contract") == APPROVAL_ATTESTATION_V2_CONTRACT
+        and item.payload.get("manifest_comment_id") == manifest_comment_id
+        and item.payload.get("manifest_sha256") == capsule.manifest_sha256
+        and item.attestation_id != selected.attestation_id
+    ]
+    if competing:
+        raise SuccessorCapsuleError("SUCCESSOR_APPROVAL_ATTESTATION_AMBIGUOUS")
+    return selected
 
 
 def validate_public_subject(

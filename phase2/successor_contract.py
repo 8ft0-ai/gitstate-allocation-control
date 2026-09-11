@@ -13,7 +13,8 @@ from .governance_state_v2 import (
 
 
 APPROVAL_ATTESTATION_V2_CONTRACT = "gitstate-manifest-approval-attestation/v2"
-APPROVAL_ATTESTATION_V2_PREFIX = "/gitstate-manifest-approval-attestation-v2 "
+APPROVAL_ATTESTATION_V2_RESERVED_PREFIX = "/gitstate-manifest-approval-attestation-v2"
+APPROVAL_ATTESTATION_V2_PREFIX = APPROVAL_ATTESTATION_V2_RESERVED_PREFIX + " "
 EXACT_RECORD_BINDING_FIELDS = frozenset(
     {
         "record_id",
@@ -55,9 +56,12 @@ def _parse_manifest_approval_attestation_v2(comment):
         raise SuccessorContractError(
             "SUCCESSOR_APPROVAL_ATTESTATION_COMMENT_INVALID"
         )
-    if not body.startswith(APPROVAL_ATTESTATION_V2_PREFIX):
+    if not body.startswith(APPROVAL_ATTESTATION_V2_RESERVED_PREFIX):
         return None
-    if "\n" in body:
+    if (
+        not body.startswith(APPROVAL_ATTESTATION_V2_PREFIX)
+        or "\n" in body
+    ):
         raise SuccessorContractError(
             "SUCCESSOR_APPROVAL_ATTESTATION_RESERVED_RECORD_INVALID"
         )
@@ -134,7 +138,7 @@ _parse_manifest_approval_attestation_v1 = _v1.parse_manifest_approval_attestatio
 def parse_manifest_approval_attestation(comment):
     body = comment.get("body")
     if isinstance(body, str) and body.startswith(
-        "/gitstate-manifest-approval-attestation-v2"
+        APPROVAL_ATTESTATION_V2_RESERVED_PREFIX
     ):
         return _parse_manifest_approval_attestation_v2(comment)
     return _parse_manifest_approval_attestation_v1(comment)
