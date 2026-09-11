@@ -98,14 +98,17 @@ def discover_capsule(*args, **kwargs):
     return _ORIGINAL_DISCOVER(*args, **kwargs)
 
 
+_PUBLIC_DISCOVER = discover_capsule
+
+
 def consume_capsule(*args, **kwargs):
     _sync_v1_globals()
-    # Preserve any explicit test/caller replacement of the public discovery
-    # seam; otherwise delegate to the historical implementation directly.
+    # If a caller/test replaced the public discovery seam, propagate that exact
+    # replacement. Otherwise use the historical implementation directly.
     current_discover = globals().get("discover_capsule")
     _v1.discover_capsule = (
         _ORIGINAL_DISCOVER
-        if current_discover is discover_capsule
+        if current_discover is _PUBLIC_DISCOVER
         else current_discover
     )
     return _ORIGINAL_CONSUME(*args, **kwargs)
