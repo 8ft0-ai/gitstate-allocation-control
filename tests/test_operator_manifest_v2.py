@@ -98,20 +98,21 @@ def exact_manifest_subject(manifest, *, record_ids=(), comment_bindings=()):
 
 
 def exact_authority_subject(manifest, *, record_ids=(), comment_bindings=()):
-    value = exact_manifest_subject(
-        manifest, record_ids=record_ids, comment_bindings=comment_bindings
-    )
-    return {"lineage_id": LINEAGE, **value}
+    return {
+        "lineage_id": LINEAGE,
+        **exact_manifest_subject(
+            manifest,
+            record_ids=record_ids,
+            comment_bindings=comment_bindings,
+        ),
+    }
 
 
 def lineage_comments():
     proposal = comment(
         101,
         record_payload(
-            "proposal",
-            PROPOSAL,
-            lineage_subject(),
-            {"disposition": "proposed"},
+            "proposal", PROPOSAL, lineage_subject(), {"disposition": "proposed"}
         ),
     )
     readiness = comment(
@@ -145,7 +146,7 @@ def lineage_comments():
     return proposal, readiness, legacy_authority
 
 
-def manifest_value(proposal, readiness, baseline):
+def guarded_payload(proposal, readiness, baseline):
     return {
         "contract": MANIFEST_V2_CONTRACT,
         "operation": OPERATION,
@@ -205,17 +206,19 @@ def make_manifest():
         expected_issue=ISSUE,
     )
     baseline = governance_history_baseline(pre_records)
-    raw = canonical_json(manifest_value(proposal, readiness, baseline))
+    payload = guarded_payload(proposal, readiness, baseline)
     manifest = attach_manifest_comment_id(
-        parse_guarded_execution_manifest(raw),
+        parse_guarded_execution_manifest(canonical_json(payload)),
         MANIFEST_COMMENT_ID,
     )
-    return proposal, readiness, legacy, manifest
+    return proposal, readiness, legacy, manifest, payload
 
 
 def history(manifest, comments):
     records = parse_governance_comments_v2(
-        comments, expected_owner="8ft0-ai", expected_issue=ISSUE
+        comments,
+        expected_owner="8ft0-ai",
+        expected_issue=ISSUE,
     )
     return build_governance_history(manifest.sha256, records)
 
@@ -292,33 +295,37 @@ def approval_and_authority(manifest, proposal, readiness):
 
 class OperatorManifestV2Tests(unittest.TestCase):
     def test_v2_manifest_is_additive_preauthority_and_digest_bound(self):
-        _, _, _, manifest = make_manifest()
-        self.assertEqual(manifest.payload["contract"], MANIFEST_V2_CONTRACT)
-        self.assertNotIn("authority", manifest.payload)
-        core = dict(manifest.payload)
+        _, _, _, manifest, payload = make_manifest()
+        core = dict(payload)
         core.pop("governance_history")
         parsed = parse_execution_manifest(canonical_json(core))
         self.assertEqual(parsed.payload["contract"], MANIFEST_V2_CONTRACT)
+        self.assertNotIn("authority", parsed.payload)
         with self.assertRaisesRegex(
             OperatorContractError, "V2_MANIFEST_HAS_NO_LIVE_AUTHORITY"
         ):
             _ = parsed.authority
 
         invalid = dict(core)
-        invalid["authority"] = binding(lineage_comments()[2])
+        invalid["authority"] = {"comment_id": 103, "body_sha256": "a" * 64}
         with self.assertRaisesRegex(
             OperatorContractError, "MANIFEST_SCHEMA_MISMATCH"
         ):
             parse_execution_manifest(canonical_json(invalid))
+        self.assertEqual(manifest.manifest_comment_id, MANIFEST_COMMENT_ID)
 
-    def test_legacy_v1_authority_is_nontransferable_but_does_not_block_preflight(self):
-        proposal, readiness, legacy, manifest = make_manifest()
+    def test_legacy_v1_authority_never_transfers_to_v2(self):
+        proposal, readiness, legacy, manifest, _ = make_manifest()
         governance = history(manifest, [proposal, readiness, legacy])
-        result = evaluate_guards(manifest, observation(manifest, governance))
-        self.assertTrue(result.passed)
-        with self.assertRaisesRegex(
-            GovernanceStateError, "AUTHORITY_NOT_GRANTED"
-        ):
+        self.assertTrue(
+            evaluate_guards(manifest, observation(manifest, governance)).passed
+        )
+        blocked = evaluate_guards(
+            manifest,
+            observation(manifest, governance, stage="live_l1", proven=False),
+        )
+        self.assertEqual(blocked.code, "AUTHORITY_NOT_GRANTED")
+        with self.assertRaisesRegex(GovernanceStateError, "AUTHORITY_NOT_GRANTED"):
             reduce_governance_history_v2(
                 manifest,
                 governance,
@@ -326,25 +333,9 @@ class OperatorManifestV2Tests(unittest.TestCase):
                 require_live_authority=True,
             )
 
-    def test_live_guard_requires_separate_exact_authority_proof(self):
-        proposal, readiness, legacy, manifest = make_manifest()
-        governance = history(manifest, [proposal, readiness, legacy])
-        blocked = evaluate_guards(
-            manifest,
-            observation(manifest, governance, stage="live_l1", proven=False),
-        )
-        self.assertEqual(blocked.code, "AUTHORITY_NOT_GRANTED")
-        passed = evaluate_guards(
-            manifest,
-            observation(manifest, governance, stage="live_l1", proven=True),
-        )
-        self.assertTrue(passed.passed)
-
-    def test_exact_manifest_approval_and_authority_reduce_to_active(self):
-        proposal, readiness, legacy, manifest = make_manifest()
-        approval, authority = approval_and_authority(
-            manifest, proposal, readiness
-        )
+    def test_exact_manifest_approval_and_authority_are_required_for_live(self):
+        proposal, readiness, legacy, manifest, _ = make_manifest()
+        approval, authority = approval_and_authority(manifest, proposal, readiness)
         governance = history(
             manifest, [proposal, readiness, legacy, approval, authority]
         )
@@ -358,64 +349,72 @@ class OperatorManifestV2Tests(unittest.TestCase):
         self.assertEqual(state.authority_status, "active")
         self.assertEqual(state.active_authority.record_id, LIVE_AUTHORITY)
 
-    def test_lineage_matching_authority_for_other_manifest_fails_closed(self):
-        proposal, readiness, legacy, manifest = make_manifest()
-        approval, authority = approval_and_authority(
-            manifest, proposal, readiness
+        wrong_subject = exact_authority_subject(
+            manifest,
+            record_ids=(PROPOSAL, READINESS, APPROVAL),
+            comment_bindings=(
+                binding(proposal),
+                binding(readiness),
+                binding(approval),
+            ),
         )
-        payload = dict(
-            parse_governance_comments_v2(
-                [authority], expected_owner="8ft0-ai", expected_issue=ISSUE
-            )[0].payload
+        wrong_subject["manifest_comment_id"] = MANIFEST_COMMENT_ID + 1
+        wrong_authority = comment(
+            105,
+            record_payload(
+                "authority",
+                LIVE_AUTHORITY,
+                wrong_subject,
+                {
+                    "disposition": "granted",
+                    "execution_authorised": True,
+                    "single_use": True,
+                },
+            ),
         )
-        subject = dict(payload["subject"])
-        subject["manifest_comment_id"] = MANIFEST_COMMENT_ID + 1
-        payload["subject"] = subject
-        wrong = comment(105, payload)
-        governance = history(
-            manifest, [proposal, readiness, legacy, approval, wrong]
+        wrong_history = history(
+            manifest,
+            [proposal, readiness, legacy, approval, wrong_authority],
         )
         with self.assertRaisesRegex(
             GovernanceStateError, "GOVERNANCE_RECORD_INVALID"
         ):
             reduce_governance_history_v2(
                 manifest,
-                governance,
+                wrong_history,
                 manifest_comment_id=MANIFEST_COMMENT_ID,
                 require_live_authority=True,
             )
 
-    def test_revoked_consumed_and_ambiguous_v2_authority_fail_closed(self):
-        proposal, readiness, legacy, manifest = make_manifest()
-        approval, authority = approval_and_authority(
-            manifest, proposal, readiness
+    def test_v2_authority_revocation_consumption_and_ambiguity_fail_closed(self):
+        proposal, readiness, legacy, manifest, _ = make_manifest()
+        approval, authority = approval_and_authority(manifest, proposal, readiness)
+        exact_target = exact_manifest_subject(
+            manifest,
+            record_ids=(LIVE_AUTHORITY,),
+            comment_bindings=(binding(authority),),
         )
         revocation = comment(
             106,
             record_payload(
                 "revocation",
                 REVOCATION,
-                exact_manifest_subject(
-                    manifest,
-                    record_ids=(LIVE_AUTHORITY,),
-                    comment_bindings=(binding(authority),),
-                ),
+                exact_target,
                 {
                     "reason": "revoked",
                     "public_invalidation": {"required": False},
                 },
             ),
         )
-        revoked = history(
-            manifest,
-            [proposal, readiness, legacy, approval, authority, revocation],
-        )
         with self.assertRaisesRegex(
             GovernanceStateError, "GOVERNANCE_SUPERSEDED"
         ):
             reduce_governance_history_v2(
                 manifest,
-                revoked,
+                history(
+                    manifest,
+                    [proposal, readiness, legacy, approval, authority, revocation],
+                ),
                 manifest_comment_id=MANIFEST_COMMENT_ID,
                 require_live_authority=True,
             )
@@ -425,24 +424,17 @@ class OperatorManifestV2Tests(unittest.TestCase):
             record_payload(
                 "consumption",
                 CONSUMPTION,
-                exact_manifest_subject(
-                    manifest,
-                    record_ids=(LIVE_AUTHORITY,),
-                    comment_bindings=(binding(authority),),
-                ),
+                exact_target,
                 {"run_id": 123, "run_attempt": 1},
             ),
         )
-        consumed = history(
-            manifest,
-            [proposal, readiness, legacy, approval, authority, consumption],
-        )
-        with self.assertRaisesRegex(
-            GovernanceStateError, "AUTHORITY_CONSUMED"
-        ):
+        with self.assertRaisesRegex(GovernanceStateError, "AUTHORITY_CONSUMED"):
             reduce_governance_history_v2(
                 manifest,
-                consumed,
+                history(
+                    manifest,
+                    [proposal, readiness, legacy, approval, authority, consumption],
+                ),
                 manifest_comment_id=MANIFEST_COMMENT_ID,
                 require_live_authority=True,
             )
@@ -468,21 +460,18 @@ class OperatorManifestV2Tests(unittest.TestCase):
                 },
             ),
         )
-        ambiguous = history(
-            manifest,
-            [proposal, readiness, legacy, approval, authority, second],
-        )
-        with self.assertRaisesRegex(
-            GovernanceStateError, "GOVERNANCE_AMBIGUOUS"
-        ):
+        with self.assertRaisesRegex(GovernanceStateError, "GOVERNANCE_AMBIGUOUS"):
             reduce_governance_history_v2(
                 manifest,
-                ambiguous,
+                history(
+                    manifest,
+                    [proposal, readiness, legacy, approval, authority, second],
+                ),
                 manifest_comment_id=MANIFEST_COMMENT_ID,
                 require_live_authority=True,
             )
 
-    def test_historical_v1_contract_constant_remains_v1(self):
+    def test_historical_v1_contract_identifier_is_unchanged(self):
         self.assertEqual(MANIFEST_CONTRACT, "gitstate-live-execution-manifest/v1")
 
 

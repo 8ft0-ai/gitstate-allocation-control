@@ -2,14 +2,26 @@ from __future__ import annotations
 
 from . import operator_guard_v1 as _v1
 
-globals().update(
-    {name: getattr(_v1, name) for name in dir(_v1) if not name.startswith("__")}
-)
+_V1_EXPORTS = {
+    name: getattr(_v1, name) for name in dir(_v1) if not name.startswith("__")
+}
+globals().update(_V1_EXPORTS)
 
 from .governance_state_v2 import (
     GuardedExecutionManifestV2,
     reduce_governance_history_v2,
 )
+
+
+def _sync_v1_globals() -> None:
+    # Preserve the historical module's monkeypatch/test seams.  The compatibility
+    # wrapper is the public module, so any patched dependency on that surface
+    # must be reflected into the byte-for-byte v1 implementation before use.
+    for name in _V1_EXPORTS:
+        if name == "evaluate_guards":
+            continue
+        if name in globals():
+            setattr(_v1, name, globals()[name])
 
 
 def _evaluate_v2_governance(
@@ -28,10 +40,9 @@ def _evaluate_v2_governance(
         return GuardResult.failure("GUARD_EVALUATOR_DEFECT")
 
     if observation.stage != "preflight":
-        # For V2, this observation bit is set only after successor-contract
-        # validation has proven one exact manifest approval and one exact
-        # manifest-bound one-use live authority through the owner-authenticated
-        # public-safe attestation. Preflight never sets or consumes this proof.
+        # For v2, this bit is set only after the public-safe successor contract
+        # has proven one exact manifest approval and one exact manifest-bound
+        # one-use live authority. Preflight never sets or consumes that proof.
         if not observation.manifest_approval_proven:
             return GuardResult.failure("AUTHORITY_NOT_GRANTED")
         if (
@@ -44,6 +55,7 @@ def _evaluate_v2_governance(
 
 def evaluate_guards(manifest: ExecutionManifest, observation: GuardObservation) -> GuardResult:
     if not isinstance(manifest, GuardedExecutionManifestV2):
+        _sync_v1_globals()
         return _v1.evaluate_guards(manifest, observation)
 
     if not isinstance(observation, _v1.GuardObservation):
