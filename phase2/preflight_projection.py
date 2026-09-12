@@ -10,7 +10,11 @@ globals().update(
 
 from .governance_state_v2 import (
     GuardedExecutionManifestV2,
-    attach_manifest_comment_id,
+    attach_manifest_comment_id as _attach_manifest_comment_id_v2,
+)
+from .governance_state_v3 import (
+    GuardedExecutionManifestV3,
+    attach_manifest_comment_id_v3,
 )
 
 
@@ -25,15 +29,21 @@ def parse_projection_comment(
     projection = _parse_projection_comment_v1(
         comment, expected_body_sha256=expected_body_sha256
     )
-    if projection is None or not isinstance(
-        projection.manifest, GuardedExecutionManifestV2
-    ):
+    if projection is None:
         return projection
+
     manifest_comment_id = int(projection.payload["manifest_comment_id"])
-    manifest = attach_manifest_comment_id(
-        projection.manifest, manifest_comment_id
-    )
-    return replace(projection, manifest=manifest)
+    if isinstance(projection.manifest, GuardedExecutionManifestV3):
+        manifest = attach_manifest_comment_id_v3(
+            projection.manifest, manifest_comment_id
+        )
+        return replace(projection, manifest=manifest)
+    if isinstance(projection.manifest, GuardedExecutionManifestV2):
+        manifest = _attach_manifest_comment_id_v2(
+            projection.manifest, manifest_comment_id
+        )
+        return replace(projection, manifest=manifest)
+    return projection
 
 
 # The historical projection-history implementation resolves this name in its
