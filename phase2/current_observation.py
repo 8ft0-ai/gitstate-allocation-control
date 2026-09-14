@@ -68,7 +68,7 @@ class ObservationContext:
 
 def _context(values: Mapping[str, str]) -> ObservationContext:
     try:
-        context = ObservationContext(
+        result = ObservationContext(
             repository=values["GITHUB_REPOSITORY"],
             ref=values["GITHUB_REF"],
             trusted_sha=values["GITHUB_SHA"],
@@ -78,14 +78,13 @@ def _context(values: Mapping[str, str]) -> ObservationContext:
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise CurrentObservationError("OBSERVATION_CONTEXT_INCOMPLETE") from exc
-    context.validate()
-    return context
+    result.validate()
+    return result
 
 
 def _required_positive_int(values: Mapping[str, str], name: str) -> int:
-    raw = values.get(name, "")
     try:
-        value = int(raw)
+        value = int(values.get(name, ""))
     except (TypeError, ValueError) as exc:
         raise CurrentObservationError(f"{name}_INVALID") from exc
     if value <= 0:
@@ -113,6 +112,7 @@ def _environment_policy_material(
         not isinstance(rule, Mapping) for rule in rules
     ):
         raise CurrentObservationError("READ_EVIDENCE_AMBIGUOUS")
+
     normalised_rules: list[dict[str, Any]] = []
     for rule in rules:
         rule_type = rule.get("type")
@@ -172,6 +172,7 @@ def _environment_policy_material(
         }
     else:
         raise CurrentObservationError("READ_EVIDENCE_AMBIGUOUS")
+
     return {
         "deployment_branch_policy": normalised_branch_policy,
         "name": expected_name,
@@ -210,17 +211,18 @@ def _observe_environment_policy(api: GitHubAPI) -> tuple[Mapping[str, Any], str]
     )
     if not isinstance(payload, Mapping):
         raise CurrentObservationError("READ_EVIDENCE_AMBIGUOUS")
-    normalised = _environment_policy_material(payload, ENVIRONMENT_NAME)
-    digest = _environment_policy_sha256(payload, ENVIRONMENT_NAME)
-    return normalised, digest
+    return (
+        _environment_policy_material(payload, ENVIRONMENT_NAME),
+        _environment_policy_sha256(payload, ENVIRONMENT_NAME),
+    )
 
 
 def _observe_execution_variable(api: GitHubAPI) -> dict[str, object]:
     expected_total: int | None = None
     observed_count = 0
     seen_names: set[str] = set()
-    target_value: str | None = None
     target_seen = False
+    target_value: str | None = None
 
     for page in range(1, MAX_VARIABLE_PAGES + 1):
         payload = api.get(
@@ -270,12 +272,14 @@ def _observe_execution_variable(api: GitHubAPI) -> dict[str, object]:
 
     if expected_total is None or observed_count != expected_total:
         raise CurrentObservationError("EXECUTION_VARIABLE_PAGINATION_INCOMPLETE")
-    if not target_seen:
-        state = "not_defined"
-    elif target_value == "":
-        state = "defined_empty"
-    else:
-        state = "defined_non_empty"
+
+    state = (
+        "not_defined"
+        if not target_seen
+        else "defined_empty"
+        if target_value == ""
+        else "defined_non_empty"
+    )
     return {
         "name": EXECUTION_VARIABLE,
         "defined": target_seen,
@@ -303,13 +307,13 @@ def _observe_installation_inventory(
     token = response.get("token")
     if not isinstance(token, str) or not token:
         raise CurrentObservationError("INVENTORY_TOKEN_MISSING")
-    inventory_api = api_factory(token, api_url)
-    token = ""
 
     primary_error: Exception | None = None
+    inventory_api: GitHubAPI | None = None
     repository_ids: tuple[int, ...] | None = None
     try:
         validate_inventory_token_response(response)
+        inventory_api = api_factory(token, api_url)
         repository_ids = _list_complete_repository_ids(inventory_api)
         if repository_ids != EXPECTED_REPOSITORY_IDS:
             raise CurrentObservationError("INVENTORY_EXACT_SET_MISMATCH")
@@ -317,15 +321,20 @@ def _observe_installation_inventory(
         primary_error = exc
 
     try:
-        _, _, status = inventory_api.request_with_status(
+        revocation_api = (
+            inventory_api if inventory_api is not None else api_factory(token, api_url)
+        )
+        _, _, status = revocation_api.request_with_status(
             "DELETE", "/installation/token"
         )
         if status != 204:
             raise CurrentObservationError("INVENTORY_TOKEN_REVOCATION_STATUS_INVALID")
-    except Exception as exc:
+    except Exception as revoke_exc:
         raise CurrentObservationError("INVENTORY_TOKEN_REVOCATION_FAILED") from (
-            primary_error or exc
+            primary_error or revoke_exc
         )
+    finally:
+        token = ""
 
     if primary_error is not None:
         raise primary_error
@@ -358,12 +367,13 @@ def _observe_state_baseline(
     token = response.get("token")
     if not isinstance(token, str) or not token:
         raise CurrentObservationError("STATE_OBSERVATION_TOKEN_MISSING")
-    state_api = api_factory(token, api_url)
 
     primary_error: Exception | None = None
+    state_api: GitHubAPI | None = None
     result: dict[str, object] | None = None
     try:
         validate_token_response(response, profile)
+        state_api = api_factory(token, api_url)
         require_state_repository_access(
             token,
             "8ft0-ai",
@@ -384,32 +394,34 @@ def _observe_state_baseline(
         tree_sha = tree.get("sha") if isinstance(tree, Mapping) else None
         if not isinstance(tree_sha, str) or SHA40.fullmatch(tree_sha) is None:
             raise CurrentObservationError("READ_EVIDENCE_AMBIGUOUS")
-        digest = _state_observation_sha256(
-            repository_id=STATE_REPOSITORY_ID,
-            ref=STATE_REPOSITORY_REF,
-            commit_sha=commit_sha,
-            tree_sha=tree_sha,
-        )
         result = {
             "repository_id": STATE_REPOSITORY_ID,
             "ref": STATE_REPOSITORY_REF,
             "commit_sha": commit_sha,
             "tree_sha": tree_sha,
-            "digest_sha256": digest,
+            "digest_sha256": _state_observation_sha256(
+                repository_id=STATE_REPOSITORY_ID,
+                ref=STATE_REPOSITORY_REF,
+                commit_sha=commit_sha,
+                tree_sha=tree_sha,
+            ),
         }
     except Exception as exc:
         primary_error = exc
-    finally:
-        token = ""
 
     try:
-        _, _, status = state_api.request_with_status("DELETE", "/installation/token")
+        revocation_api = state_api if state_api is not None else api_factory(token, api_url)
+        _, _, status = revocation_api.request_with_status(
+            "DELETE", "/installation/token"
+        )
         if status != 204:
             raise CurrentObservationError("STATE_OBSERVATION_TOKEN_REVOCATION_FAILED")
-    except Exception as exc:
+    except Exception as revoke_exc:
         raise CurrentObservationError("STATE_OBSERVATION_TOKEN_REVOCATION_FAILED") from (
-            primary_error or exc
+            primary_error or revoke_exc
         )
+    finally:
+        token = ""
 
     if primary_error is not None:
         raise primary_error
@@ -439,11 +451,18 @@ def run(
     if allocator.get("app_slug") != "gitstate-phase-2-allocator":
         raise CurrentObservationError("ALLOCATOR_APP_POLICY_MISMATCH")
 
-    app_id = _required_positive_int(env, str(allocator["app_id_env"]))
-    installation_id = _required_positive_int(env, str(allocator["installation_id_env"]))
-    state_repository_id = _required_positive_int(
-        env, str(policy["state_repository_id_env"])
-    )
+    app_id_env = allocator.get("app_id_env")
+    installation_id_env = allocator.get("installation_id_env")
+    state_repository_id_env = policy.get("state_repository_id_env")
+    if not all(
+        isinstance(item, str) and item
+        for item in (app_id_env, installation_id_env, state_repository_id_env)
+    ):
+        raise CurrentObservationError("ALLOCATOR_POLICY_INVALID")
+
+    app_id = _required_positive_int(env, app_id_env)
+    installation_id = _required_positive_int(env, installation_id_env)
+    state_repository_id = _required_positive_int(env, state_repository_id_env)
     if state_repository_id != STATE_REPOSITORY_ID:
         raise CurrentObservationError("STATE_REPOSITORY_ID_MISMATCH")
 
@@ -467,6 +486,7 @@ def run(
         app_api = api_factory(app_jwt, api_url)
     finally:
         app_jwt = ""
+
     installation = verify_live_installation(
         app_api,
         CONTROL_OWNER,
