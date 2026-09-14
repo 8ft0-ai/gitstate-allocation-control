@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import sys
 from dataclasses import dataclass
@@ -32,9 +33,9 @@ CONTROL_OWNER = "8ft0-ai"
 CONTROL_NAME = "gitstate-allocation-control"
 ENVIRONMENT_NAME = "phase-2-allocator"
 EXECUTION_VARIABLE = "PHASE2_WORKSTREAM_D_EXECUTION_ENABLED"
+CONFIGURATION_VARIABLES_ENV = "PHASE2_CONFIGURATION_VARIABLES_JSON"
 STATE_REPOSITORY = "8ft0-ai/gitstate-allocation-state"
 STATE_REPOSITORY_REF = "refs/heads/main"
-MAX_VARIABLE_PAGES = 100
 PERMISSION_PROFILE_SHA256 = (
     "e577e2ae1f3072a07de54b32c250e00cac492b4ae176ab485ff1d1157261942d"
 )
@@ -217,73 +218,46 @@ def _observe_environment_policy(api: GitHubAPI) -> tuple[Mapping[str, Any], str]
     )
 
 
-def _observe_execution_variable(api: GitHubAPI) -> dict[str, object]:
-    expected_total: int | None = None
-    observed_count = 0
-    seen_names: set[str] = set()
-    target_seen = False
-    target_value: str | None = None
-
-    for page in range(1, MAX_VARIABLE_PAGES + 1):
-        payload = api.get(
-            f"/repos/{CONTROL_REPOSITORY}/environments/"
-            f"{quote(ENVIRONMENT_NAME, safe='')}/variables?per_page=100&page={page}"
-        )
-        if not isinstance(payload, Mapping):
-            raise CurrentObservationError("EXECUTION_VARIABLE_EVIDENCE_AMBIGUOUS")
-        total_count = payload.get("total_count")
-        variables = payload.get("variables")
-        if (
-            type(total_count) is not int
-            or total_count < 0
-            or not isinstance(variables, list)
-        ):
-            raise CurrentObservationError("EXECUTION_VARIABLE_EVIDENCE_AMBIGUOUS")
-        if expected_total is None:
-            expected_total = total_count
-        elif total_count != expected_total:
-            raise CurrentObservationError(
-                "EXECUTION_VARIABLE_SET_CHANGED_DURING_PAGINATION"
-            )
-
-        for item in variables:
-            if not isinstance(item, Mapping):
+def _configuration_variables(raw: str) -> dict[str, str]:
+    def reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
                 raise CurrentObservationError("EXECUTION_VARIABLE_EVIDENCE_AMBIGUOUS")
-            name = item.get("name")
-            value = item.get("value")
-            if not isinstance(name, str) or not name or not isinstance(value, str):
-                raise CurrentObservationError("EXECUTION_VARIABLE_EVIDENCE_AMBIGUOUS")
-            if name in seen_names:
-                raise CurrentObservationError("EXECUTION_VARIABLE_DUPLICATE_NAME")
-            seen_names.add(name)
-            observed_count += 1
-            if name == EXECUTION_VARIABLE:
-                target_seen = True
-                target_value = value
+            result[key] = value
+        return result
 
-        if observed_count > expected_total:
-            raise CurrentObservationError("EXECUTION_VARIABLE_COUNT_MISMATCH")
-        if observed_count == expected_total:
-            break
-        if len(variables) < 100:
-            raise CurrentObservationError("EXECUTION_VARIABLE_PAGINATION_INCOMPLETE")
-    else:
-        raise CurrentObservationError("EXECUTION_VARIABLE_PAGINATION_EXCESSIVE")
+    try:
+        payload = json.loads(raw, object_pairs_hook=reject_duplicate_keys)
+    except CurrentObservationError:
+        raise
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise CurrentObservationError("EXECUTION_VARIABLE_EVIDENCE_AMBIGUOUS") from exc
+    if not isinstance(payload, dict):
+        raise CurrentObservationError("EXECUTION_VARIABLE_EVIDENCE_AMBIGUOUS")
 
-    if expected_total is None or observed_count != expected_total:
-        raise CurrentObservationError("EXECUTION_VARIABLE_PAGINATION_INCOMPLETE")
+    result: dict[str, str] = {}
+    for name, value in payload.items():
+        if not isinstance(name, str) or not name or not isinstance(value, str):
+            raise CurrentObservationError("EXECUTION_VARIABLE_EVIDENCE_AMBIGUOUS")
+        result[name] = value
+    return result
 
-    state = (
-        "not_defined"
-        if not target_seen
-        else "defined_empty"
-        if target_value == ""
-        else "defined_non_empty"
-    )
+
+def _observe_execution_variable(raw_configuration_variables: str) -> dict[str, object]:
+    variables = _configuration_variables(raw_configuration_variables)
+    if EXECUTION_VARIABLE not in variables:
+        return {
+            "name": EXECUTION_VARIABLE,
+            "defined": False,
+            "state": "not_defined",
+        }
+
+    value = variables[EXECUTION_VARIABLE]
     return {
         "name": EXECUTION_VARIABLE,
-        "defined": target_seen,
-        "state": state,
+        "defined": True,
+        "state": "defined_empty" if value == "" else "defined_non_empty",
     }
 
 
@@ -466,9 +440,13 @@ def run(
     if state_repository_id != STATE_REPOSITORY_ID:
         raise CurrentObservationError("STATE_REPOSITORY_ID_MISMATCH")
 
+    raw_configuration_variables = env.get(CONFIGURATION_VARIABLES_ENV)
+    if raw_configuration_variables is None:
+        raise CurrentObservationError("EXECUTION_VARIABLE_EVIDENCE_UNAVAILABLE")
+
     control_api = _control_api(env, api_factory)
     environment_policy, policy_sha256 = _observe_environment_policy(control_api)
-    execution_variable = _observe_execution_variable(control_api)
+    execution_variable = _observe_execution_variable(raw_configuration_variables)
 
     key_name = "PHASE2_ALLOCATOR_APP_PRIVATE_KEY"
     private_key = env.get(key_name, "")
