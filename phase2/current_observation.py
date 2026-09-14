@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-import json
 import os
 import sys
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, MutableMapping
 from urllib.parse import quote
 
-from . import workstream_d_live as live
 from .credentials import (
     create_app_jwt,
     require_state_repository_access,
@@ -20,19 +18,13 @@ from .github_api import GitHubAPI, GitHubAPIError
 from .operator_inventory import (
     EXPECTED_REPOSITORY_IDS,
     INVENTORY_PERMISSIONS,
-    InventoryProofError,
     STATE_REPOSITORY_ID,
     _list_complete_repository_ids,
     inventory_token_request,
     validate_inventory_token_response,
 )
-from .operator_manifest import SHA40, canonical_json
+from .operator_manifest import SHA40, canonical_json, sha256_text
 from .policy import load_policy
-from .successor_runtime import (
-    _environment_policy_material,
-    environment_policy_sha256,
-    state_observation_sha256,
-)
 
 
 CONTROL_REPOSITORY = "8ft0-ai/gitstate-allocation-control"
@@ -40,8 +32,8 @@ CONTROL_OWNER = "8ft0-ai"
 CONTROL_NAME = "gitstate-allocation-control"
 ENVIRONMENT_NAME = "phase-2-allocator"
 EXECUTION_VARIABLE = "PHASE2_WORKSTREAM_D_EXECUTION_ENABLED"
-STATE_REPOSITORY = live.STATE_REPOSITORY
-STATE_REPOSITORY_REF = live.STATE_REPOSITORY_BASELINE_REF
+STATE_REPOSITORY = "8ft0-ai/gitstate-allocation-state"
+STATE_REPOSITORY_REF = "refs/heads/main"
 MAX_VARIABLE_PAGES = 100
 PERMISSION_PROFILE_SHA256 = (
     "e577e2ae1f3072a07de54b32c250e00cac492b4ae176ab485ff1d1157261942d"
@@ -111,17 +103,115 @@ def _control_api(
     return api_factory(token, values.get("GITHUB_API_URL", "https://api.github.com"))
 
 
+def _environment_policy_material(
+    payload: Mapping[str, Any], expected_name: str
+) -> Mapping[str, Any]:
+    if payload.get("name") != expected_name:
+        raise CurrentObservationError("ENVIRONMENT_BOUNDARY_CHANGED")
+    rules = payload.get("protection_rules")
+    if not isinstance(rules, list) or any(
+        not isinstance(rule, Mapping) for rule in rules
+    ):
+        raise CurrentObservationError("READ_EVIDENCE_AMBIGUOUS")
+    normalised_rules: list[dict[str, Any]] = []
+    for rule in rules:
+        rule_type = rule.get("type")
+        if rule_type == "wait_timer":
+            timer = rule.get("wait_timer")
+            if type(timer) is not int or timer < 0:
+                raise CurrentObservationError("READ_EVIDENCE_AMBIGUOUS")
+            normalised_rules.append({"type": "wait_timer", "wait_timer": timer})
+            continue
+        if rule_type == "required_reviewers":
+            reviewers = rule.get("reviewers")
+            prevent_self_review = rule.get("prevent_self_review")
+            if not isinstance(reviewers, list) or type(prevent_self_review) is not bool:
+                raise CurrentObservationError("READ_EVIDENCE_AMBIGUOUS")
+            normalised_reviewers: list[dict[str, Any]] = []
+            for entry in reviewers:
+                if not isinstance(entry, Mapping):
+                    raise CurrentObservationError("READ_EVIDENCE_AMBIGUOUS")
+                reviewer = entry.get("reviewer")
+                reviewer_type = entry.get("type")
+                if not isinstance(reviewer, Mapping) or not isinstance(
+                    reviewer_type, str
+                ):
+                    raise CurrentObservationError("READ_EVIDENCE_AMBIGUOUS")
+                reviewer_id = reviewer.get("id")
+                if type(reviewer_id) is not int or reviewer_id <= 0:
+                    raise CurrentObservationError("READ_EVIDENCE_AMBIGUOUS")
+                normalised_reviewers.append(
+                    {"id": reviewer_id, "type": reviewer_type}
+                )
+            normalised_reviewers.sort(key=lambda item: (item["type"], item["id"]))
+            normalised_rules.append(
+                {
+                    "type": "required_reviewers",
+                    "prevent_self_review": prevent_self_review,
+                    "reviewers": normalised_reviewers,
+                }
+            )
+            continue
+        if rule_type == "branch_policy":
+            normalised_rules.append({"type": "branch_policy"})
+            continue
+        raise CurrentObservationError("READ_EVIDENCE_AMBIGUOUS")
+    normalised_rules.sort(key=canonical_json)
+
+    branch_policy = payload.get("deployment_branch_policy")
+    if branch_policy is None:
+        normalised_branch_policy: Mapping[str, Any] | None = None
+    elif isinstance(branch_policy, Mapping):
+        protected = branch_policy.get("protected_branches")
+        custom = branch_policy.get("custom_branch_policies")
+        if type(protected) is not bool or type(custom) is not bool:
+            raise CurrentObservationError("READ_EVIDENCE_AMBIGUOUS")
+        normalised_branch_policy = {
+            "custom_branch_policies": custom,
+            "protected_branches": protected,
+        }
+    else:
+        raise CurrentObservationError("READ_EVIDENCE_AMBIGUOUS")
+    return {
+        "deployment_branch_policy": normalised_branch_policy,
+        "name": expected_name,
+        "protection_rules": normalised_rules,
+    }
+
+
+def _environment_policy_sha256(payload: Mapping[str, Any], expected_name: str) -> str:
+    return sha256_text(canonical_json(_environment_policy_material(payload, expected_name)))
+
+
+def _state_observation_sha256(
+    *, repository_id: int, ref: str, commit_sha: str, tree_sha: str
+) -> str:
+    if repository_id != STATE_REPOSITORY_ID:
+        raise CurrentObservationError("STATE_REPOSITORY_ID_MISMATCH")
+    if ref != STATE_REPOSITORY_REF:
+        raise CurrentObservationError("STATE_BASELINE_CHANGED")
+    if SHA40.fullmatch(commit_sha) is None or SHA40.fullmatch(tree_sha) is None:
+        raise CurrentObservationError("READ_EVIDENCE_AMBIGUOUS")
+    return sha256_text(
+        canonical_json(
+            {
+                "commit_sha": commit_sha,
+                "ref": ref,
+                "repository_id": repository_id,
+                "tree_sha": tree_sha,
+            }
+        )
+    )
+
+
 def _observe_environment_policy(api: GitHubAPI) -> tuple[Mapping[str, Any], str]:
     payload = api.get(
         f"/repos/{CONTROL_REPOSITORY}/environments/{quote(ENVIRONMENT_NAME, safe='')}"
     )
     if not isinstance(payload, Mapping):
         raise CurrentObservationError("READ_EVIDENCE_AMBIGUOUS")
-    try:
-        normalised = _environment_policy_material(payload, ENVIRONMENT_NAME)
-        digest = environment_policy_sha256(payload, ENVIRONMENT_NAME)
-    except Exception as exc:
-        raise CurrentObservationError(str(exc).split(":", 1)[0]) from exc
+    normalised = _environment_policy_material(payload, ENVIRONMENT_NAME)
+    digest = _environment_policy_sha256(payload, ENVIRONMENT_NAME)
     return normalised, digest
 
 
@@ -141,12 +231,18 @@ def _observe_execution_variable(api: GitHubAPI) -> dict[str, object]:
             raise CurrentObservationError("EXECUTION_VARIABLE_EVIDENCE_AMBIGUOUS")
         total_count = payload.get("total_count")
         variables = payload.get("variables")
-        if type(total_count) is not int or total_count < 0 or not isinstance(variables, list):
+        if (
+            type(total_count) is not int
+            or total_count < 0
+            or not isinstance(variables, list)
+        ):
             raise CurrentObservationError("EXECUTION_VARIABLE_EVIDENCE_AMBIGUOUS")
         if expected_total is None:
             expected_total = total_count
         elif total_count != expected_total:
-            raise CurrentObservationError("EXECUTION_VARIABLE_SET_CHANGED_DURING_PAGINATION")
+            raise CurrentObservationError(
+                "EXECUTION_VARIABLE_SET_CHANGED_DURING_PAGINATION"
+            )
 
         for item in variables:
             if not isinstance(item, Mapping):
@@ -263,14 +359,13 @@ def _observe_state_baseline(
     if not isinstance(token, str) or not token:
         raise CurrentObservationError("STATE_OBSERVATION_TOKEN_MISSING")
     state_api = api_factory(token, api_url)
-    token = ""
 
     primary_error: Exception | None = None
     result: dict[str, object] | None = None
     try:
         validate_token_response(response, profile)
         require_state_repository_access(
-            state_api.token,
+            token,
             "8ft0-ai",
             "gitstate-allocation-state",
             STATE_REPOSITORY_ID,
@@ -289,7 +384,7 @@ def _observe_state_baseline(
         tree_sha = tree.get("sha") if isinstance(tree, Mapping) else None
         if not isinstance(tree_sha, str) or SHA40.fullmatch(tree_sha) is None:
             raise CurrentObservationError("READ_EVIDENCE_AMBIGUOUS")
-        digest = state_observation_sha256(
+        digest = _state_observation_sha256(
             repository_id=STATE_REPOSITORY_ID,
             ref=STATE_REPOSITORY_REF,
             commit_sha=commit_sha,
@@ -304,6 +399,8 @@ def _observe_state_baseline(
         }
     except Exception as exc:
         primary_error = exc
+    finally:
+        token = ""
 
     try:
         _, _, status = state_api.request_with_status("DELETE", "/installation/token")
@@ -332,17 +429,21 @@ def run(
     api_url = env.get("GITHUB_API_URL", "https://api.github.com")
 
     policy = load_policy(env.get("PHASE2_POLICY", "policy/actors.json"))
+    allocator = policy.get("allocator")
     if policy.get("control_repository") != CONTROL_REPOSITORY:
         raise CurrentObservationError("CONTROL_REPOSITORY_POLICY_MISMATCH")
-    if policy.get("allocator", {}).get("owner") != CONTROL_OWNER:
+    if not isinstance(allocator, Mapping):
+        raise CurrentObservationError("ALLOCATOR_POLICY_INVALID")
+    if allocator.get("owner") != CONTROL_OWNER:
         raise CurrentObservationError("ALLOCATOR_OWNER_POLICY_MISMATCH")
-    if policy.get("allocator", {}).get("app_slug") != "gitstate-phase-2-allocator":
+    if allocator.get("app_slug") != "gitstate-phase-2-allocator":
         raise CurrentObservationError("ALLOCATOR_APP_POLICY_MISMATCH")
 
-    allocator = policy["allocator"]
     app_id = _required_positive_int(env, str(allocator["app_id_env"]))
     installation_id = _required_positive_int(env, str(allocator["installation_id_env"]))
-    state_repository_id = _required_positive_int(env, str(policy["state_repository_id_env"]))
+    state_repository_id = _required_positive_int(
+        env, str(policy["state_repository_id_env"])
+    )
     if state_repository_id != STATE_REPOSITORY_ID:
         raise CurrentObservationError("STATE_REPOSITORY_ID_MISMATCH")
 
@@ -362,7 +463,10 @@ def run(
     if not isinstance(app_jwt, str) or not app_jwt:
         raise CurrentObservationError("ALLOCATOR_APP_JWT_MISSING")
 
-    app_api = api_factory(app_jwt, api_url)
+    try:
+        app_api = api_factory(app_jwt, api_url)
+    finally:
+        app_jwt = ""
     installation = verify_live_installation(
         app_api,
         CONTROL_OWNER,
@@ -390,7 +494,6 @@ def run(
         api_url=api_url,
         api_factory=api_factory,
     )
-    app_jwt = ""
 
     return {
         "status": "GITSTATE_CURRENT_OBSERVATION_COMPLETE",
@@ -455,7 +558,11 @@ def _blocked_payload(exc: Exception) -> dict[str, object]:
 def main(argv: list[str] | None = None) -> int:
     arguments = sys.argv[1:] if argv is None else argv
     if arguments:
-        print(canonical_json(_blocked_payload(CurrentObservationError("OBSERVATION_ARGUMENT_INVALID"))))
+        print(
+            canonical_json(
+                _blocked_payload(CurrentObservationError("OBSERVATION_ARGUMENT_INVALID"))
+            )
+        )
         return 2
     try:
         payload = run()
