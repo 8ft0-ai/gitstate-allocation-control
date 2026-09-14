@@ -262,6 +262,32 @@ jobs:
           echo 'The successor capsule is single-use and the live workflow is not rerunnable as authority.'
           echo 'No result from this workflow authorises another Workstream D attempt or Workstream E.'
 
+  current-observation:
+    needs: contract-check
+    if: ${{ inputs.operation == 'current_observation' }}
+    runs-on: ubuntu-24.04
+    environment: phase-2-allocator
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Checkout immutable protected-main content without persisted credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Reconstruct current read-only allocator observation
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          INPUT_OPERATION: ${{ inputs.operation }}
+          PHASE2_ALLOCATOR_APP_ID: ${{ vars.PHASE2_ALLOCATOR_APP_ID }}
+          PHASE2_ALLOCATOR_INSTALLATION_ID: ${{ vars.PHASE2_ALLOCATOR_INSTALLATION_ID }}
+          PHASE2_ALLOCATOR_APP_PRIVATE_KEY: ${{ secrets['PHASE2_ALLOCATOR_APP_PRIVATE_KEY'] }}
+          PHASE2_STATE_REPOSITORY_ID: ${{ secrets.PHASE2_STATE_REPOSITORY_ID }}
+        run: PYTHONPATH=. python3 -m phase2.current_observation
+
   operator-preflight:
     needs: [contract-check]
     if: ${{ inputs.operation == 'operator_preflight' }}
@@ -293,29 +319,3 @@ jobs:
           echo 'Operator preflight is a read-only projection check and cannot create or consume execution authority.'
           echo 'The route receives no allocator App private key, installation token or control/state mutation token.'
           echo 'No preflight result grants live Workstream D or Workstream E authority.'
-
-  current-observation:
-    needs: contract-check
-    if: ${{ inputs.operation == 'current_observation' }}
-    runs-on: ubuntu-24.04
-    environment: phase-2-allocator
-    permissions:
-      actions: read
-      contents: read
-    steps:
-      - name: Checkout immutable protected-main content without persisted credentials
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-          fetch-depth: 1
-
-      - name: Reconstruct current read-only allocator observation
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-          INPUT_OPERATION: ${{ inputs.operation }}
-          PHASE2_ALLOCATOR_APP_ID: ${{ vars.PHASE2_ALLOCATOR_APP_ID }}
-          PHASE2_ALLOCATOR_INSTALLATION_ID: ${{ vars.PHASE2_ALLOCATOR_INSTALLATION_ID }}
-          PHASE2_ALLOCATOR_APP_PRIVATE_KEY: ${{ secrets['PHASE2_ALLOCATOR_APP_PRIVATE_KEY'] }}
-          PHASE2_STATE_REPOSITORY_ID: ${{ secrets.PHASE2_STATE_REPOSITORY_ID }}
-        run: PYTHONPATH=. python3 -m phase2.current_observation
