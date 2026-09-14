@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import base64
+import binascii
+import hashlib
 import os
+import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, MutableMapping
 from urllib.parse import quote
@@ -42,10 +47,31 @@ ENVIRONMENT_OBSERVATION_PERMISSIONS = {
 PERMISSION_PROFILE_SHA256 = (
     "e577e2ae1f3072a07de54b32c250e00cac492b4ae176ab485ff1d1157261942d"
 )
+RECIPIENT_CERTIFICATE_ENV = "INPUT_CURRENT_OBSERVATION_RECIPIENT_CERT_B64"
+ENVELOPE_CONTRACT_VERSION = "gitstate-current-observation-envelope-v1"
+MAX_RECIPIENT_CERTIFICATE_B64_CHARS = 16_384
+MAX_RECIPIENT_CERTIFICATE_DER_BYTES = 12_288
+MAX_PRIVATE_OBSERVATION_BYTES = 131_072
+MAX_CIPHERTEXT_BYTES = 196_608
+OPENSSL_TIMEOUT_SECONDS = 15
 
 
 class CurrentObservationError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class RecipientCertificate:
+    der: bytes
+    sha256: str
+
+    def validate_binding(self) -> None:
+        if (
+            not self.der
+            or len(self.der) > MAX_RECIPIENT_CERTIFICATE_DER_BYTES
+            or hashlib.sha256(self.der).hexdigest() != self.sha256
+        ):
+            raise CurrentObservationError("RECIPIENT_CERTIFICATE_MISMATCH")
 
 
 @dataclass(frozen=True)
@@ -104,6 +130,69 @@ def _control_api(
     if not token:
         raise CurrentObservationError("READ_EVIDENCE_UNAVAILABLE")
     return api_factory(token, values.get("GITHUB_API_URL", "https://api.github.com"))
+
+
+def _run_openssl(
+    arguments: list[str],
+    *,
+    stdin: bytes,
+    failure_code: str,
+) -> subprocess.CompletedProcess[bytes]:
+    try:
+        result = subprocess.run(
+            ["openssl", *arguments],
+            input=stdin,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=OPENSSL_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise CurrentObservationError(failure_code) from exc
+    if result.returncode != 0:
+        raise CurrentObservationError(failure_code)
+    return result
+
+
+def _load_recipient_certificate(values: Mapping[str, str]) -> RecipientCertificate:
+    if values.get("GITHUB_ACTOR") != CONTROL_OWNER:
+        raise CurrentObservationError("OBSERVATION_OWNER_ACTOR_REQUIRED")
+    encoded = values.get(RECIPIENT_CERTIFICATE_ENV, "")
+    if (
+        not isinstance(encoded, str)
+        or not encoded
+        or len(encoded) > MAX_RECIPIENT_CERTIFICATE_B64_CHARS
+        or not encoded.isascii()
+    ):
+        raise CurrentObservationError("RECIPIENT_CERTIFICATE_INVALID")
+    try:
+        certificate_der = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise CurrentObservationError("RECIPIENT_CERTIFICATE_INVALID") from exc
+    if (
+        not certificate_der
+        or len(certificate_der) > MAX_RECIPIENT_CERTIFICATE_DER_BYTES
+    ):
+        raise CurrentObservationError("RECIPIENT_CERTIFICATE_INVALID")
+
+    parsed = _run_openssl(
+        ["x509", "-inform", "DER", "-outform", "DER"],
+        stdin=certificate_der,
+        failure_code="RECIPIENT_CERTIFICATE_INVALID",
+    )
+    if parsed.stdout != certificate_der:
+        raise CurrentObservationError("RECIPIENT_CERTIFICATE_INVALID")
+    _run_openssl(
+        ["x509", "-inform", "DER", "-noout", "-checkend", "0"],
+        stdin=certificate_der,
+        failure_code="RECIPIENT_CERTIFICATE_INVALID",
+    )
+    recipient = RecipientCertificate(
+        der=certificate_der,
+        sha256=hashlib.sha256(certificate_der).hexdigest(),
+    )
+    recipient.validate_binding()
+    return recipient
 
 
 def _list_counted_collection(
@@ -464,16 +553,17 @@ def _validate_environment_observation_token_response(
     return token
 
 
-def _observe_execution_variable(api: GitHubAPI) -> dict[str, object]:
-    environment = quote(ENVIRONMENT_NAME, safe="")
+def _read_execution_variable_collection(
+    api: GitHubAPI,
+    collection_path: str,
+) -> tuple[tuple[str, str], ...]:
     variables = _list_counted_collection(
         api,
-        f"/repos/{CONTROL_REPOSITORY}/environments/{environment}/variables",
+        collection_path,
         key="variables",
         per_page=30,
     )
-    selected_value: str | None = None
-    selected_found = False
+    canonical_variables: list[tuple[str, str]] = []
     seen_names: set[str] = set()
     for variable in variables:
         name = variable.get("name")
@@ -483,9 +573,55 @@ def _observe_execution_variable(api: GitHubAPI) -> dict[str, object]:
         if name in seen_names:
             raise CurrentObservationError("EXECUTION_VARIABLE_EVIDENCE_AMBIGUOUS")
         seen_names.add(name)
-        if name == EXECUTION_VARIABLE:
-            selected_found = True
-            selected_value = value
+        canonical_variables.append((name, value))
+    return tuple(sorted(canonical_variables))
+
+
+def _read_exact_execution_variable(
+    api: GitHubAPI,
+    exact_path: str,
+) -> tuple[bool, str | None]:
+    try:
+        payload = api.get(exact_path)
+    except GitHubAPIError as exc:
+        if exc.status == 404:
+            return False, None
+        raise
+    if not isinstance(payload, Mapping):
+        raise CurrentObservationError("EXECUTION_VARIABLE_EVIDENCE_AMBIGUOUS")
+    name = payload.get("name")
+    value = payload.get("value")
+    if name != EXECUTION_VARIABLE or not isinstance(value, str):
+        raise CurrentObservationError("EXECUTION_VARIABLE_EVIDENCE_AMBIGUOUS")
+    return True, value
+
+
+def _observe_execution_variable(api: GitHubAPI) -> dict[str, object]:
+    environment = quote(ENVIRONMENT_NAME, safe="")
+    variable_name = quote(EXECUTION_VARIABLE, safe="")
+    collection_path = (
+        f"/repos/{CONTROL_REPOSITORY}/environments/{environment}/variables"
+    )
+    exact_path = f"{collection_path}/{variable_name}"
+
+    first_exact = _read_exact_execution_variable(api, exact_path)
+    first_collection = _read_execution_variable_collection(api, collection_path)
+    second_collection = _read_execution_variable_collection(api, collection_path)
+    if first_collection != second_collection:
+        raise CurrentObservationError("EXECUTION_VARIABLE_EVIDENCE_MOVED")
+    second_exact = _read_exact_execution_variable(api, exact_path)
+    if first_exact != second_exact:
+        raise CurrentObservationError("EXECUTION_VARIABLE_EVIDENCE_MOVED")
+
+    collection_values = [
+        value for name, value in first_collection if name == EXECUTION_VARIABLE
+    ]
+    selected_found, selected_value = first_exact
+    if selected_found:
+        if collection_values != [selected_value]:
+            raise CurrentObservationError("EXECUTION_VARIABLE_EVIDENCE_AMBIGUOUS")
+    elif collection_values:
+        raise CurrentObservationError("EXECUTION_VARIABLE_EVIDENCE_AMBIGUOUS")
 
     if not selected_found:
         return {
@@ -712,6 +848,7 @@ def run(
 ) -> dict[str, object]:
     env = os.environ if values is None else values
     context = _context(env)
+    _load_recipient_certificate(env)
     api_url = env.get("GITHUB_API_URL", "https://api.github.com")
 
     policy = load_policy(env.get("PHASE2_POLICY", "policy/actors.json"))
@@ -847,6 +984,88 @@ def run(
     }
 
 
+def _seal_observation(
+    payload: Mapping[str, object],
+    recipient: RecipientCertificate,
+) -> dict[str, object]:
+    recipient.validate_binding()
+    operation = payload.get("operation")
+    run_id = payload.get("run_id")
+    run_attempt = payload.get("run_attempt")
+    trusted_sha = payload.get("trusted_sha")
+    if (
+        payload.get("status") != "GITSTATE_CURRENT_OBSERVATION_COMPLETE"
+        or operation != "current_observation"
+        or type(run_id) is not int
+        or run_id <= 0
+        or run_attempt != 1
+        or not isinstance(trusted_sha, str)
+        or SHA40.fullmatch(trusted_sha) is None
+    ):
+        raise CurrentObservationError("PRIVATE_OBSERVATION_IDENTITY_INVALID")
+    recipient_pem = _run_openssl(
+        ["x509", "-inform", "DER", "-outform", "PEM"],
+        stdin=recipient.der,
+        failure_code="RECIPIENT_CERTIFICATE_INVALID",
+    ).stdout
+    if not recipient_pem or len(recipient_pem) > MAX_RECIPIENT_CERTIFICATE_B64_CHARS:
+        raise CurrentObservationError("RECIPIENT_CERTIFICATE_INVALID")
+    plaintext = canonical_json(payload).encode("utf-8")
+    if not plaintext or len(plaintext) > MAX_PRIVATE_OBSERVATION_BYTES:
+        raise CurrentObservationError("PRIVATE_OBSERVATION_SIZE_INVALID")
+
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w+b", prefix="gitstate-recipient-", suffix=".pem"
+        ) as certificate_file:
+            certificate_file.write(recipient_pem)
+            certificate_file.flush()
+            encrypted = _run_openssl(
+                [
+                    "cms",
+                    "-encrypt",
+                    "-binary",
+                    "-aes-256-gcm",
+                    "-outform",
+                    "DER",
+                    "-recip",
+                    certificate_file.name,
+                ],
+                stdin=plaintext,
+                failure_code="OBSERVATION_ENCRYPTION_FAILED",
+            )
+    except OSError as exc:
+        raise CurrentObservationError("OBSERVATION_ENCRYPTION_FAILED") from exc
+    finally:
+        plaintext = b""
+
+    ciphertext = encrypted.stdout
+    if not ciphertext or len(ciphertext) > MAX_CIPHERTEXT_BYTES:
+        raise CurrentObservationError("OBSERVATION_CIPHERTEXT_SIZE_INVALID")
+    ciphertext_b64 = base64.b64encode(ciphertext).decode("ascii")
+    return {
+        "status": "GITSTATE_CURRENT_OBSERVATION_ENVELOPE_COMPLETE",
+        "contract_version": ENVELOPE_CONTRACT_VERSION,
+        "operation": operation,
+        "run_id": run_id,
+        "run_attempt": run_attempt,
+        "trusted_sha": trusted_sha,
+        "recipient_certificate_sha256": recipient.sha256,
+        "ciphertext_sha256": hashlib.sha256(ciphertext).hexdigest(),
+        "ciphertext_b64": ciphertext_b64,
+        "authenticated_public_key_encryption": True,
+        "one_use_recipient": True,
+        "recipient_private_key_received": False,
+        "private_observation_plaintext_emitted": False,
+        "plaintext_temporary_file_created": False,
+        "credential_material_emitted": False,
+        "authority_consumed": False,
+        "canonical_state_mutated": False,
+        "workstream_d_executed": False,
+        "workstream_e_authorised": False,
+    }
+
+
 def _blocked_payload(exc: Exception) -> dict[str, object]:
     payload: dict[str, object] = {
         "status": "BLOCKED",
@@ -877,11 +1096,13 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
     try:
+        recipient = _load_recipient_certificate(os.environ)
         payload = run()
+        public_envelope = _seal_observation(payload, recipient)
     except Exception as exc:
         print(canonical_json(_blocked_payload(exc)))
         return 2
-    print(canonical_json(payload))
+    print(canonical_json(public_envelope))
     return 0
 
 

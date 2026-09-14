@@ -1,8 +1,16 @@
 from __future__ import annotations
 
+import base64
+import hashlib
+import io
 import json
+import os
+import subprocess
+import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 from phase2 import current_observation as observation
 from phase2.operator_inventory import CONTROL_REPOSITORY_ID, STATE_REPOSITORY_ID
@@ -59,6 +67,83 @@ def environment_payload(*, can_admins_bypass=False, custom=False):
     }
 
 
+def stable_environment_variable_handler(value: str | None):
+    def get_handler(path: str):
+        if path.endswith(f"/variables/{observation.EXECUTION_VARIABLE}"):
+            if value is None:
+                raise observation.GitHubAPIError(404, "synthetic not found")
+            return {"name": observation.EXECUTION_VARIABLE, "value": value}
+        if "/variables?" in path:
+            variables = (
+                []
+                if value is None
+                else [{"name": observation.EXECUTION_VARIABLE, "value": value}]
+            )
+            return {"total_count": len(variables), "variables": variables}
+        raise AssertionError(path)
+
+    return get_handler
+
+
+class EphemeralRecipientMixin:
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.recipient_tempdir = tempfile.TemporaryDirectory(
+            prefix="gitstate-recipient-test-"
+        )
+        root = Path(cls.recipient_tempdir.name)
+        cls.recipient_key_path = root / "recipient-key.pem"
+        cls.recipient_pem_path = root / "recipient-cert.pem"
+        cls.recipient_der_path = root / "recipient-cert.der"
+        subprocess.run(
+            [
+                "openssl",
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-keyout",
+                str(cls.recipient_key_path),
+                "-out",
+                str(cls.recipient_pem_path),
+                "-sha256",
+                "-days",
+                "1",
+                "-nodes",
+                "-subj",
+                "/CN=gitstate-ephemeral-recipient",
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=15,
+        )
+        subprocess.run(
+            [
+                "openssl",
+                "x509",
+                "-in",
+                str(cls.recipient_pem_path),
+                "-outform",
+                "DER",
+                "-out",
+                str(cls.recipient_der_path),
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=15,
+        )
+        cls.recipient_der = cls.recipient_der_path.read_bytes()
+        cls.recipient_b64 = base64.b64encode(cls.recipient_der).decode("ascii")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.recipient_tempdir.cleanup()
+        super().tearDownClass()
+
+
 class CurrentObservationUnitTests(unittest.TestCase):
     def test_literal_environment_variable_absence_empty_and_non_empty_are_distinct(self):
         cases = (
@@ -78,10 +163,9 @@ class CurrentObservationUnitTests(unittest.TestCase):
             with self.subTest(state=state):
                 api = TokenAPI(
                     "environment-token",
-                    lambda path, variables=variables: {
-                        "total_count": len(variables),
-                        "variables": variables,
-                    },
+                    stable_environment_variable_handler(
+                        None if not variables else variables[0]["value"]
+                    ),
                 )
                 result = observation._observe_execution_variable(api)
                 self.assertEqual(result["defined"], defined)
@@ -95,6 +179,8 @@ class CurrentObservationUnitTests(unittest.TestCase):
         page_two = [{"name": observation.EXECUTION_VARIABLE, "value": ""}]
 
         def get_handler(path: str):
+            if path.endswith(f"/variables/{observation.EXECUTION_VARIABLE}"):
+                return {"name": observation.EXECUTION_VARIABLE, "value": ""}
             page = int(path.rsplit("page=", 1)[1])
             if page == 1:
                 return {"total_count": 31, "variables": page_one}
@@ -105,9 +191,13 @@ class CurrentObservationUnitTests(unittest.TestCase):
         api = TokenAPI("environment-token", get_handler)
         result = observation._observe_execution_variable(api)
         self.assertEqual(result["state"], "defined_empty")
-        self.assertEqual(len(api.get_calls), 2)
-        self.assertIn("per_page=30&page=1", api.get_calls[0])
-        self.assertIn("per_page=30&page=2", api.get_calls[1])
+        self.assertEqual(len(api.get_calls), 6)
+        self.assertEqual(
+            sum("per_page=30&page=1" in path for path in api.get_calls), 2
+        )
+        self.assertEqual(
+            sum("per_page=30&page=2" in path for path in api.get_calls), 2
+        )
 
     def test_environment_variable_evidence_rejects_duplicate_or_malformed_entries(self):
         payloads = (
@@ -125,12 +215,117 @@ class CurrentObservationUnitTests(unittest.TestCase):
         )
         for payload in payloads:
             with self.subTest(payload=payload):
-                api = TokenAPI("environment-token", lambda path, payload=payload: payload)
+                def get_handler(path: str, payload=payload):
+                    if path.endswith(
+                        f"/variables/{observation.EXECUTION_VARIABLE}"
+                    ):
+                        value = payload["variables"][0].get("value")
+                        return {
+                            "name": observation.EXECUTION_VARIABLE,
+                            "value": value,
+                        }
+                    return payload
+
+                api = TokenAPI("environment-token", get_handler)
                 with self.assertRaisesRegex(
                     observation.CurrentObservationError,
                     "EXECUTION_VARIABLE_EVIDENCE_AMBIGUOUS",
                 ):
                     observation._observe_execution_variable(api)
+
+    def test_same_total_count_pagination_movement_cannot_report_absence(self):
+        first_page = [
+            {"name": f"OTHER_{index:02d}", "value": "x"} for index in range(30)
+        ]
+        first_tail = [{"name": "OTHER_30", "value": "x"}]
+        second_page = first_page[:-1] + [
+            {"name": observation.EXECUTION_VARIABLE, "value": "true"}
+        ]
+        second_tail = first_tail
+        collection_reads = [
+            {"total_count": 31, "variables": first_page},
+            {"total_count": 31, "variables": first_tail},
+            {"total_count": 31, "variables": second_page},
+            {"total_count": 31, "variables": second_tail},
+        ]
+
+        def get_handler(path: str):
+            if path.endswith(f"/variables/{observation.EXECUTION_VARIABLE}"):
+                raise observation.GitHubAPIError(404, "synthetic not found")
+            return collection_reads.pop(0)
+
+        with self.assertRaisesRegex(
+            observation.CurrentObservationError,
+            "EXECUTION_VARIABLE_EVIDENCE_MOVED",
+        ):
+            observation._observe_execution_variable(
+                TokenAPI("environment-token", get_handler)
+            )
+
+    def test_exact_execution_variable_movement_fails_closed(self):
+        cases = (
+            ("", "changed"),
+            ("", None),
+            (None, ""),
+        )
+        for first, second in cases:
+            with self.subTest(first=first, second=second):
+                exact_reads: list[str | None] = [first, second]
+
+                def get_handler(path: str):
+                    if path.endswith(
+                        f"/variables/{observation.EXECUTION_VARIABLE}"
+                    ):
+                        value = exact_reads.pop(0)
+                        if value is None:
+                            raise observation.GitHubAPIError(
+                                404, "synthetic not found"
+                            )
+                        return {
+                            "name": observation.EXECUTION_VARIABLE,
+                            "value": value,
+                        }
+                    variables = (
+                        []
+                        if first is None
+                        else [
+                            {
+                                "name": observation.EXECUTION_VARIABLE,
+                                "value": first,
+                            }
+                        ]
+                    )
+                    return {
+                        "total_count": len(variables),
+                        "variables": variables,
+                    }
+
+                with self.assertRaisesRegex(
+                    observation.CurrentObservationError,
+                    "EXECUTION_VARIABLE_EVIDENCE_MOVED",
+                ):
+                    observation._observe_execution_variable(
+                        TokenAPI("environment-token", get_handler)
+                    )
+
+    def test_exact_404_is_ambiguous_when_complete_collection_contains_variable(self):
+        def get_handler(path: str):
+            if path.endswith(f"/variables/{observation.EXECUTION_VARIABLE}"):
+                raise observation.GitHubAPIError(404, "synthetic not found")
+            return {
+                "total_count": 1,
+                "variables": [
+                    {"name": observation.EXECUTION_VARIABLE, "value": "true"}
+                ],
+            }
+
+        with self.assertRaisesRegex(
+            observation.CurrentObservationError,
+            "EXECUTION_VARIABLE_EVIDENCE_AMBIGUOUS",
+        ):
+            observation._observe_execution_variable(
+                TokenAPI("environment-token", get_handler)
+            )
 
     def test_environment_token_scope_permissions_and_positive_revocation(self):
         response = {
@@ -141,7 +336,7 @@ class CurrentObservationUnitTests(unittest.TestCase):
         app_api = MintingAppAPI([response])
         environment_api = TokenAPI(
             "environment-token",
-            lambda path: {"total_count": 0, "variables": []},
+            stable_environment_variable_handler(None),
         )
         result = observation._observe_environment_variable(
             app_api,
@@ -223,7 +418,7 @@ class CurrentObservationUnitTests(unittest.TestCase):
         app_api = MintingAppAPI([response])
         environment_api = TokenAPI(
             "environment-token",
-            lambda path: {"total_count": 0, "variables": []},
+            stable_environment_variable_handler(None),
         )
         environment_api.delete_status = 200
         with self.assertRaisesRegex(
@@ -236,6 +431,41 @@ class CurrentObservationUnitTests(unittest.TestCase):
                 api_url="https://api.github.test",
                 api_factory=lambda token, url: environment_api,
             )
+
+    def test_environment_observation_movement_still_revokes_token(self):
+        response = {
+            "token": "environment-token",
+            "permissions": {"environments": "read", "metadata": "read"},
+            "repositories": [{"id": CONTROL_REPOSITORY_ID}],
+        }
+        app_api = MintingAppAPI([response])
+        exact_reads = ["", "changed"]
+
+        def get_handler(path: str):
+            if path.endswith(f"/variables/{observation.EXECUTION_VARIABLE}"):
+                return {
+                    "name": observation.EXECUTION_VARIABLE,
+                    "value": exact_reads.pop(0),
+                }
+            return {
+                "total_count": 1,
+                "variables": [
+                    {"name": observation.EXECUTION_VARIABLE, "value": ""}
+                ],
+            }
+
+        environment_api = TokenAPI("environment-token", get_handler)
+        with self.assertRaisesRegex(
+            observation.CurrentObservationError,
+            "EXECUTION_VARIABLE_EVIDENCE_MOVED",
+        ):
+            observation._observe_environment_variable(
+                app_api,
+                installation_id=77,
+                api_url="https://api.github.test",
+                api_factory=lambda token, url: environment_api,
+            )
+        self.assertEqual(environment_api.delete_calls, ["/installation/token"])
 
     def test_policy_binds_admin_bypass_and_custom_protection_rules(self):
         payload = environment_payload(can_admins_bypass=False)
@@ -561,7 +791,7 @@ class CurrentObservationUnitTests(unittest.TestCase):
         self.assertEqual(observation.PERMISSION_PROFILE_SHA256, permission_profile_sha256())
 
 
-class CurrentObservationEndToEndTests(unittest.TestCase):
+class CurrentObservationEndToEndTests(EphemeralRecipientMixin, unittest.TestCase):
     def test_output_is_sanitised_key_is_scrubbed_and_only_read_tokens_are_minted(self):
         policy_payload = environment_payload()
         empty_custom_rules = {
@@ -637,12 +867,7 @@ class CurrentObservationEndToEndTests(unittest.TestCase):
 
         environment_api = TokenAPI(
             "environment-token-secret",
-            lambda path: {
-                "total_count": 1,
-                "variables": [
-                    {"name": observation.EXECUTION_VARIABLE, "value": ""}
-                ],
-            },
+            stable_environment_variable_handler(""),
         )
 
         def state_get(path: str):
@@ -677,7 +902,9 @@ class CurrentObservationEndToEndTests(unittest.TestCase):
             "GITHUB_SHA": "a" * 40,
             "GITHUB_RUN_ID": "99",
             "GITHUB_RUN_ATTEMPT": "1",
+            "GITHUB_ACTOR": observation.CONTROL_OWNER,
             "INPUT_OPERATION": "current_observation",
+            observation.RECIPIENT_CERTIFICATE_ENV: self.recipient_b64,
             "GITHUB_TOKEN": "github-token",
             "GITHUB_API_URL": "https://api.github.test",
             "PHASE2_ALLOCATOR_APP_ID": "123",
@@ -738,7 +965,9 @@ class CurrentObservationEndToEndTests(unittest.TestCase):
             "GITHUB_SHA": "a" * 40,
             "GITHUB_RUN_ID": "99",
             "GITHUB_RUN_ATTEMPT": "1",
+            "GITHUB_ACTOR": observation.CONTROL_OWNER,
             "INPUT_OPERATION": "current_observation",
+            observation.RECIPIENT_CERTIFICATE_ENV: self.recipient_b64,
             "GITHUB_TOKEN": "github-token",
             "PHASE2_ALLOCATOR_APP_ID": "123",
             "PHASE2_ALLOCATOR_INSTALLATION_ID": "456",
@@ -768,6 +997,159 @@ class CurrentObservationEndToEndTests(unittest.TestCase):
             )
         self.assertNotIn("PHASE2_ALLOCATOR_APP_PRIVATE_KEY", values)
 
+    def test_actor_and_recipient_are_rejected_before_allocator_key_access(self):
+        cases = (
+            ("untrusted-actor", self.recipient_b64, "OBSERVATION_OWNER_ACTOR_REQUIRED"),
+            (observation.CONTROL_OWNER, "not-base64!", "RECIPIENT_CERTIFICATE_INVALID"),
+        )
+        for actor, certificate, reason in cases:
+            with self.subTest(reason=reason):
+                values = {
+                    "GITHUB_REPOSITORY": observation.CONTROL_REPOSITORY,
+                    "GITHUB_REF": "refs/heads/main",
+                    "GITHUB_SHA": "a" * 40,
+                    "GITHUB_RUN_ID": "99",
+                    "GITHUB_RUN_ATTEMPT": "1",
+                    "GITHUB_ACTOR": actor,
+                    "INPUT_OPERATION": "current_observation",
+                    observation.RECIPIENT_CERTIFICATE_ENV: certificate,
+                    "PHASE2_ALLOCATOR_APP_PRIVATE_KEY": "untouched-private-key",
+                }
+                jwt_called = False
+
+                def unexpected_jwt(app_id: int, key: str) -> str:
+                    nonlocal jwt_called
+                    jwt_called = True
+                    raise AssertionError((app_id, key))
+
+                with self.assertRaisesRegex(
+                    observation.CurrentObservationError, reason
+                ):
+                    observation.run(
+                        values,
+                        api_factory=lambda token, url: (_ for _ in ()).throw(
+                            AssertionError((token, url))
+                        ),
+                        jwt_factory=unexpected_jwt,
+                    )
+                self.assertFalse(jwt_called)
+                self.assertEqual(
+                    values["PHASE2_ALLOCATOR_APP_PRIVATE_KEY"],
+                    "untouched-private-key",
+                )
+
+
+class CurrentObservationCLITests(EphemeralRecipientMixin, unittest.TestCase):
+    def private_observation(self) -> dict[str, object]:
+        return {
+            "status": "GITSTATE_CURRENT_OBSERVATION_COMPLETE",
+            "operation": "current_observation",
+            "run_id": 99,
+            "run_attempt": 1,
+            "trusted_sha": "a" * 40,
+            "allocator_app": {
+                "app_id": "PRIVATE-APP-ID-SENTINEL",
+                "installation_id": "PRIVATE-INSTALLATION-ID-SENTINEL",
+            },
+            "installation_inventory": {
+                "selected_repository_ids": [
+                    "PRIVATE-REPOSITORY-ID-SENTINEL"
+                ]
+            },
+            "state_baseline": {
+                "repository": "PRIVATE-STATE-REPOSITORY-SENTINEL",
+                "commit_sha": "PRIVATE-STATE-COMMIT-SENTINEL",
+                "tree_sha": "PRIVATE-STATE-TREE-SENTINEL",
+                "sha256": "PRIVATE-STATE-DIGEST-SENTINEL",
+            },
+            "protected_environment": {
+                "policy": "PRIVATE-POLICY-MATERIAL-SENTINEL",
+                "policy_sha256": "PRIVATE-POLICY-DIGEST-SENTINEL",
+            },
+            "execution_variable": "PRIVATE-EXECUTION-VARIABLE-SENTINEL",
+        }
+
+    def test_cli_stdout_is_public_safe_and_envelope_round_trips_exactly(self):
+        private_payload = self.private_observation()
+        cli_environment = {
+            "GITHUB_ACTOR": observation.CONTROL_OWNER,
+            observation.RECIPIENT_CERTIFICATE_ENV: self.recipient_b64,
+        }
+        output = io.StringIO()
+        with mock.patch.dict(os.environ, cli_environment, clear=False), mock.patch.object(
+            observation, "run", return_value=private_payload
+        ) as run_mock, redirect_stdout(output):
+            exit_code = observation.main([])
+
+        self.assertEqual(exit_code, 0)
+        run_mock.assert_called_once()
+        rendered = output.getvalue()
+        envelope = json.loads(rendered)
+        for sentinel in (
+            "PRIVATE-APP-ID-SENTINEL",
+            "PRIVATE-INSTALLATION-ID-SENTINEL",
+            "PRIVATE-REPOSITORY-ID-SENTINEL",
+            "PRIVATE-STATE-REPOSITORY-SENTINEL",
+            "PRIVATE-STATE-COMMIT-SENTINEL",
+            "PRIVATE-STATE-TREE-SENTINEL",
+            "PRIVATE-STATE-DIGEST-SENTINEL",
+            "PRIVATE-POLICY-MATERIAL-SENTINEL",
+            "PRIVATE-POLICY-DIGEST-SENTINEL",
+            "PRIVATE-EXECUTION-VARIABLE-SENTINEL",
+        ):
+            self.assertNotIn(sentinel, rendered)
+
+        ciphertext = base64.b64decode(envelope["ciphertext_b64"], validate=True)
+        self.assertEqual(
+            envelope["recipient_certificate_sha256"],
+            hashlib.sha256(self.recipient_der).hexdigest(),
+        )
+        self.assertEqual(
+            envelope["ciphertext_sha256"], hashlib.sha256(ciphertext).hexdigest()
+        )
+        decrypt_result = subprocess.run(
+            [
+                "openssl",
+                "cms",
+                "-decrypt",
+                "-binary",
+                "-inform",
+                "DER",
+                "-recip",
+                str(self.recipient_pem_path),
+                "-inkey",
+                str(self.recipient_key_path),
+            ],
+            input=ciphertext,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=15,
+        )
+        self.assertEqual(
+            decrypt_result.returncode,
+            0,
+            decrypt_result.stderr.decode("utf-8", "replace"),
+        )
+        decrypted = decrypt_result.stdout
+        self.assertEqual(
+            decrypted.decode("utf-8"), observation.canonical_json(private_payload)
+        )
+        self.assertFalse(envelope["private_observation_plaintext_emitted"])
+        self.assertFalse(envelope["plaintext_temporary_file_created"])
+        self.assertTrue(envelope["authenticated_public_key_encryption"])
+
+    def test_recipient_binding_mismatch_fails_closed(self):
+        mismatched = observation.RecipientCertificate(
+            der=self.recipient_der,
+            sha256="0" * 64,
+        )
+        with self.assertRaisesRegex(
+            observation.CurrentObservationError,
+            "RECIPIENT_CERTIFICATE_MISMATCH",
+        ):
+            observation._seal_observation(self.private_observation(), mismatched)
+
 
 class CurrentObservationWorkflowTests(unittest.TestCase):
     @classmethod
@@ -793,6 +1175,14 @@ class CurrentObservationWorkflowTests(unittest.TestCase):
         self.assertNotIn("issues: write", current)
         self.assertNotIn(
             "PHASE2_WORKSTREAM_D_EXECUTION_ENABLED: ${{ vars.", current
+        )
+        self.assertIn(
+            "INPUT_CURRENT_OBSERVATION_RECIPIENT_CERT_B64: ${{ inputs.current_observation_recipient_cert_b64 }}",
+            current,
+        )
+        self.assertIn(
+            "current_observation_recipient_cert_b64:\n",
+            self.workflow,
         )
 
     def test_observation_runtime_has_no_live_or_mutation_profile_path(self):

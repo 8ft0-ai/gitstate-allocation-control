@@ -48,6 +48,11 @@ on:
         required: false
         default: ""
         type: string
+      current_observation_recipient_cert_b64:
+        description: One-use base64 DER X.509 recipient certificate; current_observation only
+        required: false
+        default: ""
+        type: string
 
 concurrency:
   group: beads-allocation-v0.2-${{ github.repository }}
@@ -282,6 +287,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
           INPUT_OPERATION: ${{ inputs.operation }}
+          INPUT_CURRENT_OBSERVATION_RECIPIENT_CERT_B64: ${{ inputs.current_observation_recipient_cert_b64 }}
           PHASE2_ALLOCATOR_APP_ID: ${{ vars.PHASE2_ALLOCATOR_APP_ID }}
           PHASE2_ALLOCATOR_INSTALLATION_ID: ${{ vars.PHASE2_ALLOCATOR_INSTALLATION_ID }}
           PHASE2_ALLOCATOR_APP_PRIVATE_KEY: ${{ secrets['PHASE2_ALLOCATOR_APP_PRIVATE_KEY'] }}
