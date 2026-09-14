@@ -18,17 +18,6 @@ COMMIT_SHA = "b" * 40
 TREE_SHA = "c" * 40
 
 
-class VariableAPI:
-    def __init__(self, pages):
-        self.pages = pages
-        self.calls: list[str] = []
-
-    def get(self, path: str):
-        self.calls.append(path)
-        page = int(path.rsplit("page=", 1)[1])
-        return self.pages[page]
-
-
 class MintingAppAPI:
     def __init__(self, responses):
         self.responses = list(responses)
@@ -61,54 +50,51 @@ class TokenAPI:
 class CurrentObservationUnitTests(unittest.TestCase):
     def test_literal_variable_absence_empty_and_non_empty_are_distinct(self):
         cases = (
-            ({1: {"total_count": 0, "variables": []}}, False, "not_defined"),
-            (
-                {1: {"total_count": 1, "variables": [{"name": observation.EXECUTION_VARIABLE, "value": ""}]}},
-                True,
-                "defined_empty",
-            ),
-            (
-                {1: {"total_count": 1, "variables": [{"name": observation.EXECUTION_VARIABLE, "value": "true"}]}},
-                True,
-                "defined_non_empty",
-            ),
+            ({}, False, "not_defined"),
+            ({observation.EXECUTION_VARIABLE: ""}, True, "defined_empty"),
+            ({observation.EXECUTION_VARIABLE: "true"}, True, "defined_non_empty"),
         )
-        for pages, defined, state in cases:
+        for variables, defined, state in cases:
             with self.subTest(state=state):
-                result = observation._observe_execution_variable(VariableAPI(pages))
+                result = observation._observe_execution_variable(
+                    json.dumps(variables, separators=(",", ":"))
+                )
                 self.assertEqual(result["defined"], defined)
                 self.assertEqual(result["state"], state)
                 self.assertNotIn("value", result)
 
-    def test_variable_pagination_is_complete_and_fail_closed(self):
-        incomplete = VariableAPI(
-            {1: {"total_count": 101, "variables": [{"name": f"OTHER_{i}", "value": "x"} for i in range(50)]}}
-        )
-        with self.assertRaisesRegex(
-            observation.CurrentObservationError,
-            "EXECUTION_VARIABLE_PAGINATION_INCOMPLETE",
+    def test_literal_variable_evidence_fails_closed_on_malformed_or_ambiguous_json(self):
+        for raw in (
+            "",
+            "[]",
+            '{"PHASE2_WORKSTREAM_D_EXECUTION_ENABLED":null}',
+            '{"PHASE2_WORKSTREAM_D_EXECUTION_ENABLED":"","PHASE2_WORKSTREAM_D_EXECUTION_ENABLED":"true"}',
         ):
-            observation._observe_execution_variable(incomplete)
-
-        complete = VariableAPI(
-            {
-                1: {"total_count": 101, "variables": [{"name": f"OTHER_{i}", "value": "x"} for i in range(100)]},
-                2: {"total_count": 101, "variables": [{"name": observation.EXECUTION_VARIABLE, "value": ""}]},
-            }
-        )
-        result = observation._observe_execution_variable(complete)
-        self.assertEqual(result["state"], "defined_empty")
-        self.assertEqual(len(complete.calls), 2)
+            with self.subTest(raw=raw):
+                with self.assertRaisesRegex(
+                    observation.CurrentObservationError,
+                    "EXECUTION_VARIABLE_EVIDENCE_AMBIGUOUS",
+                ):
+                    observation._observe_execution_variable(raw)
 
     def test_inventory_paginates_completely_then_revokes_on_exact_set_failure(self):
         app_api = MintingAppAPI(
-            [{"token": "inventory-token", "permissions": {"metadata": "read"}, "repository_selection": "selected"}]
+            [
+                {
+                    "token": "inventory-token",
+                    "permissions": {"metadata": "read"},
+                    "repository_selection": "selected",
+                }
+            ]
         )
 
         def get_handler(path: str):
             page = int(path.rsplit("page=", 1)[1])
             if page == 1:
-                return {"total_count": 101, "repositories": [{"id": index + 1} for index in range(100)]}
+                return {
+                    "total_count": 101,
+                    "repositories": [{"id": index + 1} for index in range(100)],
+                }
             if page == 2:
                 return {"total_count": 101, "repositories": [{"id": 101}]}
             raise AssertionError(path)
@@ -130,9 +116,18 @@ class CurrentObservationUnitTests(unittest.TestCase):
 
     def test_inventory_post_mint_permission_failure_still_revokes(self):
         app_api = MintingAppAPI(
-            [{"token": "inventory-token", "permissions": {"metadata": "write"}, "repository_selection": "selected"}]
+            [
+                {
+                    "token": "inventory-token",
+                    "permissions": {"metadata": "write"},
+                    "repository_selection": "selected",
+                }
+            ]
         )
-        inventory_api = TokenAPI("inventory-token", lambda path: {"total_count": 0, "repositories": []})
+        inventory_api = TokenAPI(
+            "inventory-token",
+            lambda path: {"total_count": 0, "repositories": []},
+        )
         with self.assertRaisesRegex(Exception, "INVENTORY_TOKEN_PERMISSION_MISMATCH"):
             observation._observe_installation_inventory(
                 app_api,
@@ -142,19 +137,61 @@ class CurrentObservationUnitTests(unittest.TestCase):
             )
         self.assertEqual(inventory_api.delete_calls, ["/installation/token"])
 
+    def test_inventory_client_construction_failure_still_attempts_revocation(self):
+        app_api = MintingAppAPI(
+            [
+                {
+                    "token": "inventory-token",
+                    "permissions": {"metadata": "read"},
+                    "repository_selection": "selected",
+                }
+            ]
+        )
+        revocation_api = TokenAPI("inventory-token", lambda path: None)
+        calls = 0
+
+        def api_factory(token: str, url: str):
+            nonlocal calls
+            del token, url
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("CLIENT_CONSTRUCTION_FAILED")
+            return revocation_api
+
+        with self.assertRaisesRegex(RuntimeError, "CLIENT_CONSTRUCTION_FAILED"):
+            observation._observe_installation_inventory(
+                app_api,
+                installation_id=77,
+                api_url="https://api.github.test",
+                api_factory=api_factory,
+            )
+        self.assertEqual(revocation_api.delete_calls, ["/installation/token"])
+
     def test_inventory_revocation_requires_http_204(self):
         app_api = MintingAppAPI(
-            [{"token": "inventory-token", "permissions": {"metadata": "read"}, "repository_selection": "selected"}]
+            [
+                {
+                    "token": "inventory-token",
+                    "permissions": {"metadata": "read"},
+                    "repository_selection": "selected",
+                }
+            ]
         )
         inventory_api = TokenAPI(
             "inventory-token",
             lambda path: {
                 "total_count": 2,
-                "repositories": [{"id": CONTROL_REPOSITORY_ID}, {"id": STATE_REPOSITORY_ID}],
+                "repositories": [
+                    {"id": CONTROL_REPOSITORY_ID},
+                    {"id": STATE_REPOSITORY_ID},
+                ],
             },
         )
         inventory_api.delete_status = 200
-        with self.assertRaisesRegex(observation.CurrentObservationError, "INVENTORY_TOKEN_REVOCATION_FAILED"):
+        with self.assertRaisesRegex(
+            observation.CurrentObservationError,
+            "INVENTORY_TOKEN_REVOCATION_FAILED",
+        ):
             observation._observe_installation_inventory(
                 app_api,
                 installation_id=77,
@@ -172,7 +209,10 @@ class CurrentObservationUnitTests(unittest.TestCase):
 
         def state_get(path: str):
             if path == "/repos/8ft0-ai/gitstate-allocation-state":
-                return {"id": STATE_REPOSITORY_ID, "full_name": "8ft0-ai/gitstate-allocation-state"}
+                return {
+                    "id": STATE_REPOSITORY_ID,
+                    "full_name": "8ft0-ai/gitstate-allocation-state",
+                }
             if path.endswith("/git/ref/heads/main"):
                 return {"object": {"sha": COMMIT_SHA}}
             if path.endswith(f"/git/commits/{COMMIT_SHA}"):
@@ -208,13 +248,18 @@ class CurrentObservationUnitTests(unittest.TestCase):
 
         def state_get(path: str):
             if path == "/repos/8ft0-ai/gitstate-allocation-state":
-                return {"id": STATE_REPOSITORY_ID, "full_name": "8ft0-ai/gitstate-allocation-state"}
+                return {
+                    "id": STATE_REPOSITORY_ID,
+                    "full_name": "8ft0-ai/gitstate-allocation-state",
+                }
             if path.endswith("/git/ref/heads/main"):
                 return {"object": {"sha": "not-a-sha"}}
             raise AssertionError(path)
 
         state_api = TokenAPI("state-token", state_get)
-        with self.assertRaisesRegex(observation.CurrentObservationError, "READ_EVIDENCE_AMBIGUOUS"):
+        with self.assertRaisesRegex(
+            observation.CurrentObservationError, "READ_EVIDENCE_AMBIGUOUS"
+        ):
             observation._observe_state_baseline(
                 app_api,
                 installation_id=77,
@@ -222,6 +267,33 @@ class CurrentObservationUnitTests(unittest.TestCase):
                 api_factory=lambda token, url: state_api,
             )
         self.assertEqual(state_api.delete_calls, ["/installation/token"])
+
+    def test_state_client_construction_failure_still_attempts_revocation(self):
+        response = {
+            "token": "state-token",
+            "permissions": {"contents": "read", "metadata": "read"},
+            "repositories": [{"id": STATE_REPOSITORY_ID}],
+        }
+        app_api = MintingAppAPI([response])
+        revocation_api = TokenAPI("state-token", lambda path: None)
+        calls = 0
+
+        def api_factory(token: str, url: str):
+            nonlocal calls
+            del token, url
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("CLIENT_CONSTRUCTION_FAILED")
+            return revocation_api
+
+        with self.assertRaisesRegex(RuntimeError, "CLIENT_CONSTRUCTION_FAILED"):
+            observation._observe_state_baseline(
+                app_api,
+                installation_id=77,
+                api_url="https://api.github.test",
+                api_factory=api_factory,
+            )
+        self.assertEqual(revocation_api.delete_calls, ["/installation/token"])
 
     def test_pure_observation_digests_match_reviewed_predecessor(self):
         payload = {
@@ -238,15 +310,26 @@ class CurrentObservationUnitTests(unittest.TestCase):
                 },
                 {"type": "branch_policy"},
             ],
-            "deployment_branch_policy": {"protected_branches": True, "custom_branch_policies": False},
+            "deployment_branch_policy": {
+                "protected_branches": True,
+                "custom_branch_policies": False,
+            },
         }
         self.assertEqual(
-            observation._environment_policy_material(payload, observation.ENVIRONMENT_NAME),
-            predecessor_environment_policy_material(payload, observation.ENVIRONMENT_NAME),
+            observation._environment_policy_material(
+                payload, observation.ENVIRONMENT_NAME
+            ),
+            predecessor_environment_policy_material(
+                payload, observation.ENVIRONMENT_NAME
+            ),
         )
         self.assertEqual(
-            observation._environment_policy_sha256(payload, observation.ENVIRONMENT_NAME),
-            predecessor_environment_policy_sha256(payload, observation.ENVIRONMENT_NAME),
+            observation._environment_policy_sha256(
+                payload, observation.ENVIRONMENT_NAME
+            ),
+            predecessor_environment_policy_sha256(
+                payload, observation.ENVIRONMENT_NAME
+            ),
         )
         self.assertEqual(observation.PERMISSION_PROFILE_SHA256, permission_profile_sha256())
 
@@ -256,7 +339,10 @@ class CurrentObservationEndToEndTests(unittest.TestCase):
         environment_payload = {
             "name": observation.ENVIRONMENT_NAME,
             "protection_rules": [],
-            "deployment_branch_policy": {"protected_branches": True, "custom_branch_policies": False},
+            "deployment_branch_policy": {
+                "protected_branches": True,
+                "custom_branch_policies": False,
+            },
         }
 
         class ControlAPI:
@@ -265,8 +351,6 @@ class CurrentObservationEndToEndTests(unittest.TestCase):
             def get(self, path: str):
                 if path.endswith("/environments/phase-2-allocator"):
                     return environment_payload
-                if "/variables?" in path:
-                    return {"total_count": 1, "variables": [{"name": observation.EXECUTION_VARIABLE, "value": ""}]}
                 raise AssertionError(path)
 
         class AppAPI:
@@ -289,7 +373,11 @@ class CurrentObservationEndToEndTests(unittest.TestCase):
             def post(self, path: str, body: dict):
                 self.mints.append(body)
                 if body == {"permissions": {"metadata": "read"}}:
-                    return {"token": "inventory-token-secret", "permissions": {"metadata": "read"}, "repository_selection": "selected"}
+                    return {
+                        "token": "inventory-token-secret",
+                        "permissions": {"metadata": "read"},
+                        "repository_selection": "selected",
+                    }
                 if body == {
                     "repository_ids": [STATE_REPOSITORY_ID],
                     "permissions": {"contents": "read", "metadata": "read"},
@@ -305,13 +393,19 @@ class CurrentObservationEndToEndTests(unittest.TestCase):
             "inventory-token-secret",
             lambda path: {
                 "total_count": 2,
-                "repositories": [{"id": STATE_REPOSITORY_ID}, {"id": CONTROL_REPOSITORY_ID}],
+                "repositories": [
+                    {"id": STATE_REPOSITORY_ID},
+                    {"id": CONTROL_REPOSITORY_ID},
+                ],
             },
         )
 
         def state_get(path: str):
             if path == "/repos/8ft0-ai/gitstate-allocation-state":
-                return {"id": STATE_REPOSITORY_ID, "full_name": "8ft0-ai/gitstate-allocation-state"}
+                return {
+                    "id": STATE_REPOSITORY_ID,
+                    "full_name": "8ft0-ai/gitstate-allocation-state",
+                }
             if path.endswith("/git/ref/heads/main"):
                 return {"object": {"sha": COMMIT_SHA}}
             if path.endswith(f"/git/commits/{COMMIT_SHA}"):
@@ -343,15 +437,28 @@ class CurrentObservationEndToEndTests(unittest.TestCase):
             "PHASE2_ALLOCATOR_APP_ID": "123",
             "PHASE2_ALLOCATOR_INSTALLATION_ID": "456",
             "PHASE2_ALLOCATOR_APP_PRIVATE_KEY": "private-key-secret",
+            "PHASE2_CONFIGURATION_VARIABLES_JSON": json.dumps(
+                {observation.EXECUTION_VARIABLE: ""}, separators=(",", ":")
+            ),
             "PHASE2_STATE_REPOSITORY_ID": str(STATE_REPOSITORY_ID),
         }
         result = observation.run(
             values,
             api_factory=api_factory,
-            jwt_factory=lambda app_id, key: "jwt-secret" if app_id == 123 and key == "private-key-secret" else "",
+            jwt_factory=lambda app_id, key: (
+                "jwt-secret"
+                if app_id == 123 and key == "private-key-secret"
+                else ""
+            ),
         )
         rendered = json.dumps(result, sort_keys=True)
-        for secret in ("private-key-secret", "jwt-secret", "inventory-token-secret", "state-token-secret", "github-token"):
+        for secret in (
+            "private-key-secret",
+            "jwt-secret",
+            "inventory-token-secret",
+            "state-token-secret",
+            "github-token",
+        ):
             self.assertNotIn(secret, rendered)
         self.assertNotIn("PHASE2_ALLOCATOR_APP_PRIVATE_KEY", values)
         self.assertEqual(result["execution_variable"]["state"], "defined_empty")
@@ -382,6 +489,7 @@ class CurrentObservationEndToEndTests(unittest.TestCase):
             "PHASE2_ALLOCATOR_APP_ID": "123",
             "PHASE2_ALLOCATOR_INSTALLATION_ID": "456",
             "PHASE2_ALLOCATOR_APP_PRIVATE_KEY": "private-key-secret",
+            "PHASE2_CONFIGURATION_VARIABLES_JSON": "{}",
             "PHASE2_STATE_REPOSITORY_ID": str(STATE_REPOSITORY_ID),
         }
 
@@ -393,8 +501,6 @@ class CurrentObservationEndToEndTests(unittest.TestCase):
                         "protection_rules": [],
                         "deployment_branch_policy": None,
                     }
-                if "/variables?" in path:
-                    return {"total_count": 0, "variables": []}
                 raise AssertionError(path)
 
         def fail_jwt(app_id: int, key: str) -> str:
@@ -412,7 +518,9 @@ class CurrentObservationEndToEndTests(unittest.TestCase):
 class CurrentObservationWorkflowTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.workflow = Path(".github/workflows/phase2-adversarial.yml").read_text(encoding="utf-8")
+        cls.workflow = Path(".github/workflows/phase2-adversarial.yml").read_text(
+            encoding="utf-8"
+        )
         cls.source = Path("phase2/current_observation.py").read_text(encoding="utf-8")
 
     def test_operation_dispatch_is_isolated_and_has_no_authority_dependencies(self):
@@ -423,11 +531,16 @@ class CurrentObservationWorkflowTests(unittest.TestCase):
         self.assertIn("    needs: contract-check\n", current)
         self.assertIn("inputs.operation == 'current_observation'", current)
         self.assertIn("environment: phase-2-allocator", current)
+        self.assertIn(
+            "PHASE2_CONFIGURATION_VARIABLES_JSON: ${{ toJSON(vars) }}", current
+        )
         self.assertNotIn("successor-capsule", current)
         self.assertNotIn("operator_preflight", current)
         self.assertNotIn("live-scenario-suite", current)
         self.assertNotIn("issues: write", current)
-        self.assertNotIn("PHASE2_WORKSTREAM_D_EXECUTION_ENABLED: ${{ vars.", current)
+        self.assertNotIn(
+            "PHASE2_WORKSTREAM_D_EXECUTION_ENABLED: ${{ vars.", current
+        )
 
     def test_observation_runtime_has_no_live_or_mutation_profile_path(self):
         for forbidden in (
@@ -440,6 +553,7 @@ class CurrentObservationWorkflowTests(unittest.TestCase):
             "state_profile(",
             '"contents": "write"',
             '"issues": "write"',
+            "/variables?",
         ):
             self.assertNotIn(forbidden, self.source)
 
