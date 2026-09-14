@@ -7,11 +7,7 @@ from pathlib import Path
 from phase2 import current_observation as observation
 from phase2.operator_inventory import CONTROL_REPOSITORY_ID, STATE_REPOSITORY_ID
 from phase2.successor_contract import permission_profile_sha256
-from phase2.successor_runtime import (
-    _environment_policy_material as predecessor_environment_policy_material,
-    environment_policy_sha256 as predecessor_environment_policy_sha256,
-    state_observation_sha256 as predecessor_state_observation_sha256,
-)
+from phase2.successor_runtime import state_observation_sha256 as predecessor_state_observation_sha256
 
 
 COMMIT_SHA = "b" * 40
@@ -47,35 +43,301 @@ class TokenAPI:
         return None, {}, self.delete_status
 
 
+def environment_payload(*, can_admins_bypass=False, custom=False):
+    return {
+        "name": observation.ENVIRONMENT_NAME,
+        "can_admins_bypass": can_admins_bypass,
+        "protection_rules": [{"type": "branch_policy"}]
+        if custom
+        else [],
+        "deployment_branch_policy": {
+            "protected_branches": False,
+            "custom_branch_policies": True,
+        }
+        if custom
+        else None,
+    }
+
+
 class CurrentObservationUnitTests(unittest.TestCase):
-    def test_literal_variable_absence_empty_and_non_empty_are_distinct(self):
+    def test_literal_environment_variable_absence_empty_and_non_empty_are_distinct(self):
         cases = (
-            ({}, False, "not_defined"),
-            ({observation.EXECUTION_VARIABLE: ""}, True, "defined_empty"),
-            ({observation.EXECUTION_VARIABLE: "true"}, True, "defined_non_empty"),
+            ([], False, "not_defined"),
+            (
+                [{"name": observation.EXECUTION_VARIABLE, "value": ""}],
+                True,
+                "defined_empty",
+            ),
+            (
+                [{"name": observation.EXECUTION_VARIABLE, "value": "true"}],
+                True,
+                "defined_non_empty",
+            ),
         )
         for variables, defined, state in cases:
             with self.subTest(state=state):
-                result = observation._observe_execution_variable(
-                    json.dumps(variables, separators=(",", ":"))
+                api = TokenAPI(
+                    "environment-token",
+                    lambda path, variables=variables: {
+                        "total_count": len(variables),
+                        "variables": variables,
+                    },
                 )
+                result = observation._observe_execution_variable(api)
                 self.assertEqual(result["defined"], defined)
                 self.assertEqual(result["state"], state)
                 self.assertNotIn("value", result)
 
-    def test_literal_variable_evidence_fails_closed_on_malformed_or_ambiguous_json(self):
-        for raw in (
-            "",
-            "[]",
-            '{"PHASE2_WORKSTREAM_D_EXECUTION_ENABLED":null}',
-            '{"PHASE2_WORKSTREAM_D_EXECUTION_ENABLED":"","PHASE2_WORKSTREAM_D_EXECUTION_ENABLED":"true"}',
-        ):
-            with self.subTest(raw=raw):
+    def test_environment_variable_pagination_is_complete_at_api_maximum_page_size(self):
+        page_one = [
+            {"name": f"OTHER_{index}", "value": "x"} for index in range(30)
+        ]
+        page_two = [{"name": observation.EXECUTION_VARIABLE, "value": ""}]
+
+        def get_handler(path: str):
+            page = int(path.rsplit("page=", 1)[1])
+            if page == 1:
+                return {"total_count": 31, "variables": page_one}
+            if page == 2:
+                return {"total_count": 31, "variables": page_two}
+            raise AssertionError(path)
+
+        api = TokenAPI("environment-token", get_handler)
+        result = observation._observe_execution_variable(api)
+        self.assertEqual(result["state"], "defined_empty")
+        self.assertEqual(len(api.get_calls), 2)
+        self.assertIn("per_page=30&page=1", api.get_calls[0])
+        self.assertIn("per_page=30&page=2", api.get_calls[1])
+
+    def test_environment_variable_evidence_rejects_duplicate_or_malformed_entries(self):
+        payloads = (
+            {
+                "total_count": 2,
+                "variables": [
+                    {"name": observation.EXECUTION_VARIABLE, "value": ""},
+                    {"name": observation.EXECUTION_VARIABLE, "value": "true"},
+                ],
+            },
+            {
+                "total_count": 1,
+                "variables": [{"name": observation.EXECUTION_VARIABLE, "value": None}],
+            },
+        )
+        for payload in payloads:
+            with self.subTest(payload=payload):
+                api = TokenAPI("environment-token", lambda path, payload=payload: payload)
                 with self.assertRaisesRegex(
                     observation.CurrentObservationError,
                     "EXECUTION_VARIABLE_EVIDENCE_AMBIGUOUS",
                 ):
-                    observation._observe_execution_variable(raw)
+                    observation._observe_execution_variable(api)
+
+    def test_environment_token_scope_permissions_and_positive_revocation(self):
+        response = {
+            "token": "environment-token",
+            "permissions": {"environments": "read", "metadata": "read"},
+            "repositories": [{"id": CONTROL_REPOSITORY_ID}],
+        }
+        app_api = MintingAppAPI([response])
+        environment_api = TokenAPI(
+            "environment-token",
+            lambda path: {"total_count": 0, "variables": []},
+        )
+        result = observation._observe_environment_variable(
+            app_api,
+            installation_id=77,
+            api_url="https://api.github.test",
+            api_factory=lambda token, url: environment_api,
+        )
+        self.assertEqual(result["state"], "not_defined")
+        self.assertEqual(
+            app_api.posts,
+            [
+                (
+                    "/app/installations/77/access_tokens",
+                    {
+                        "repository_ids": [CONTROL_REPOSITORY_ID],
+                        "permissions": {
+                            "environments": "read",
+                            "metadata": "read",
+                        },
+                    },
+                )
+            ],
+        )
+        self.assertEqual(environment_api.delete_calls, ["/installation/token"])
+
+    def test_environment_token_permission_widening_still_revokes(self):
+        response = {
+            "token": "environment-token",
+            "permissions": {"environments": "write", "metadata": "read"},
+            "repositories": [{"id": CONTROL_REPOSITORY_ID}],
+        }
+        app_api = MintingAppAPI([response])
+        revocation_api = TokenAPI("environment-token", lambda path: None)
+        with self.assertRaisesRegex(
+            observation.CurrentObservationError,
+            "ENVIRONMENT_TOKEN_PERMISSION_MISMATCH",
+        ):
+            observation._observe_environment_variable(
+                app_api,
+                installation_id=77,
+                api_url="https://api.github.test",
+                api_factory=lambda token, url: revocation_api,
+            )
+        self.assertEqual(revocation_api.delete_calls, ["/installation/token"])
+
+    def test_environment_token_client_construction_failure_still_attempts_revocation(self):
+        response = {
+            "token": "environment-token",
+            "permissions": {"environments": "read", "metadata": "read"},
+            "repositories": [{"id": CONTROL_REPOSITORY_ID}],
+        }
+        app_api = MintingAppAPI([response])
+        revocation_api = TokenAPI("environment-token", lambda path: None)
+        calls = 0
+
+        def api_factory(token: str, url: str):
+            nonlocal calls
+            del token, url
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("CLIENT_CONSTRUCTION_FAILED")
+            return revocation_api
+
+        with self.assertRaisesRegex(RuntimeError, "CLIENT_CONSTRUCTION_FAILED"):
+            observation._observe_environment_variable(
+                app_api,
+                installation_id=77,
+                api_url="https://api.github.test",
+                api_factory=api_factory,
+            )
+        self.assertEqual(revocation_api.delete_calls, ["/installation/token"])
+
+    def test_environment_token_revocation_requires_http_204(self):
+        response = {
+            "token": "environment-token",
+            "permissions": {"environments": "read", "metadata": "read"},
+            "repositories": [{"id": CONTROL_REPOSITORY_ID}],
+        }
+        app_api = MintingAppAPI([response])
+        environment_api = TokenAPI(
+            "environment-token",
+            lambda path: {"total_count": 0, "variables": []},
+        )
+        environment_api.delete_status = 200
+        with self.assertRaisesRegex(
+            observation.CurrentObservationError,
+            "ENVIRONMENT_TOKEN_REVOCATION_FAILED",
+        ):
+            observation._observe_environment_variable(
+                app_api,
+                installation_id=77,
+                api_url="https://api.github.test",
+                api_factory=lambda token, url: environment_api,
+            )
+
+    def test_policy_binds_admin_bypass_and_custom_protection_rules(self):
+        payload = environment_payload(can_admins_bypass=False)
+        empty = {
+            "total_count": 0,
+            "custom_deployment_protection_rules": [],
+        }
+        custom = {
+            "total_count": 1,
+            "custom_deployment_protection_rules": [
+                {
+                    "id": 101,
+                    "enabled": True,
+                    "app": {"id": 202, "slug": "deployment-guard"},
+                }
+            ],
+        }
+        baseline = observation._environment_policy_material(
+            payload,
+            observation.ENVIRONMENT_NAME,
+            custom_protection_rules=empty,
+        )
+        with_rule = observation._environment_policy_material(
+            payload,
+            observation.ENVIRONMENT_NAME,
+            custom_protection_rules=custom,
+        )
+        bypassed_payload = dict(payload)
+        bypassed_payload["can_admins_bypass"] = True
+        with_bypass = observation._environment_policy_material(
+            bypassed_payload,
+            observation.ENVIRONMENT_NAME,
+            custom_protection_rules=empty,
+        )
+        self.assertNotEqual(
+            observation.sha256_text(observation.canonical_json(baseline)),
+            observation.sha256_text(observation.canonical_json(with_rule)),
+        )
+        self.assertNotEqual(
+            observation.sha256_text(observation.canonical_json(baseline)),
+            observation.sha256_text(observation.canonical_json(with_bypass)),
+        )
+
+    def test_custom_branch_policy_without_branch_or_tag_type_fails_closed(self):
+        payload = environment_payload(custom=True)
+        with self.assertRaisesRegex(
+            observation.CurrentObservationError,
+            "CUSTOM_BRANCH_POLICY_TYPE_UNAVAILABLE",
+        ):
+            observation._environment_policy_material(
+                payload,
+                observation.ENVIRONMENT_NAME,
+                branch_policies=[{"id": 10, "name": "main"}],
+                custom_protection_rules={
+                    "total_count": 0,
+                    "custom_deployment_protection_rules": [],
+                },
+            )
+
+    def test_typed_branch_and_tag_policies_are_canonicalised_deterministically(self):
+        payload = environment_payload(custom=True)
+        material = observation._environment_policy_material(
+            payload,
+            observation.ENVIRONMENT_NAME,
+            branch_policies=[
+                {"id": 2, "name": "v*", "type": "tag"},
+                {"id": 1, "name": "main", "type": "branch"},
+            ],
+            custom_protection_rules={
+                "total_count": 0,
+                "custom_deployment_protection_rules": [],
+            },
+        )
+        self.assertEqual(
+            material["deployment_branch_policies"],
+            [
+                {"id": 1, "name": "main", "type": "branch"},
+                {"id": 2, "name": "v*", "type": "tag"},
+            ],
+        )
+
+    def test_environment_policy_double_scan_detects_movement(self):
+        first = environment_payload(can_admins_bypass=False)
+        second = environment_payload(can_admins_bypass=True)
+        environment_reads = [first, first, second, second]
+
+        class PolicyAPI:
+            def get(self, path: str):
+                if path.endswith("/deployment_protection_rules"):
+                    return {
+                        "total_count": 0,
+                        "custom_deployment_protection_rules": [],
+                    }
+                if path.endswith("/environments/phase-2-allocator"):
+                    return environment_reads.pop(0)
+                raise AssertionError(path)
+
+        with self.assertRaisesRegex(
+            observation.CurrentObservationError,
+            "ENVIRONMENT_POLICY_MOVED",
+        ):
+            observation._observe_environment_policy(PolicyAPI())
 
     def test_inventory_paginates_completely_then_revokes_on_exact_set_failure(self):
         app_api = MintingAppAPI(
@@ -295,62 +557,26 @@ class CurrentObservationUnitTests(unittest.TestCase):
             )
         self.assertEqual(revocation_api.delete_calls, ["/installation/token"])
 
-    def test_pure_observation_digests_match_reviewed_predecessor(self):
-        payload = {
-            "name": observation.ENVIRONMENT_NAME,
-            "protection_rules": [
-                {"type": "wait_timer", "wait_timer": 0},
-                {
-                    "type": "required_reviewers",
-                    "prevent_self_review": True,
-                    "reviewers": [
-                        {"type": "User", "reviewer": {"id": 9}},
-                        {"type": "Team", "reviewer": {"id": 4}},
-                    ],
-                },
-                {"type": "branch_policy"},
-            ],
-            "deployment_branch_policy": {
-                "protected_branches": True,
-                "custom_branch_policies": False,
-            },
-        }
-        self.assertEqual(
-            observation._environment_policy_material(
-                payload, observation.ENVIRONMENT_NAME
-            ),
-            predecessor_environment_policy_material(
-                payload, observation.ENVIRONMENT_NAME
-            ),
-        )
-        self.assertEqual(
-            observation._environment_policy_sha256(
-                payload, observation.ENVIRONMENT_NAME
-            ),
-            predecessor_environment_policy_sha256(
-                payload, observation.ENVIRONMENT_NAME
-            ),
-        )
+    def test_reviewed_live_permission_profile_digest_remains_unchanged(self):
         self.assertEqual(observation.PERMISSION_PROFILE_SHA256, permission_profile_sha256())
 
 
 class CurrentObservationEndToEndTests(unittest.TestCase):
     def test_output_is_sanitised_key_is_scrubbed_and_only_read_tokens_are_minted(self):
-        environment_payload = {
-            "name": observation.ENVIRONMENT_NAME,
-            "protection_rules": [],
-            "deployment_branch_policy": {
-                "protected_branches": True,
-                "custom_branch_policies": False,
-            },
+        policy_payload = environment_payload()
+        empty_custom_rules = {
+            "total_count": 0,
+            "custom_deployment_protection_rules": [],
         }
 
         class ControlAPI:
             token = "github-token"
 
             def get(self, path: str):
+                if path.endswith("/deployment_protection_rules"):
+                    return empty_custom_rules
                 if path.endswith("/environments/phase-2-allocator"):
-                    return environment_payload
+                    return policy_payload
                 raise AssertionError(path)
 
         class AppAPI:
@@ -379,6 +605,15 @@ class CurrentObservationEndToEndTests(unittest.TestCase):
                         "repository_selection": "selected",
                     }
                 if body == {
+                    "repository_ids": [CONTROL_REPOSITORY_ID],
+                    "permissions": {"environments": "read", "metadata": "read"},
+                }:
+                    return {
+                        "token": "environment-token-secret",
+                        "permissions": {"environments": "read", "metadata": "read"},
+                        "repositories": [{"id": CONTROL_REPOSITORY_ID}],
+                    }
+                if body == {
                     "repository_ids": [STATE_REPOSITORY_ID],
                     "permissions": {"contents": "read", "metadata": "read"},
                 }:
@@ -396,6 +631,16 @@ class CurrentObservationEndToEndTests(unittest.TestCase):
                 "repositories": [
                     {"id": STATE_REPOSITORY_ID},
                     {"id": CONTROL_REPOSITORY_ID},
+                ],
+            },
+        )
+
+        environment_api = TokenAPI(
+            "environment-token-secret",
+            lambda path: {
+                "total_count": 1,
+                "variables": [
+                    {"name": observation.EXECUTION_VARIABLE, "value": ""}
                 ],
             },
         )
@@ -422,6 +667,7 @@ class CurrentObservationEndToEndTests(unittest.TestCase):
                 "github-token": control_api,
                 "jwt-secret": app_api,
                 "inventory-token-secret": inventory_api,
+                "environment-token-secret": environment_api,
                 "state-token-secret": state_api,
             }[token]
 
@@ -437,9 +683,6 @@ class CurrentObservationEndToEndTests(unittest.TestCase):
             "PHASE2_ALLOCATOR_APP_ID": "123",
             "PHASE2_ALLOCATOR_INSTALLATION_ID": "456",
             "PHASE2_ALLOCATOR_APP_PRIVATE_KEY": "private-key-secret",
-            "PHASE2_CONFIGURATION_VARIABLES_JSON": json.dumps(
-                {observation.EXECUTION_VARIABLE: ""}, separators=(",", ":")
-            ),
             "PHASE2_STATE_REPOSITORY_ID": str(STATE_REPOSITORY_ID),
         }
         result = observation.run(
@@ -456,6 +699,7 @@ class CurrentObservationEndToEndTests(unittest.TestCase):
             "private-key-secret",
             "jwt-secret",
             "inventory-token-secret",
+            "environment-token-secret",
             "state-token-secret",
             "github-token",
         ):
@@ -463,13 +707,23 @@ class CurrentObservationEndToEndTests(unittest.TestCase):
         self.assertNotIn("PHASE2_ALLOCATOR_APP_PRIVATE_KEY", values)
         self.assertEqual(result["execution_variable"]["state"], "defined_empty")
         self.assertEqual(result["state_baseline"]["tree_sha"], TREE_SHA)
-        self.assertEqual(result["token_observation"]["mutation_capable_tokens_minted"], 0)
+        self.assertEqual(
+            result["token_observation"]["mutation_capable_tokens_minted"], 0
+        )
+        self.assertTrue(
+            result["token_observation"]["environment_observation_token_revoked"]
+        )
         self.assertEqual(inventory_api.delete_calls, ["/installation/token"])
+        self.assertEqual(environment_api.delete_calls, ["/installation/token"])
         self.assertEqual(state_api.delete_calls, ["/installation/token"])
         self.assertEqual(
             app_api.mints,
             [
                 {"permissions": {"metadata": "read"}},
+                {
+                    "repository_ids": [CONTROL_REPOSITORY_ID],
+                    "permissions": {"environments": "read", "metadata": "read"},
+                },
                 {
                     "repository_ids": [STATE_REPOSITORY_ID],
                     "permissions": {"contents": "read", "metadata": "read"},
@@ -489,18 +743,18 @@ class CurrentObservationEndToEndTests(unittest.TestCase):
             "PHASE2_ALLOCATOR_APP_ID": "123",
             "PHASE2_ALLOCATOR_INSTALLATION_ID": "456",
             "PHASE2_ALLOCATOR_APP_PRIVATE_KEY": "private-key-secret",
-            "PHASE2_CONFIGURATION_VARIABLES_JSON": "{}",
             "PHASE2_STATE_REPOSITORY_ID": str(STATE_REPOSITORY_ID),
         }
 
         class ControlAPI:
             def get(self, path: str):
-                if path.endswith("/environments/phase-2-allocator"):
+                if path.endswith("/deployment_protection_rules"):
                     return {
-                        "name": observation.ENVIRONMENT_NAME,
-                        "protection_rules": [],
-                        "deployment_branch_policy": None,
+                        "total_count": 0,
+                        "custom_deployment_protection_rules": [],
                     }
+                if path.endswith("/environments/phase-2-allocator"):
+                    return environment_payload()
                 raise AssertionError(path)
 
         def fail_jwt(app_id: int, key: str) -> str:
@@ -531,9 +785,8 @@ class CurrentObservationWorkflowTests(unittest.TestCase):
         self.assertIn("    needs: contract-check\n", current)
         self.assertIn("inputs.operation == 'current_observation'", current)
         self.assertIn("environment: phase-2-allocator", current)
-        self.assertIn(
-            "PHASE2_CONFIGURATION_VARIABLES_JSON: ${{ toJSON(vars) }}", current
-        )
+        self.assertNotIn("PHASE2_CONFIGURATION_VARIABLES_JSON", current)
+        self.assertNotIn("toJSON(vars)", current)
         self.assertNotIn("successor-capsule", current)
         self.assertNotIn("operator_preflight", current)
         self.assertNotIn("live-scenario-suite", current)
@@ -553,9 +806,12 @@ class CurrentObservationWorkflowTests(unittest.TestCase):
             "state_profile(",
             '"contents": "write"',
             '"issues": "write"',
-            "/variables?",
+            '"environments": "write"',
+            "PHASE2_CONFIGURATION_VARIABLES_JSON",
         ):
             self.assertNotIn(forbidden, self.source)
+        self.assertIn('"environments": "read"', self.source)
+        self.assertIn("/variables", self.source)
 
     def test_existing_contract_preflight_and_live_semantics_remain_present(self):
         expected = (

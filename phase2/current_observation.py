@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 import sys
 from dataclasses import dataclass
@@ -17,6 +16,7 @@ from .credentials import (
 )
 from .github_api import GitHubAPI, GitHubAPIError
 from .operator_inventory import (
+    CONTROL_REPOSITORY_ID,
     EXPECTED_REPOSITORY_IDS,
     INVENTORY_PERMISSIONS,
     STATE_REPOSITORY_ID,
@@ -33,9 +33,12 @@ CONTROL_OWNER = "8ft0-ai"
 CONTROL_NAME = "gitstate-allocation-control"
 ENVIRONMENT_NAME = "phase-2-allocator"
 EXECUTION_VARIABLE = "PHASE2_WORKSTREAM_D_EXECUTION_ENABLED"
-CONFIGURATION_VARIABLES_ENV = "PHASE2_CONFIGURATION_VARIABLES_JSON"
 STATE_REPOSITORY = "8ft0-ai/gitstate-allocation-state"
 STATE_REPOSITORY_REF = "refs/heads/main"
+ENVIRONMENT_OBSERVATION_PERMISSIONS = {
+    "environments": "read",
+    "metadata": "read",
+}
 PERMISSION_PROFILE_SHA256 = (
     "e577e2ae1f3072a07de54b32c250e00cac492b4ae176ab485ff1d1157261942d"
 )
@@ -103,12 +106,48 @@ def _control_api(
     return api_factory(token, values.get("GITHUB_API_URL", "https://api.github.com"))
 
 
-def _environment_policy_material(
-    payload: Mapping[str, Any], expected_name: str
-) -> Mapping[str, Any]:
-    if payload.get("name") != expected_name:
-        raise CurrentObservationError("ENVIRONMENT_BOUNDARY_CHANGED")
-    rules = payload.get("protection_rules")
+def _list_counted_collection(
+    api: GitHubAPI,
+    path: str,
+    *,
+    key: str,
+    per_page: int,
+    max_pages: int = 100,
+) -> list[Mapping[str, Any]]:
+    if per_page <= 0 or max_pages <= 0:
+        raise CurrentObservationError("READ_EVIDENCE_AMBIGUOUS")
+    items: list[Mapping[str, Any]] = []
+    expected_total: int | None = None
+    for page in range(1, max_pages + 1):
+        separator = "&" if "?" in path else "?"
+        payload = api.get(f"{path}{separator}per_page={per_page}&page={page}")
+        if not isinstance(payload, Mapping):
+            raise CurrentObservationError("READ_EVIDENCE_AMBIGUOUS")
+        total = payload.get("total_count")
+        page_items = payload.get(key)
+        if type(total) is not int or total < 0 or not isinstance(page_items, list):
+            raise CurrentObservationError("READ_EVIDENCE_AMBIGUOUS")
+        if expected_total is None:
+            expected_total = total
+            if expected_total > per_page * max_pages:
+                raise CurrentObservationError("READ_EVIDENCE_TOO_LARGE")
+        elif total != expected_total:
+            raise CurrentObservationError("READ_EVIDENCE_MOVED")
+        if any(not isinstance(item, Mapping) for item in page_items):
+            raise CurrentObservationError("READ_EVIDENCE_AMBIGUOUS")
+        items.extend(page_items)
+        if len(items) > expected_total:
+            raise CurrentObservationError("READ_EVIDENCE_AMBIGUOUS")
+        if len(items) == expected_total:
+            return items
+        if not page_items:
+            raise CurrentObservationError("READ_EVIDENCE_INCOMPLETE")
+    raise CurrentObservationError("READ_EVIDENCE_INCOMPLETE")
+
+
+def _normalise_standard_protection_rules(
+    rules: object,
+) -> list[dict[str, Any]]:
     if not isinstance(rules, list) or any(
         not isinstance(rule, Mapping) for rule in rules
     ):
@@ -129,18 +168,24 @@ def _environment_policy_material(
             if not isinstance(reviewers, list) or type(prevent_self_review) is not bool:
                 raise CurrentObservationError("READ_EVIDENCE_AMBIGUOUS")
             normalised_reviewers: list[dict[str, Any]] = []
+            seen_reviewers: set[tuple[str, int]] = set()
             for entry in reviewers:
                 if not isinstance(entry, Mapping):
                     raise CurrentObservationError("READ_EVIDENCE_AMBIGUOUS")
                 reviewer = entry.get("reviewer")
                 reviewer_type = entry.get("type")
-                if not isinstance(reviewer, Mapping) or not isinstance(
-                    reviewer_type, str
-                ):
+                if not isinstance(reviewer, Mapping) or reviewer_type not in {
+                    "User",
+                    "Team",
+                }:
                     raise CurrentObservationError("READ_EVIDENCE_AMBIGUOUS")
                 reviewer_id = reviewer.get("id")
                 if type(reviewer_id) is not int or reviewer_id <= 0:
                     raise CurrentObservationError("READ_EVIDENCE_AMBIGUOUS")
+                identity = (reviewer_type, reviewer_id)
+                if identity in seen_reviewers:
+                    raise CurrentObservationError("READ_EVIDENCE_AMBIGUOUS")
+                seen_reviewers.add(identity)
                 normalised_reviewers.append(
                     {"id": reviewer_id, "type": reviewer_type}
                 )
@@ -158,31 +203,216 @@ def _environment_policy_material(
             continue
         raise CurrentObservationError("READ_EVIDENCE_AMBIGUOUS")
     normalised_rules.sort(key=canonical_json)
+    return normalised_rules
+
+
+def _normalise_branch_policies(
+    values: list[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    seen_ids: set[int] = set()
+    seen_semantics: set[tuple[str, str]] = set()
+    for value in values:
+        policy_id = value.get("id")
+        name = value.get("name")
+        policy_type = value.get("type")
+        if type(policy_id) is not int or policy_id <= 0:
+            raise CurrentObservationError("READ_EVIDENCE_AMBIGUOUS")
+        if not isinstance(name, str) or not name:
+            raise CurrentObservationError("READ_EVIDENCE_AMBIGUOUS")
+        if policy_type not in {"branch", "tag"}:
+            raise CurrentObservationError("CUSTOM_BRANCH_POLICY_TYPE_UNAVAILABLE")
+        semantic = (policy_type, name)
+        if policy_id in seen_ids or semantic in seen_semantics:
+            raise CurrentObservationError("READ_EVIDENCE_AMBIGUOUS")
+        seen_ids.add(policy_id)
+        seen_semantics.add(semantic)
+        result.append({"id": policy_id, "name": name, "type": policy_type})
+    result.sort(key=lambda item: (item["type"], item["name"], item["id"]))
+    return result
+
+
+def _normalise_custom_protection_rules(
+    payload: object,
+) -> list[dict[str, Any]]:
+    if not isinstance(payload, Mapping):
+        raise CurrentObservationError("READ_EVIDENCE_AMBIGUOUS")
+    total = payload.get("total_count")
+    rules = payload.get("custom_deployment_protection_rules")
+    if type(total) is not int or total < 0 or not isinstance(rules, list):
+        raise CurrentObservationError("READ_EVIDENCE_AMBIGUOUS")
+    if total != len(rules):
+        raise CurrentObservationError("READ_EVIDENCE_INCOMPLETE")
+
+    result: list[dict[str, Any]] = []
+    seen_ids: set[int] = set()
+    seen_apps: set[tuple[int, str]] = set()
+    for rule in rules:
+        if not isinstance(rule, Mapping):
+            raise CurrentObservationError("READ_EVIDENCE_AMBIGUOUS")
+        rule_id = rule.get("id")
+        enabled = rule.get("enabled")
+        app = rule.get("app")
+        if type(rule_id) is not int or rule_id <= 0 or enabled is not True:
+            raise CurrentObservationError("READ_EVIDENCE_AMBIGUOUS")
+        if not isinstance(app, Mapping):
+            raise CurrentObservationError("READ_EVIDENCE_AMBIGUOUS")
+        app_id = app.get("id")
+        app_slug = app.get("slug")
+        if type(app_id) is not int or app_id <= 0:
+            raise CurrentObservationError("READ_EVIDENCE_AMBIGUOUS")
+        if not isinstance(app_slug, str) or not app_slug:
+            raise CurrentObservationError("READ_EVIDENCE_AMBIGUOUS")
+        app_identity = (app_id, app_slug)
+        if rule_id in seen_ids or app_identity in seen_apps:
+            raise CurrentObservationError("READ_EVIDENCE_AMBIGUOUS")
+        seen_ids.add(rule_id)
+        seen_apps.add(app_identity)
+        result.append(
+            {
+                "id": rule_id,
+                "enabled": True,
+                "app": {"id": app_id, "slug": app_slug},
+            }
+        )
+    result.sort(key=lambda item: (item["app"]["slug"], item["app"]["id"], item["id"]))
+    return result
+
+
+def _environment_policy_material(
+    payload: Mapping[str, Any],
+    expected_name: str,
+    *,
+    branch_policies: list[Mapping[str, Any]] | None = None,
+    custom_protection_rules: object | None = None,
+) -> Mapping[str, Any]:
+    if payload.get("name") != expected_name:
+        raise CurrentObservationError("ENVIRONMENT_BOUNDARY_CHANGED")
+    can_admins_bypass = payload.get("can_admins_bypass")
+    if type(can_admins_bypass) is not bool:
+        raise CurrentObservationError("READ_EVIDENCE_AMBIGUOUS")
+    normalised_rules = _normalise_standard_protection_rules(
+        payload.get("protection_rules")
+    )
 
     branch_policy = payload.get("deployment_branch_policy")
     if branch_policy is None:
         normalised_branch_policy: Mapping[str, Any] | None = None
+        custom_enabled = False
     elif isinstance(branch_policy, Mapping):
         protected = branch_policy.get("protected_branches")
         custom = branch_policy.get("custom_branch_policies")
-        if type(protected) is not bool or type(custom) is not bool:
+        if type(protected) is not bool or type(custom) is not bool or protected == custom:
             raise CurrentObservationError("READ_EVIDENCE_AMBIGUOUS")
         normalised_branch_policy = {
             "custom_branch_policies": custom,
             "protected_branches": protected,
         }
+        custom_enabled = custom
     else:
         raise CurrentObservationError("READ_EVIDENCE_AMBIGUOUS")
 
+    has_branch_rule = any(rule["type"] == "branch_policy" for rule in normalised_rules)
+    if has_branch_rule != (normalised_branch_policy is not None):
+        raise CurrentObservationError("READ_EVIDENCE_AMBIGUOUS")
+
+    supplied_branch_policies = [] if branch_policies is None else branch_policies
+    if custom_enabled:
+        normalised_custom_branch_policies = _normalise_branch_policies(
+            supplied_branch_policies
+        )
+    else:
+        if supplied_branch_policies:
+            raise CurrentObservationError("READ_EVIDENCE_AMBIGUOUS")
+        normalised_custom_branch_policies = []
+
+    if custom_protection_rules is None:
+        normalised_custom_protection_rules: list[dict[str, Any]] = []
+    else:
+        normalised_custom_protection_rules = _normalise_custom_protection_rules(
+            custom_protection_rules
+        )
+
     return {
+        "can_admins_bypass": can_admins_bypass,
+        "custom_deployment_protection_rules": normalised_custom_protection_rules,
         "deployment_branch_policy": normalised_branch_policy,
+        "deployment_branch_policies": normalised_custom_branch_policies,
         "name": expected_name,
         "protection_rules": normalised_rules,
     }
 
 
-def _environment_policy_sha256(payload: Mapping[str, Any], expected_name: str) -> str:
-    return sha256_text(canonical_json(_environment_policy_material(payload, expected_name)))
+def _environment_policy_sha256(
+    payload: Mapping[str, Any],
+    expected_name: str,
+    *,
+    branch_policies: list[Mapping[str, Any]] | None = None,
+    custom_protection_rules: object | None = None,
+) -> str:
+    return sha256_text(
+        canonical_json(
+            _environment_policy_material(
+                payload,
+                expected_name,
+                branch_policies=branch_policies,
+                custom_protection_rules=custom_protection_rules,
+            )
+        )
+    )
+
+
+def _read_environment_policy_snapshot(api: GitHubAPI) -> Mapping[str, Any]:
+    environment_path = (
+        f"/repos/{CONTROL_REPOSITORY}/environments/{quote(ENVIRONMENT_NAME, safe='')}"
+    )
+    before = api.get(environment_path)
+    if not isinstance(before, Mapping):
+        raise CurrentObservationError("READ_EVIDENCE_AMBIGUOUS")
+
+    branch_policy = before.get("deployment_branch_policy")
+    custom_enabled = (
+        isinstance(branch_policy, Mapping)
+        and branch_policy.get("custom_branch_policies") is True
+    )
+    if custom_enabled:
+        branch_policies = _list_counted_collection(
+            api,
+            f"{environment_path}/deployment-branch-policies",
+            key="branch_policies",
+            per_page=100,
+        )
+    else:
+        branch_policies = []
+
+    custom_rules = api.get(f"{environment_path}/deployment_protection_rules")
+    after = api.get(environment_path)
+    if not isinstance(after, Mapping):
+        raise CurrentObservationError("READ_EVIDENCE_AMBIGUOUS")
+
+    before_material = _environment_policy_material(
+        before,
+        ENVIRONMENT_NAME,
+        branch_policies=branch_policies,
+        custom_protection_rules=custom_rules,
+    )
+    after_material = _environment_policy_material(
+        after,
+        ENVIRONMENT_NAME,
+        branch_policies=branch_policies,
+        custom_protection_rules=custom_rules,
+    )
+    if canonical_json(before_material) != canonical_json(after_material):
+        raise CurrentObservationError("ENVIRONMENT_POLICY_MOVED")
+    return before_material
+
+
+def _observe_environment_policy(api: GitHubAPI) -> tuple[Mapping[str, Any], str]:
+    first = _read_environment_policy_snapshot(api)
+    second = _read_environment_policy_snapshot(api)
+    if canonical_json(first) != canonical_json(second):
+        raise CurrentObservationError("ENVIRONMENT_POLICY_MOVED")
+    return first, sha256_text(canonical_json(first))
 
 
 def _state_observation_sha256(
@@ -206,58 +436,67 @@ def _state_observation_sha256(
     )
 
 
-def _observe_environment_policy(api: GitHubAPI) -> tuple[Mapping[str, Any], str]:
-    payload = api.get(
-        f"/repos/{CONTROL_REPOSITORY}/environments/{quote(ENVIRONMENT_NAME, safe='')}"
+def _environment_observation_token_request() -> dict[str, object]:
+    return {
+        "repository_ids": [CONTROL_REPOSITORY_ID],
+        "permissions": dict(ENVIRONMENT_OBSERVATION_PERMISSIONS),
+    }
+
+
+def _validate_environment_observation_token_response(
+    response: Mapping[str, Any],
+) -> str:
+    token = response.get("token")
+    permissions = response.get("permissions")
+    repositories = response.get("repositories")
+    if permissions != ENVIRONMENT_OBSERVATION_PERMISSIONS:
+        raise CurrentObservationError("ENVIRONMENT_TOKEN_PERMISSION_MISMATCH")
+    if not isinstance(repositories, list):
+        raise CurrentObservationError("ENVIRONMENT_TOKEN_REPOSITORY_SCOPE_MISMATCH")
+    ids = [
+        repository.get("id") if isinstance(repository, Mapping) else None
+        for repository in repositories
+    ]
+    if ids != [CONTROL_REPOSITORY_ID]:
+        raise CurrentObservationError("ENVIRONMENT_TOKEN_REPOSITORY_SCOPE_MISMATCH")
+    if not isinstance(token, str) or not token:
+        raise CurrentObservationError("ENVIRONMENT_TOKEN_MISSING")
+    return token
+
+
+def _observe_execution_variable(api: GitHubAPI) -> dict[str, object]:
+    environment = quote(ENVIRONMENT_NAME, safe="")
+    variables = _list_counted_collection(
+        api,
+        f"/repos/{CONTROL_REPOSITORY}/environments/{environment}/variables",
+        key="variables",
+        per_page=30,
     )
-    if not isinstance(payload, Mapping):
-        raise CurrentObservationError("READ_EVIDENCE_AMBIGUOUS")
-    return (
-        _environment_policy_material(payload, ENVIRONMENT_NAME),
-        _environment_policy_sha256(payload, ENVIRONMENT_NAME),
-    )
-
-
-def _configuration_variables(raw: str) -> dict[str, str]:
-    def reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
-        result: dict[str, object] = {}
-        for key, value in pairs:
-            if key in result:
-                raise CurrentObservationError("EXECUTION_VARIABLE_EVIDENCE_AMBIGUOUS")
-            result[key] = value
-        return result
-
-    try:
-        payload = json.loads(raw, object_pairs_hook=reject_duplicate_keys)
-    except CurrentObservationError:
-        raise
-    except (TypeError, ValueError, json.JSONDecodeError) as exc:
-        raise CurrentObservationError("EXECUTION_VARIABLE_EVIDENCE_AMBIGUOUS") from exc
-    if not isinstance(payload, dict):
-        raise CurrentObservationError("EXECUTION_VARIABLE_EVIDENCE_AMBIGUOUS")
-
-    result: dict[str, str] = {}
-    for name, value in payload.items():
+    selected_value: str | None = None
+    selected_found = False
+    seen_names: set[str] = set()
+    for variable in variables:
+        name = variable.get("name")
+        value = variable.get("value")
         if not isinstance(name, str) or not name or not isinstance(value, str):
             raise CurrentObservationError("EXECUTION_VARIABLE_EVIDENCE_AMBIGUOUS")
-        result[name] = value
-    return result
+        if name in seen_names:
+            raise CurrentObservationError("EXECUTION_VARIABLE_EVIDENCE_AMBIGUOUS")
+        seen_names.add(name)
+        if name == EXECUTION_VARIABLE:
+            selected_found = True
+            selected_value = value
 
-
-def _observe_execution_variable(raw_configuration_variables: str) -> dict[str, object]:
-    variables = _configuration_variables(raw_configuration_variables)
-    if EXECUTION_VARIABLE not in variables:
+    if not selected_found:
         return {
             "name": EXECUTION_VARIABLE,
             "defined": False,
             "state": "not_defined",
         }
-
-    value = variables[EXECUTION_VARIABLE]
     return {
         "name": EXECUTION_VARIABLE,
         "defined": True,
-        "state": "defined_empty" if value == "" else "defined_non_empty",
+        "state": "defined_empty" if selected_value == "" else "defined_non_empty",
     }
 
 
@@ -315,6 +554,67 @@ def _observe_installation_inventory(
     if repository_ids is None:
         raise CurrentObservationError("INVENTORY_EVIDENCE_MISSING")
     return repository_ids
+
+
+def _observe_environment_variable(
+    app_api: GitHubAPI,
+    *,
+    installation_id: int,
+    api_url: str,
+    api_factory: Callable[[str, str], GitHubAPI],
+) -> dict[str, object]:
+    request = _environment_observation_token_request()
+    if request != {
+        "repository_ids": [CONTROL_REPOSITORY_ID],
+        "permissions": {"environments": "read", "metadata": "read"},
+    }:
+        raise CurrentObservationError("ENVIRONMENT_TOKEN_REQUEST_WIDENED")
+
+    response = app_api.post(
+        f"/app/installations/{installation_id}/access_tokens",
+        request,
+    )
+    if not isinstance(response, Mapping):
+        raise CurrentObservationError("ENVIRONMENT_TOKEN_RESPONSE_INVALID")
+    token = response.get("token")
+    if not isinstance(token, str) or not token:
+        raise CurrentObservationError("ENVIRONMENT_TOKEN_MISSING")
+
+    primary_error: Exception | None = None
+    environment_api: GitHubAPI | None = None
+    result: dict[str, object] | None = None
+    try:
+        _validate_environment_observation_token_response(response)
+        environment_api = api_factory(token, api_url)
+        result = _observe_execution_variable(environment_api)
+    except Exception as exc:
+        primary_error = exc
+
+    try:
+        revocation_api = (
+            environment_api
+            if environment_api is not None
+            else api_factory(token, api_url)
+        )
+        _, _, status = revocation_api.request_with_status(
+            "DELETE", "/installation/token"
+        )
+        if status != 204:
+            raise CurrentObservationError(
+                "ENVIRONMENT_TOKEN_REVOCATION_STATUS_INVALID"
+            )
+    except Exception as revoke_exc:
+        raise CurrentObservationError("ENVIRONMENT_TOKEN_REVOCATION_FAILED") from (
+            primary_error or revoke_exc
+        )
+    finally:
+        token = ""
+
+    if primary_error is not None:
+        raise primary_error
+    if result is None:
+        raise CurrentObservationError("EXECUTION_VARIABLE_EVIDENCE_MISSING")
+    return result
 
 
 def _observe_state_baseline(
@@ -440,13 +740,8 @@ def run(
     if state_repository_id != STATE_REPOSITORY_ID:
         raise CurrentObservationError("STATE_REPOSITORY_ID_MISMATCH")
 
-    raw_configuration_variables = env.get(CONFIGURATION_VARIABLES_ENV)
-    if raw_configuration_variables is None:
-        raise CurrentObservationError("EXECUTION_VARIABLE_EVIDENCE_UNAVAILABLE")
-
     control_api = _control_api(env, api_factory)
     environment_policy, policy_sha256 = _observe_environment_policy(control_api)
-    execution_variable = _observe_execution_variable(raw_configuration_variables)
 
     key_name = "PHASE2_ALLOCATOR_APP_PRIVATE_KEY"
     private_key = env.get(key_name, "")
@@ -486,12 +781,27 @@ def run(
         api_url=api_url,
         api_factory=api_factory,
     )
+    execution_variable = _observe_environment_variable(
+        app_api,
+        installation_id=installation_id,
+        api_url=api_url,
+        api_factory=api_factory,
+    )
     state_baseline = _observe_state_baseline(
         app_api,
         installation_id=installation_id,
         api_url=api_url,
         api_factory=api_factory,
     )
+
+    final_environment_policy, final_policy_sha256 = _observe_environment_policy(
+        control_api
+    )
+    if (
+        final_policy_sha256 != policy_sha256
+        or canonical_json(final_environment_policy) != canonical_json(environment_policy)
+    ):
+        raise CurrentObservationError("ENVIRONMENT_POLICY_MOVED")
 
     return {
         "status": "GITSTATE_CURRENT_OBSERVATION_COMPLETE",
@@ -517,11 +827,15 @@ def run(
         "execution_variable": execution_variable,
         "token_observation": {
             "inventory_token_permissions": dict(INVENTORY_PERMISSIONS),
+            "environment_observation_token_permissions": dict(
+                ENVIRONMENT_OBSERVATION_PERMISSIONS
+            ),
             "state_observation_token_permissions": {
                 "contents": "read",
                 "metadata": "read",
             },
             "inventory_token_revoked": True,
+            "environment_observation_token_revoked": True,
             "state_observation_token_revoked": True,
             "mutation_capable_tokens_minted": 0,
         },
