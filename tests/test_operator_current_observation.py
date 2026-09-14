@@ -142,6 +142,26 @@ class CurrentObservationUnitTests(unittest.TestCase):
             )
         self.assertEqual(inventory_api.delete_calls, ["/installation/token"])
 
+    def test_inventory_revocation_requires_http_204(self):
+        app_api = MintingAppAPI(
+            [{"token": "inventory-token", "permissions": {"metadata": "read"}, "repository_selection": "selected"}]
+        )
+        inventory_api = TokenAPI(
+            "inventory-token",
+            lambda path: {
+                "total_count": 2,
+                "repositories": [{"id": CONTROL_REPOSITORY_ID}, {"id": STATE_REPOSITORY_ID}],
+            },
+        )
+        inventory_api.delete_status = 200
+        with self.assertRaisesRegex(observation.CurrentObservationError, "INVENTORY_TOKEN_REVOCATION_FAILED"):
+            observation._observe_installation_inventory(
+                app_api,
+                installation_id=77,
+                api_url="https://api.github.test",
+                api_factory=lambda token, url: inventory_api,
+            )
+
     def test_state_tree_sha_preserves_predecessor_digest_and_revokes(self):
         response = {
             "token": "state-token",
@@ -397,7 +417,9 @@ class CurrentObservationWorkflowTests(unittest.TestCase):
 
     def test_operation_dispatch_is_isolated_and_has_no_authority_dependencies(self):
         self.assertIn("          - current_observation\n", self.workflow)
-        current = self.workflow.split("\n  current-observation:\n", 1)[1]
+        current = self.workflow.split("\n  current-observation:\n", 1)[1].split(
+            "\n  operator-preflight:\n", 1
+        )[0]
         self.assertIn("    needs: contract-check\n", current)
         self.assertIn("inputs.operation == 'current_observation'", current)
         self.assertIn("environment: phase-2-allocator", current)
