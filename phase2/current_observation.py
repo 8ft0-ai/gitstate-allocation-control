@@ -122,16 +122,6 @@ def _required_positive_int(values: Mapping[str, str], name: str) -> int:
     return value
 
 
-def _control_api(
-    values: Mapping[str, str],
-    api_factory: Callable[[str, str], GitHubAPI],
-) -> GitHubAPI:
-    token = values.get("GITHUB_TOKEN", "")
-    if not token:
-        raise CurrentObservationError("READ_EVIDENCE_UNAVAILABLE")
-    return api_factory(token, values.get("GITHUB_API_URL", "https://api.github.com"))
-
-
 def _run_openssl(
     arguments: list[str],
     *,
@@ -692,12 +682,13 @@ def _observe_installation_inventory(
     return repository_ids
 
 
-def _observe_environment_variable(
+def _with_environment_observation_token(
     app_api: GitHubAPI,
     *,
     installation_id: int,
     api_url: str,
     api_factory: Callable[[str, str], GitHubAPI],
+    observe: Callable[[GitHubAPI], dict[str, object]],
 ) -> dict[str, object]:
     request = _environment_observation_token_request()
     if request != {
@@ -722,7 +713,7 @@ def _observe_environment_variable(
     try:
         _validate_environment_observation_token_response(response)
         environment_api = api_factory(token, api_url)
-        result = _observe_execution_variable(environment_api)
+        result = observe(environment_api)
     except Exception as exc:
         primary_error = exc
 
@@ -749,7 +740,7 @@ def _observe_environment_variable(
     if primary_error is not None:
         raise primary_error
     if result is None:
-        raise CurrentObservationError("EXECUTION_VARIABLE_EVIDENCE_MISSING")
+        raise CurrentObservationError("ENVIRONMENT_OBSERVATION_EVIDENCE_MISSING")
     return result
 
 
@@ -877,9 +868,6 @@ def run(
     if state_repository_id != STATE_REPOSITORY_ID:
         raise CurrentObservationError("STATE_REPOSITORY_ID_MISMATCH")
 
-    control_api = _control_api(env, api_factory)
-    environment_policy, policy_sha256 = _observe_environment_policy(control_api)
-
     key_name = "PHASE2_ALLOCATOR_APP_PRIVATE_KEY"
     private_key = env.get(key_name, "")
     if not private_key:
@@ -912,35 +900,49 @@ def run(
     if repository_selection != "selected":
         raise CurrentObservationError("INVENTORY_INSTALLATION_NOT_SELECTED")
 
-    repository_ids = _observe_installation_inventory(
+    def observe_interval(environment_api: GitHubAPI) -> dict[str, object]:
+        environment_policy, policy_sha256 = _observe_environment_policy(
+            environment_api
+        )
+        repository_ids = _observe_installation_inventory(
+            app_api,
+            installation_id=installation_id,
+            api_url=api_url,
+            api_factory=api_factory,
+        )
+        execution_variable = _observe_execution_variable(environment_api)
+        state_baseline = _observe_state_baseline(
+            app_api,
+            installation_id=installation_id,
+            api_url=api_url,
+            api_factory=api_factory,
+        )
+        final_environment_policy, final_policy_sha256 = _observe_environment_policy(
+            environment_api
+        )
+        if (
+            final_policy_sha256 != policy_sha256
+            or canonical_json(final_environment_policy)
+            != canonical_json(environment_policy)
+        ):
+            raise CurrentObservationError("ENVIRONMENT_POLICY_MOVED")
+        return {
+            "environment_policy": environment_policy,
+            "policy_sha256": policy_sha256,
+            "repository_ids": list(repository_ids),
+            "execution_variable": execution_variable,
+            "state_baseline": state_baseline,
+        }
+
+    observed = _with_environment_observation_token(
         app_api,
         installation_id=installation_id,
         api_url=api_url,
         api_factory=api_factory,
-    )
-    execution_variable = _observe_environment_variable(
-        app_api,
-        installation_id=installation_id,
-        api_url=api_url,
-        api_factory=api_factory,
-    )
-    state_baseline = _observe_state_baseline(
-        app_api,
-        installation_id=installation_id,
-        api_url=api_url,
-        api_factory=api_factory,
+        observe=observe_interval,
     )
 
-    final_environment_policy, final_policy_sha256 = _observe_environment_policy(
-        control_api
-    )
-    if (
-        final_policy_sha256 != policy_sha256
-        or canonical_json(final_environment_policy) != canonical_json(environment_policy)
-    ):
-        raise CurrentObservationError("ENVIRONMENT_POLICY_MOVED")
-
-    return {
+    result = {
         "status": "GITSTATE_CURRENT_OBSERVATION_COMPLETE",
         "operation": context.operation,
         "run_id": context.run_id,
@@ -952,16 +954,16 @@ def run(
         },
         "installation_inventory": {
             "repository_selection": repository_selection,
-            "selected_repository_ids": list(repository_ids),
+            "selected_repository_ids": observed["repository_ids"],
         },
-        "state_baseline": state_baseline,
+        "state_baseline": observed["state_baseline"],
         "permission_profile_sha256": PERMISSION_PROFILE_SHA256,
         "protected_environment": {
             "name": ENVIRONMENT_NAME,
-            "policy": environment_policy,
-            "policy_sha256": policy_sha256,
+            "policy": observed["environment_policy"],
+            "policy_sha256": observed["policy_sha256"],
         },
-        "execution_variable": execution_variable,
+        "execution_variable": observed["execution_variable"],
         "token_observation": {
             "inventory_token_permissions": dict(INVENTORY_PERMISSIONS),
             "environment_observation_token_permissions": dict(
@@ -982,6 +984,11 @@ def run(
         "workstream_d_executed": False,
         "workstream_e_authorised": False,
     }
+    try:
+        canonical_json(result)
+    except (TypeError, ValueError) as exc:
+        raise CurrentObservationError("OBSERVATION_EVIDENCE_INVALID") from exc
+    return result
 
 
 def _seal_observation(
