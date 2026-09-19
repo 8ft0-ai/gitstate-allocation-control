@@ -6,9 +6,31 @@ Public control plane for the bounded Gitstate Phase 2 allocation experiment.
 
 Only non-sensitive synthetic identifiers and content are permitted in this repository, its issues, workflow inputs, logs and artefacts. Credentials, personal data, proprietary task content, private repository identities and private issue references are prohibited.
 
-## Request surface
+## Request surfaces
 
-Issue #1 is the sole request surface and must remain open with the trusted control-surface label. A request is exactly one UTF-8 line beginning with `/beads-v0.2 ` followed immediately by one strict JSON object. Requests elsewhere are rejected before App credentials are available.
+### Allocation intake
+
+Issue #1 is the sole `/beads-v0.2` allocation-intake request surface and must remain open with the trusted control-surface label. An allocation-intake request is exactly one UTF-8 line beginning with `/beads-v0.2 ` followed immediately by one strict JSON object. Allocation-intake requests elsewhere are rejected before App credentials are available.
+
+### Governed `current_observation` dispatch relay
+
+A separately governed transport-only relay may accept one dedicated issue per `current_observation` dispatch attempt. This relay is not an allocation-intake surface and grants no allocation, Workstream D or Workstream E authority.
+
+The request issue must be opened by repository owner `8ft0-ai`, have the exact title:
+
+```text
+[gitstate-current-observation-dispatch/v1]
+```
+
+and contain exactly one UTF-8 line with one strict JSON object containing only:
+
+```json
+{"ref":"refs/tags/gitstate-current-observation/<40-lowercase-hex>","current_observation_recipient_cert_b64":"<public-base64-DER-X509-certificate>"}
+```
+
+The relay is structurally fixed to repository `8ft0-ai/gitstate-allocation-control`, workflow `.github/workflows/phase2-adversarial.yml`, operation `current_observation` and method `workflow_dispatch`. It requires a direct protected-tag target matching the 40-hex suffix, durably consumes the request before transmission, permits at most one outbound dispatch mutation attempt, has no automatic retry or fallback transport, and uses only the ordinary ephemeral repository `GITHUB_TOKEN`.
+
+The recipient certificate is public request/input material but is not echoed to relay logs, summaries or diagnostics. Allocator credentials and recipient private-key material are not relay inputs.
 
 ## Trust boundary
 

@@ -1,0 +1,50 @@
+name: Current observation governed dispatch relay
+
+on:
+  issues:
+    types: [opened]
+
+permissions: {}
+
+concurrency:
+  group: current-observation-relay-${{ github.event.issue.id }}
+  cancel-in-progress: false
+
+jobs:
+  validation:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      issues: read
+    steps:
+      - name: Checkout immutable relay implementation without persisted credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Validate exact governed dispatch request
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 -m phase2.current_observation_dispatch_relay validate
+
+  consume-and-dispatch:
+    needs: validation
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      issues: write
+      actions: write
+    steps:
+      - name: Checkout immutable relay implementation without persisted credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Consume request and attempt exactly one fixed workflow dispatch
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 -m phase2.current_observation_dispatch_relay consume-and-dispatch
