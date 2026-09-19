@@ -20,6 +20,8 @@ from phase2.successor_runtime import state_observation_sha256 as predecessor_sta
 
 COMMIT_SHA = "b" * 40
 TREE_SHA = "c" * 40
+RUNTIME_SHA = "a" * 40
+RUNTIME_REF = f"{observation.CURRENT_OBSERVATION_TAG_REF_PREFIX}{RUNTIME_SHA}"
 
 
 class MintingAppAPI:
@@ -163,6 +165,89 @@ class EphemeralRecipientMixin:
 
 
 class CurrentObservationUnitTests(unittest.TestCase):
+    def test_context_accepts_exact_protected_tag_runtime_and_workflow_sha(self):
+        values = {
+            "GITHUB_REPOSITORY": observation.CONTROL_REPOSITORY,
+            "GITHUB_REF": RUNTIME_REF,
+            "GITHUB_SHA": RUNTIME_SHA,
+            observation.WORKFLOW_SHA_ENV: RUNTIME_SHA,
+            "GITHUB_RUN_ID": "99",
+            "GITHUB_RUN_ATTEMPT": "1",
+            "INPUT_OPERATION": "current_observation",
+        }
+        context = observation._context(values)
+        self.assertEqual(context.ref, RUNTIME_REF)
+        self.assertEqual(context.trusted_sha, RUNTIME_SHA)
+        self.assertEqual(context.workflow_sha, RUNTIME_SHA)
+
+    def test_context_rejects_non_tag_malformed_tag_and_sha_mismatches(self):
+        base = {
+            "GITHUB_REPOSITORY": observation.CONTROL_REPOSITORY,
+            "GITHUB_REF": RUNTIME_REF,
+            "GITHUB_SHA": RUNTIME_SHA,
+            observation.WORKFLOW_SHA_ENV: RUNTIME_SHA,
+            "GITHUB_RUN_ID": "99",
+            "GITHUB_RUN_ATTEMPT": "1",
+            "INPUT_OPERATION": "current_observation",
+        }
+        cases = (
+            ("GITHUB_REF", "refs/heads/main", "OBSERVATION_PROTECTED_TAG_REQUIRED"),
+            (
+                "GITHUB_REF",
+                observation.CURRENT_OBSERVATION_TAG_REF_PREFIX + ("a" * 39),
+                "OBSERVATION_PROTECTED_TAG_INVALID",
+            ),
+            ("GITHUB_SHA", "b" * 40, "OBSERVATION_TRUSTED_SHA_MISMATCH"),
+            (
+                observation.WORKFLOW_SHA_ENV,
+                "b" * 40,
+                "OBSERVATION_WORKFLOW_SHA_MISMATCH",
+            ),
+        )
+        for name, value, reason in cases:
+            with self.subTest(name=name, reason=reason):
+                values = dict(base)
+                values[name] = value
+                with self.assertRaisesRegex(observation.CurrentObservationError, reason):
+                    observation._context(values)
+
+    def test_runtime_identity_gate_precedes_allocator_private_key_access(self):
+        values = {
+            "GITHUB_REPOSITORY": observation.CONTROL_REPOSITORY,
+            "GITHUB_REF": RUNTIME_REF,
+            "GITHUB_SHA": RUNTIME_SHA,
+            observation.WORKFLOW_SHA_ENV: "b" * 40,
+            "GITHUB_RUN_ID": "99",
+            "GITHUB_RUN_ATTEMPT": "1",
+            "GITHUB_ACTOR": observation.CONTROL_OWNER,
+            "INPUT_OPERATION": "current_observation",
+            observation.RECIPIENT_CERTIFICATE_ENV: "not-reached",
+            "PHASE2_ALLOCATOR_APP_PRIVATE_KEY": "untouched-private-key",
+        }
+        jwt_called = False
+
+        def unexpected_jwt(app_id: int, key: str) -> str:
+            nonlocal jwt_called
+            jwt_called = True
+            raise AssertionError((app_id, key))
+
+        with self.assertRaisesRegex(
+            observation.CurrentObservationError,
+            "OBSERVATION_WORKFLOW_SHA_MISMATCH",
+        ):
+            observation.run(
+                values,
+                api_factory=lambda token, url: (_ for _ in ()).throw(
+                    AssertionError((token, url))
+                ),
+                jwt_factory=unexpected_jwt,
+            )
+        self.assertFalse(jwt_called)
+        self.assertEqual(
+            values["PHASE2_ALLOCATOR_APP_PRIVATE_KEY"],
+            "untouched-private-key",
+        )
+
     def test_literal_environment_variable_absence_empty_and_non_empty_are_distinct(self):
         cases = (
             ([], False, "not_defined"),
@@ -929,8 +1014,9 @@ class CurrentObservationEndToEndTests(EphemeralRecipientMixin, unittest.TestCase
 
         values = {
             "GITHUB_REPOSITORY": observation.CONTROL_REPOSITORY,
-            "GITHUB_REF": "refs/heads/main",
-            "GITHUB_SHA": "a" * 40,
+            "GITHUB_REF": RUNTIME_REF,
+            "GITHUB_SHA": RUNTIME_SHA,
+            observation.WORKFLOW_SHA_ENV: RUNTIME_SHA,
             "GITHUB_RUN_ID": "99",
             "GITHUB_RUN_ATTEMPT": "1",
             "GITHUB_ACTOR": observation.CONTROL_OWNER,
@@ -1030,8 +1116,9 @@ class CurrentObservationEndToEndTests(EphemeralRecipientMixin, unittest.TestCase
         def values():
             return {
                 "GITHUB_REPOSITORY": observation.CONTROL_REPOSITORY,
-                "GITHUB_REF": "refs/heads/main",
-                "GITHUB_SHA": "a" * 40,
+                "GITHUB_REF": RUNTIME_REF,
+                "GITHUB_SHA": RUNTIME_SHA,
+                observation.WORKFLOW_SHA_ENV: RUNTIME_SHA,
                 "GITHUB_RUN_ID": "99",
                 "GITHUB_RUN_ATTEMPT": "1",
                 "GITHUB_ACTOR": observation.CONTROL_OWNER,
@@ -1155,8 +1242,9 @@ class CurrentObservationEndToEndTests(EphemeralRecipientMixin, unittest.TestCase
     def test_private_key_is_removed_even_if_jwt_construction_fails(self):
         values = {
             "GITHUB_REPOSITORY": observation.CONTROL_REPOSITORY,
-            "GITHUB_REF": "refs/heads/main",
-            "GITHUB_SHA": "a" * 40,
+            "GITHUB_REF": RUNTIME_REF,
+            "GITHUB_SHA": RUNTIME_SHA,
+            observation.WORKFLOW_SHA_ENV: RUNTIME_SHA,
             "GITHUB_RUN_ID": "99",
             "GITHUB_RUN_ATTEMPT": "1",
             "GITHUB_ACTOR": observation.CONTROL_OWNER,
@@ -1199,8 +1287,9 @@ class CurrentObservationEndToEndTests(EphemeralRecipientMixin, unittest.TestCase
             with self.subTest(reason=reason):
                 values = {
                     "GITHUB_REPOSITORY": observation.CONTROL_REPOSITORY,
-                    "GITHUB_REF": "refs/heads/main",
-                    "GITHUB_SHA": "a" * 40,
+                    "GITHUB_REF": RUNTIME_REF,
+                    "GITHUB_SHA": RUNTIME_SHA,
+                    observation.WORKFLOW_SHA_ENV: RUNTIME_SHA,
                     "GITHUB_RUN_ID": "99",
                     "GITHUB_RUN_ATTEMPT": "1",
                     "GITHUB_ACTOR": actor,
@@ -1375,6 +1464,11 @@ class CurrentObservationWorkflowTests(unittest.TestCase):
             "INPUT_CURRENT_OBSERVATION_RECIPIENT_CERT_B64: ${{ inputs.current_observation_recipient_cert_b64 }}",
             current,
         )
+        self.assertIn(
+            "CURRENT_OBSERVATION_WORKFLOW_SHA: ${{ github.workflow_sha }}",
+            current,
+        )
+        self.assertNotIn("expected_sha", current.lower())
         self.assertIn(
             "current_observation_recipient_cert_b64:\n",
             self.workflow,
