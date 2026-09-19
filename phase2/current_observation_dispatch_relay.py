@@ -64,6 +64,12 @@ class ValidatedRequest:
         return f"{REQUEST_CONTRACT}:{self.repository_id}:{self.issue_id}"
 
 
+@dataclass
+class ExecutionProgress:
+    request: ValidatedRequest | None = None
+    marker_id: int | None = None
+
+
 @dataclass(frozen=True)
 class DispatchOutcome:
     outcome: str
@@ -73,7 +79,11 @@ class DispatchOutcome:
     html_url: str | None = None
 
     def safe_payload(self) -> dict[str, object]:
-        payload: dict[str, object] = {"outcome": self.outcome}
+        dispatch_state = "NOT_SENT" if self.outcome == "NOT_SENT" else "SEND_STARTED"
+        payload: dict[str, object] = {
+            "dispatch_state": dispatch_state,
+            "transport_outcome": self.outcome,
+        }
         if self.http_status is not None:
             payload["http_status"] = self.http_status
         if self.workflow_run_id is not None:
@@ -203,12 +213,15 @@ class GitHubRelayAPI:
         expected_status: int = 200,
         error_code: str,
     ) -> object:
-        connection = self._connection()
         data = (
             None
             if body is None
             else json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
         )
+        try:
+            connection = self._connection()
+        except Exception as exc:
+            raise RelayError(error_code) from exc
         try:
             connection.request(method, path, body=data, headers=self._headers())
             response = connection.getresponse()
@@ -306,7 +319,10 @@ class GitHubRelayAPI:
             },
         }
         data = json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        connection = self._connection()
+        try:
+            connection = self._connection()
+        except Exception:
+            return DispatchOutcome("NOT_SENT")
         try:
             # SEND_STARTED: every condition after entering request() is terminal and
             # must never be retried by this execution.
@@ -577,8 +593,11 @@ def consume_and_dispatch(
     *,
     api: GitHubRelayAPI,
     event: Mapping[str, object] | None = None,
+    progress: ExecutionProgress | None = None,
 ) -> tuple[ValidatedRequest, int, DispatchOutcome]:
+    execution = ExecutionProgress() if progress is None else progress
     request = validate_request(values, api=api, event=event)
+    execution.request = request
 
     _revalidate_tag(api, request)
     comments = api.list_issue_comments(request.issue_number)
@@ -595,6 +614,7 @@ def consume_and_dispatch(
         or created.get("body") != marker_body
     ):
         raise RelayError("CONSUMPTION_MARKER_ACK_INVALID")
+    execution.marker_id = created_id
 
     comments = api.list_issue_comments(request.issue_number)
     matches = _matching_markers(comments, request)
@@ -619,6 +639,7 @@ def consume_and_dispatch(
 
 def _safe_execution_payload(
     *,
+    values: Mapping[str, str],
     request: ValidatedRequest | None,
     marker_id: int | None,
     outcome: DispatchOutcome,
@@ -635,6 +656,9 @@ def _safe_execution_payload(
         "max_dispatch_mutation_requests": 1,
         **outcome.safe_payload(),
     }
+    workflow_sha = values.get("GITHUB_WORKFLOW_SHA", "")
+    if SHA40.fullmatch(workflow_sha) is not None:
+        payload["relay_workflow_sha"] = workflow_sha
     if request is not None:
         payload.update(
             {
@@ -672,36 +696,55 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     values = os.environ
-    request: ValidatedRequest | None = None
-    marker_id: int | None = None
+    progress = ExecutionProgress()
     try:
         api = GitHubRelayAPI(values.get("GITHUB_TOKEN", ""))
         if arguments == ["validate"]:
-            request = validate_request(values, api=api)
+            progress.request = validate_request(values, api=api)
             payload = _safe_execution_payload(
-                request=request,
+                values=values,
+                request=progress.request,
                 marker_id=None,
                 outcome=DispatchOutcome("NOT_SENT"),
             )
             print(json.dumps({"status": "VALIDATED", **payload}, sort_keys=True))
             return 0
 
-        request, marker_id, outcome = consume_and_dispatch(values, api=api)
+        request, marker_id, outcome = consume_and_dispatch(
+            values,
+            api=api,
+            progress=progress,
+        )
         payload = _safe_execution_payload(
+            values=values,
             request=request,
             marker_id=marker_id,
             outcome=outcome,
         )
         summary_written = _write_summary(values, payload)
+        if not summary_written:
+            print(
+                json.dumps(
+                    {
+                        "status": "AUDIT_SUMMARY_WRITE_FAILED",
+                        "audit_summary_written": False,
+                        **payload,
+                    },
+                    sort_keys=True,
+                )
+            )
+            return 2
+
+        status = {
+            "NOT_SENT": "DISPATCH_NOT_SENT",
+            "ACCEPTED": "DISPATCH_ACCEPTED",
+            "SENT_OR_ACCEPTANCE_UNKNOWN": "DISPATCH_TERMINAL_UNKNOWN",
+        }.get(outcome.outcome, "DISPATCH_OUTCOME_INVALID")
         print(
             json.dumps(
                 {
-                    "status": (
-                        "DISPATCH_ACCEPTED"
-                        if outcome.outcome == "ACCEPTED"
-                        else "DISPATCH_TERMINAL_UNKNOWN"
-                    ),
-                    "audit_summary_written": summary_written,
+                    "status": status,
+                    "audit_summary_written": True,
                     **payload,
                 },
                 sort_keys=True,
@@ -710,14 +753,25 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if outcome.outcome == "ACCEPTED" else 2
     except RelayError as exc:
         payload = _safe_execution_payload(
-            request=request,
-            marker_id=marker_id,
+            values=values,
+            request=progress.request,
+            marker_id=progress.marker_id,
             outcome=DispatchOutcome("NOT_SENT"),
             reason_code=str(exc).split(":", 1)[0],
         )
+        summary_written = False
         if arguments == ["consume-and-dispatch"]:
-            _write_summary(values, payload)
-        print(json.dumps({"status": "BLOCKED", **payload}, sort_keys=True))
+            summary_written = _write_summary(values, payload)
+        print(
+            json.dumps(
+                {
+                    "status": "BLOCKED",
+                    "audit_summary_written": summary_written,
+                    **payload,
+                },
+                sort_keys=True,
+            )
+        )
         return 2
 
 
