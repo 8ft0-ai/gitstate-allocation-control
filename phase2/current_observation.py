@@ -48,6 +48,8 @@ PERMISSION_PROFILE_SHA256 = (
     "e577e2ae1f3072a07de54b32c250e00cac492b4ae176ab485ff1d1157261942d"
 )
 RECIPIENT_CERTIFICATE_ENV = "INPUT_CURRENT_OBSERVATION_RECIPIENT_CERT_B64"
+CURRENT_OBSERVATION_TAG_REF_PREFIX = "refs/tags/gitstate-current-observation/"
+WORKFLOW_SHA_ENV = "CURRENT_OBSERVATION_WORKFLOW_SHA"
 ENVELOPE_CONTRACT_VERSION = "gitstate-current-observation-envelope-v1"
 MAX_RECIPIENT_CERTIFICATE_B64_CHARS = 16_384
 MAX_RECIPIENT_CERTIFICATE_DER_BYTES = 12_288
@@ -79,6 +81,7 @@ class ObservationContext:
     repository: str
     ref: str
     trusted_sha: str
+    workflow_sha: str
     run_id: int
     run_attempt: int
     operation: str
@@ -86,10 +89,19 @@ class ObservationContext:
     def validate(self) -> None:
         if self.repository != CONTROL_REPOSITORY:
             raise CurrentObservationError("OBSERVATION_REPOSITORY_MISMATCH")
-        if self.ref != "refs/heads/main":
-            raise CurrentObservationError("OBSERVATION_PROTECTED_MAIN_REQUIRED")
+        if not self.ref.startswith(CURRENT_OBSERVATION_TAG_REF_PREFIX):
+            raise CurrentObservationError("OBSERVATION_PROTECTED_TAG_REQUIRED")
+        ref_sha = self.ref[len(CURRENT_OBSERVATION_TAG_REF_PREFIX) :]
+        if SHA40.fullmatch(ref_sha) is None:
+            raise CurrentObservationError("OBSERVATION_PROTECTED_TAG_INVALID")
         if SHA40.fullmatch(self.trusted_sha) is None:
             raise CurrentObservationError("OBSERVATION_TRUSTED_SHA_INVALID")
+        if self.trusted_sha != ref_sha:
+            raise CurrentObservationError("OBSERVATION_TRUSTED_SHA_MISMATCH")
+        if SHA40.fullmatch(self.workflow_sha) is None:
+            raise CurrentObservationError("OBSERVATION_WORKFLOW_SHA_INVALID")
+        if self.workflow_sha != ref_sha:
+            raise CurrentObservationError("OBSERVATION_WORKFLOW_SHA_MISMATCH")
         if self.run_id <= 0 or self.run_attempt != 1:
             raise CurrentObservationError("OBSERVATION_RUN_IDENTITY_INVALID")
         if self.operation != "current_observation":
@@ -102,6 +114,7 @@ def _context(values: Mapping[str, str]) -> ObservationContext:
             repository=values["GITHUB_REPOSITORY"],
             ref=values["GITHUB_REF"],
             trusted_sha=values["GITHUB_SHA"],
+            workflow_sha=values[WORKFLOW_SHA_ENV],
             run_id=int(values["GITHUB_RUN_ID"]),
             run_attempt=int(values["GITHUB_RUN_ATTEMPT"]),
             operation=values["INPUT_OPERATION"],
