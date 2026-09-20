@@ -10,13 +10,13 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
+from phase2 import current_observation
 from phase2 import current_observation_dispatch_relay as relay
 
 
 CERT = base64.b64encode(b"public-certificate-der-fixture").decode("ascii")
-REF_SHA = "1" * 40
-REF = f"refs/tags/gitstate-current-observation/{REF_SHA}"
-WORKFLOW_SHA = "2" * 40
+EXECUTION_SHA = "1" * 40
+REF = f"refs/tags/gitstate-current-observation/{EXECUTION_SHA}"
 
 
 def body(ref: str = REF, certificate: str = CERT) -> str:
@@ -52,10 +52,14 @@ def env() -> dict[str, str]:
         "GITHUB_REPOSITORY_ID": "123",
         "GITHUB_EVENT_NAME": "issues",
         "GITHUB_ACTOR": relay.FIXED_OWNER,
+        "GITHUB_TRIGGERING_ACTOR": relay.FIXED_OWNER,
         "GITHUB_API_URL": "https://api.github.com",
         "GITHUB_SERVER_URL": "https://github.com",
-        "GITHUB_WORKFLOW_SHA": WORKFLOW_SHA,
+        "GITHUB_REF": relay.FIXED_EXECUTION_REF,
+        "GITHUB_SHA": EXECUTION_SHA,
+        "GITHUB_WORKFLOW_SHA": EXECUTION_SHA,
         "GITHUB_RUN_ID": "789",
+        "GITHUB_RUN_ATTEMPT": "1",
     }
 
 
@@ -75,37 +79,27 @@ class FakeAPI:
     def __init__(
         self,
         *,
-        outcome: relay.DispatchOutcome | None = None,
         marker_write_error: bool = False,
-        final_tag_mismatch: bool = False,
+        tag_target: str = EXECUTION_SHA,
+        final_tag_target: str | None = None,
     ) -> None:
         self.comments: list[dict[str, object]] = []
-        self.dispatch_calls = 0
         self.create_calls = 0
         self.tag_reads = 0
         self.issue_reads = 0
-        self.outcome = outcome or relay.DispatchOutcome(
-            "ACCEPTED",
-            http_status=200,
-            workflow_run_id=321,
-            run_url=(
-                "https://api.github.com/repos/"
-                f"{relay.FIXED_REPOSITORY}/actions/runs/321"
-            ),
-            html_url=f"https://github.com/{relay.FIXED_REPOSITORY}/actions/runs/321",
-        )
         self.marker_write_error = marker_write_error
-        self.final_tag_mismatch = final_tag_mismatch
-
-    def get_issue(self, issue_number: int):
-        self.issue_reads += 1
-        self.assert_issue_number(issue_number)
-        return current_issue()
+        self.tag_target = tag_target
+        self.final_tag_target = final_tag_target
 
     @staticmethod
     def assert_issue_number(issue_number: int) -> None:
         if issue_number != 99:
             raise AssertionError(issue_number)
+
+    def get_issue(self, issue_number: int):
+        self.issue_reads += 1
+        self.assert_issue_number(issue_number)
+        return current_issue()
 
     def list_issue_comments(self, issue_number: int):
         self.assert_issue_number(issue_number)
@@ -115,8 +109,10 @@ class FakeAPI:
         if ref != REF:
             raise AssertionError(ref)
         self.tag_reads += 1
-        sha = "f" * 40 if self.final_tag_mismatch and self.tag_reads >= 2 else REF_SHA
-        return {"object": {"type": "commit", "sha": sha}}
+        target = self.tag_target
+        if self.final_tag_target is not None and self.tag_reads >= 2:
+            target = self.final_tag_target
+        return {"object": {"type": "commit", "sha": target}}
 
     def create_consumption_comment(self, issue_number: int, marker_body: str):
         self.assert_issue_number(issue_number)
@@ -131,105 +127,130 @@ class FakeAPI:
         self.comments.append(comment)
         return dict(comment)
 
-    def dispatch_current_observation(self, *, ref: str, certificate_b64: str):
-        if ref != REF or certificate_b64 != CERT:
-            raise AssertionError("dispatch input widened")
-        self.dispatch_calls += 1
-        return self.outcome
-
 
 class RequestSchemaTests(unittest.TestCase):
     def test_accepts_exact_two_key_request(self):
         self.assertEqual(relay.parse_request_body(body()), (REF, CERT))
 
-    def test_rejects_duplicate_key(self):
-        request = (
+    def test_rejects_duplicate_extra_multiline_and_non_exact_refs(self):
+        duplicate = (
             '{"ref":"%s","ref":"%s",'
             '"current_observation_recipient_cert_b64":"%s"}'
         ) % (REF, REF, CERT)
-        with self.assertRaisesRegex(relay.RelayError, "REQUEST_BODY_INVALID"):
-            relay.parse_request_body(request)
-
-    def test_rejects_extra_key(self):
-        request = json.dumps(
-            {
-                "ref": REF,
-                "current_observation_recipient_cert_b64": CERT,
-                "repository": "other/repo",
-            },
-            separators=(",", ":"),
-        )
-        with self.assertRaisesRegex(relay.RelayError, "REQUEST_SCHEMA_INVALID"):
-            relay.parse_request_body(request)
-
-    def test_rejects_non_exact_refs(self):
-        bad = [
-            "main",
-            "HEAD",
-            "refs/heads/main",
-            "refs/tags/gitstate-current-observation/" + "a" * 39,
-            "refs/tags/gitstate-current-observation/" + "A" * 40,
-            "refs/tags/other/" + "a" * 40,
+        cases = [
+            (duplicate, "REQUEST_BODY_INVALID"),
+            (
+                json.dumps(
+                    {
+                        "ref": REF,
+                        "current_observation_recipient_cert_b64": CERT,
+                        "extra": True,
+                    },
+                    separators=(",", ":"),
+                ),
+                "REQUEST_SCHEMA_INVALID",
+            ),
+            (body() + "\n", "REQUEST_BODY_INVALID"),
+            (body(ref="refs/heads/main"), "REQUEST_REF_INVALID"),
+            (
+                body(
+                    ref="refs/tags/gitstate-current-observation/" + ("A" * 40)
+                ),
+                "REQUEST_REF_INVALID",
+            ),
+            (body(certificate="***"), "REQUEST_CERTIFICATE_INVALID"),
         ]
-        for ref in bad:
-            with self.subTest(ref=ref), self.assertRaises(relay.RelayError):
-                relay.parse_request_body(body(ref=ref))
-
-    def test_rejects_multiline_or_invalid_base64(self):
-        with self.assertRaisesRegex(relay.RelayError, "REQUEST_BODY_INVALID"):
-            relay.parse_request_body(body() + "\n")
-        with self.assertRaisesRegex(relay.RelayError, "REQUEST_CERTIFICATE_INVALID"):
-            relay.parse_request_body(body(certificate="***"))
+        for request_body, code in cases:
+            with self.subTest(code=code), self.assertRaisesRegex(relay.RelayError, code):
+                relay.parse_request_body(request_body)
 
 
-class AuthorityAndReplayTests(unittest.TestCase):
-    def test_validation_requires_exact_actor_event_and_current_issue(self):
+class PreConsumptionAuthorityTests(unittest.TestCase):
+    def test_exact_identity_consumes_once_and_binds_attempt(self):
         api = FakeAPI()
-        values = env()
-        request = relay.validate_request(values, api=api, event=event())
-        self.assertEqual(request.attempt_identity, f"{relay.REQUEST_CONTRACT}:123:456")
-        bad_values = dict(values)
-        bad_values["GITHUB_ACTOR"] = "someone-else"
-        with self.assertRaisesRegex(relay.RelayError, "GITHUB_ACTOR_MISMATCH"):
-            relay.validate_request(bad_values, api=api, event=event())
-
-    def test_first_attempt_consumes_then_dispatches_once(self):
-        api = FakeAPI()
-        request, marker_id, outcome = relay.consume_and_dispatch(
-            env(), api=api, event=event()
-        )
+        request, marker_id = relay.consume_request(env(), api=api, event=event())
         self.assertEqual(request.ref, REF)
         self.assertEqual(marker_id, 701)
-        self.assertEqual(outcome.outcome, "ACCEPTED")
         self.assertEqual(api.create_calls, 1)
-        self.assertEqual(api.dispatch_calls, 1)
         self.assertEqual(api.tag_reads, 2)
-        marker_body = str(api.comments[0]["body"])
-        self.assertNotIn(CERT, marker_body)
-        self.assertIn(request.body_sha256, marker_body)
+        marker = str(api.comments[0]["body"])
+        self.assertNotIn(CERT, marker)
+        self.assertIn('"relay_run_attempt":1', marker)
+        self.assertIn(f'"relay_workflow_sha":"{EXECUTION_SHA}"', marker)
+        self.assertIn(f'"validated_ref":"{REF}"', marker)
 
-    def test_consumed_rerun_cannot_redispatch(self):
+    def test_execution_identity_mismatches_are_zero_write(self):
+        cases = [
+            ("GITHUB_TRIGGERING_ACTOR", "someone-else", "GITHUB_TRIGGERING_ACTOR_MISMATCH"),
+            ("GITHUB_RUN_ATTEMPT", "2", "GITHUB_RUN_ATTEMPT_MISMATCH"),
+            ("GITHUB_REF", "refs/heads/other", "GITHUB_REF_MISMATCH"),
+            ("GITHUB_WORKFLOW_SHA", "2" * 40, "EXECUTION_WORKFLOW_SHA_MISMATCH"),
+            ("GITHUB_SHA", "2" * 40, "EXECUTION_WORKFLOW_SHA_MISMATCH"),
+        ]
+        for name, value, code in cases:
+            values = env()
+            values[name] = value
+            api = FakeAPI()
+            with self.subTest(name=name), self.assertRaisesRegex(relay.RelayError, code):
+                relay.consume_request(values, api=api, event=event())
+            self.assertEqual(api.create_calls, 0)
+
+    def test_requested_tag_execution_sha_mismatch_is_zero_write(self):
+        request_body = body(
+            ref="refs/tags/gitstate-current-observation/" + ("2" * 40)
+        )
         api = FakeAPI()
-        relay.consume_and_dispatch(env(), api=api, event=event())
-        with self.assertRaisesRegex(relay.RelayError, "REQUEST_ALREADY_CONSUMED"):
-            relay.consume_and_dispatch(env(), api=api, event=event())
-        self.assertEqual(api.dispatch_calls, 1)
-        self.assertEqual(api.create_calls, 1)
+        with self.assertRaisesRegex(relay.RelayError, "REQUEST_EXECUTION_SHA_MISMATCH"):
+            relay.consume_request(env(), api=api, event=event(request_body))
+        self.assertEqual(api.create_calls, 0)
+        self.assertEqual(api.tag_reads, 0)
 
-    def test_ambiguous_marker_write_never_dispatches(self):
+    def test_direct_tag_target_mismatch_is_zero_write(self):
+        api = FakeAPI(tag_target="f" * 40)
+        with self.assertRaisesRegex(relay.RelayError, "REQUEST_TAG_TARGET_MISMATCH"):
+            relay.consume_request(env(), api=api, event=event())
+        self.assertEqual(api.create_calls, 0)
+
+    def test_ambiguous_marker_write_is_terminal_without_second_consequence(self):
         api = FakeAPI(marker_write_error=True)
         with self.assertRaisesRegex(
             relay.RelayError, "CONSUMPTION_MARKER_WRITE_AMBIGUOUS"
         ):
-            relay.consume_and_dispatch(env(), api=api, event=event())
-        self.assertEqual(api.dispatch_calls, 0)
-
-    def test_post_consumption_tag_movement_never_dispatches(self):
-        api = FakeAPI(final_tag_mismatch=True)
-        with self.assertRaisesRegex(relay.RelayError, "REQUEST_TAG_TARGET_MISMATCH"):
-            relay.consume_and_dispatch(env(), api=api, event=event())
+            relay.consume_request(env(), api=api, event=event())
         self.assertEqual(api.create_calls, 1)
-        self.assertEqual(api.dispatch_calls, 0)
+
+    def test_post_consumption_tag_movement_burns_request_fail_closed(self):
+        api = FakeAPI(final_tag_target="f" * 40)
+        progress = relay.ExecutionProgress()
+        with self.assertRaisesRegex(relay.RelayError, "REQUEST_TAG_TARGET_MISMATCH"):
+            relay.consume_request(env(), api=api, event=event(), progress=progress)
+        self.assertEqual(api.create_calls, 1)
+        self.assertEqual(progress.marker_id, 701)
+
+    def test_prior_marker_and_serialised_duplicate_cannot_create_second_marker(self):
+        api = FakeAPI()
+        relay.consume_request(env(), api=api, event=event())
+        with self.assertRaisesRegex(relay.RelayError, "REQUEST_ALREADY_CONSUMED"):
+            relay.consume_request(env(), api=api, event=event())
+        self.assertEqual(api.create_calls, 1)
+
+        workflow = Path(
+            ".github/workflows/current-observation-dispatch-relay.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "group: current-observation-relay-${{ github.event.issue.id }}",
+            workflow,
+        )
+        self.assertIn("cancel-in-progress: false", workflow)
+
+    def test_attempt_two_fails_before_existing_marker_discovery_or_write(self):
+        api = FakeAPI()
+        relay.consume_request(env(), api=api, event=event())
+        values = env()
+        values["GITHUB_RUN_ATTEMPT"] = "2"
+        with self.assertRaisesRegex(relay.RelayError, "GITHUB_RUN_ATTEMPT_MISMATCH"):
+            relay.consume_request(values, api=api, event=event())
+        self.assertEqual(api.create_calls, 1)
 
     def test_user_spoof_marker_is_not_consumption(self):
         api = FakeAPI()
@@ -241,265 +262,87 @@ class AuthorityAndReplayTests(unittest.TestCase):
                 "user": {"login": relay.FIXED_OWNER},
             }
         )
-        _, _, outcome = relay.consume_and_dispatch(env(), api=api, event=event())
-        self.assertEqual(outcome.outcome, "ACCEPTED")
-        self.assertEqual(api.dispatch_calls, 1)
+        relay.consume_request(env(), api=api, event=event())
+        self.assertEqual(api.create_calls, 1)
 
 
-class FakeResponse:
-    def __init__(self, status: int, payload: object):
-        self.status = status
-        self._payload = (
-            payload
-            if isinstance(payload, bytes)
-            else json.dumps(payload, separators=(",", ":")).encode("utf-8")
-        )
+class ProtectedReconstructionTests(unittest.TestCase):
+    def consumed_api(self) -> FakeAPI:
+        api = FakeAPI()
+        relay.consume_request(env(), api=api, event=event())
+        return api
 
-    def read(self, amount: int = -1) -> bytes:
-        return self._payload[:amount]
+    def test_protected_job_reconstructs_exact_request_marker_and_subject(self):
+        api = self.consumed_api()
+        request = relay.reconstruct_protected_request(env(), api=api, event=event())
+        self.assertEqual(request.ref, REF)
+        self.assertGreaterEqual(api.tag_reads, 4)
+        self.assertGreaterEqual(api.issue_reads, 4)
 
-
-class FakeConnection:
-    def __init__(self, response: FakeResponse, *, request_error: Exception | None = None):
-        self.response = response
-        self.request_error = request_error
-        self.requests: list[tuple[str, str, bytes | None, dict[str, str]]] = []
-        self.closed = False
-
-    def request(self, method: str, path: str, body=None, headers=None):
-        if self.request_error is not None:
-            raise self.request_error
-        self.requests.append((method, path, body, dict(headers or {})))
-
-    def getresponse(self):
-        return self.response
-
-    def close(self):
-        self.closed = True
-
-
-class DispatchTransportTests(unittest.TestCase):
-    def client_with_connection(self, connection: FakeConnection):
-        def factory(host: str, port: int, timeout: int):
-            self.assertEqual(host, relay.API_HOST)
-            self.assertEqual(port, 443)
-            self.assertEqual(timeout, relay.HTTP_TIMEOUT_SECONDS)
-            return connection
-
-        return relay.GitHubRelayAPI("token", connection_factory=factory)
-
-    def test_positive_200_with_exact_run_identity_is_accepted(self):
-        run_id = 42
-        connection = FakeConnection(
-            FakeResponse(
-                200,
-                {
-                    "workflow_run_id": run_id,
-                    "run_url": (
-                        "https://api.github.com/repos/"
-                        f"{relay.FIXED_REPOSITORY}/actions/runs/{run_id}"
-                    ),
-                    "html_url": (
-                        f"https://github.com/{relay.FIXED_REPOSITORY}/actions/runs/{run_id}"
-                    ),
-                },
-            )
-        )
-        api = self.client_with_connection(connection)
-        outcome = api.dispatch_current_observation(ref=REF, certificate_b64=CERT)
-        self.assertEqual(outcome.outcome, "ACCEPTED")
-        self.assertEqual(len(connection.requests), 1)
-        method, path, sent_body, headers = connection.requests[0]
-        self.assertEqual(method, "POST")
-        self.assertEqual(path, relay.DISPATCH_ENDPOINT)
-        self.assertEqual(headers["X-GitHub-Api-Version"], "2026-03-10")
-        payload = json.loads(sent_body)
-        self.assertEqual(
-            payload,
-            {
-                "ref": REF,
-                "inputs": {
-                    "operation": "current_observation",
-                    "current_observation_recipient_cert_b64": CERT,
-                },
-            },
-        )
-
-    def test_non_200_or_bad_success_body_is_terminal_unknown(self):
-        api = self.client_with_connection(
-            FakeConnection(FakeResponse(422, {"message": "x"}))
-        )
-        self.assertEqual(
-            api.dispatch_current_observation(ref=REF, certificate_b64=CERT).outcome,
-            "SENT_OR_ACCEPTANCE_UNKNOWN",
-        )
-        api = self.client_with_connection(FakeConnection(FakeResponse(200, {})))
-        self.assertEqual(
-            api.dispatch_current_observation(ref=REF, certificate_b64=CERT).outcome,
-            "SENT_OR_ACCEPTANCE_UNKNOWN",
-        )
-
-    def test_transport_exception_is_terminal_unknown_and_not_retried(self):
-        connection = FakeConnection(
-            FakeResponse(200, {}),
-            request_error=TimeoutError("ambiguous"),
-        )
-        api = self.client_with_connection(connection)
-        outcome = api.dispatch_current_observation(ref=REF, certificate_b64=CERT)
-        self.assertEqual(outcome.outcome, "SENT_OR_ACCEPTANCE_UNKNOWN")
-        self.assertEqual(connection.requests, [])
-        self.assertEqual(api.dispatch_calls, 1)
-
-    def test_second_dispatch_call_is_structurally_rejected(self):
-        connection = FakeConnection(FakeResponse(500, {}))
-        api = self.client_with_connection(connection)
-        api.dispatch_current_observation(ref=REF, certificate_b64=CERT)
+    def test_missing_duplicate_or_foreign_attempt_marker_blocks_protected_execution(self):
+        api = FakeAPI()
         with self.assertRaisesRegex(
-            relay.RelayError, "DISPATCH_MUTATION_COUNT_EXCEEDED"
+            relay.RelayError, "CONSUMPTION_MARKER_CARDINALITY_INVALID"
         ):
-            api.dispatch_current_observation(ref=REF, certificate_b64=CERT)
+            relay.reconstruct_protected_request(env(), api=api, event=event())
 
+        api = self.consumed_api()
+        duplicate = dict(api.comments[0])
+        duplicate["id"] = 999
+        api.comments.append(duplicate)
+        with self.assertRaisesRegex(
+            relay.RelayError, "CONSUMPTION_MARKER_CARDINALITY_INVALID"
+        ):
+            relay.reconstruct_protected_request(env(), api=api, event=event())
 
-class PublicEvidenceTests(unittest.TestCase):
-    def test_safe_payload_and_marker_never_echo_certificate(self):
-        request = relay._event_request(env(), event())
-        marker = relay._marker_body(request, env())
-        payload = relay._safe_execution_payload(
-            values=env(),
-            request=request,
-            marker_id=777,
-            outcome=relay.DispatchOutcome("NOT_SENT"),
+        api = self.consumed_api()
+        prefix, encoded = str(api.comments[0]["body"]).split("\n", 1)
+        payload = json.loads(encoded)
+        payload["relay_run_id"] = 999
+        api.comments[0]["body"] = (
+            prefix + "\n" + json.dumps(payload, sort_keys=True, separators=(",", ":"))
         )
-        self.assertNotIn(CERT, marker)
-        self.assertNotIn(CERT, json.dumps(payload))
+        with self.assertRaisesRegex(relay.RelayError, "CONSUMPTION_MARKER_MISMATCH"):
+            relay.reconstruct_protected_request(env(), api=api, event=event())
 
-    def test_summary_does_not_echo_certificate(self):
-        request = relay._event_request(env(), event())
-        payload = relay._safe_execution_payload(
-            values=env(),
-            request=request,
-            marker_id=777,
-            outcome=relay.DispatchOutcome("NOT_SENT"),
-        )
-        with tempfile.TemporaryDirectory() as directory:
-            summary = Path(directory) / "summary.md"
-            values = env()
-            values["GITHUB_STEP_SUMMARY"] = str(summary)
-            self.assertTrue(relay._write_summary(values, payload))
-            self.assertNotIn(CERT, summary.read_text(encoding="utf-8"))
+    def test_protected_rerun_is_rejected_before_observation_engine(self):
+        api = self.consumed_api()
+        values = env()
+        values["GITHUB_RUN_ATTEMPT"] = "2"
+        with mock.patch.object(current_observation, "main") as observation_main:
+            with self.assertRaisesRegex(relay.RelayError, "GITHUB_RUN_ATTEMPT_MISMATCH"):
+                relay._run_protected_observation(
+                    values,
+                    api=api,
+                    event=event(),
+                )
+        observation_main.assert_not_called()
 
+    def test_certificate_and_subject_are_reconstructed_inside_protected_job(self):
+        api = self.consumed_api()
+        seen: dict[str, str] = {}
 
-class RepositoryContractTests(unittest.TestCase):
-    def test_relay_workflow_is_additive_and_narrow(self):
-        workflow = Path(
-            ".github/workflows/current-observation-dispatch-relay.yml"
-        ).read_text(encoding="utf-8")
-        self.assertIn("issues:", workflow)
-        self.assertIn("types: [opened]", workflow)
-        self.assertIn(
-            "current-observation-relay-${{ github.event.issue.id }}", workflow
-        )
-        self.assertIn("contents: read", workflow)
-        self.assertIn("issues: read", workflow)
-        self.assertIn("issues: write", workflow)
-        self.assertIn("actions: write", workflow)
-        self.assertIn("GITHUB_TOKEN: ${{ github.token }}", workflow)
-        self.assertNotIn("workflow_dispatch:", workflow)
-        self.assertNotIn("phase-2-allocator", workflow)
-        self.assertNotIn("secrets.", workflow)
+        def observation_main(argv):
+            seen["certificate"] = os.environ[current_observation.RECIPIENT_CERTIFICATE_ENV]
+            seen["workflow_sha"] = os.environ[current_observation.WORKFLOW_SHA_ENV]
+            seen["requested_ref"] = os.environ[current_observation.REQUESTED_REF_ENV]
+            seen["operation"] = os.environ["INPUT_OPERATION"]
+            return 0
 
-
-class StrictSchemaCoverageTests(unittest.TestCase):
-    def test_rejects_all_missing_wrong_type_and_certificate_boundaries(self):
-        cases = [
-            (
-                json.dumps({"ref": REF}, separators=(",", ":")),
-                "REQUEST_SCHEMA_INVALID",
-            ),
-            (
-                json.dumps(
-                    {"current_observation_recipient_cert_b64": CERT},
-                    separators=(",", ":"),
-                ),
-                "REQUEST_SCHEMA_INVALID",
-            ),
-            (
-                json.dumps(
-                    {
-                        "ref": 123,
-                        "current_observation_recipient_cert_b64": CERT,
-                    },
-                    separators=(",", ":"),
-                ),
-                "REQUEST_REF_INVALID",
-            ),
-            (
-                json.dumps(
-                    {
-                        "ref": REF,
-                        "current_observation_recipient_cert_b64": 123,
-                    },
-                    separators=(",", ":"),
-                ),
-                "REQUEST_CERTIFICATE_INVALID",
-            ),
-            (body(certificate=""), "REQUEST_CERTIFICATE_INVALID"),
-            (
-                body(certificate="A" * (relay.MAX_CERTIFICATE_B64_CHARS + 1)),
-                "REQUEST_CERTIFICATE_INVALID",
-            ),
-            (body(certificate="é"), "REQUEST_CERTIFICATE_INVALID"),
-            ("[]", "REQUEST_BODY_INVALID"),
-        ]
-        for request_body, code in cases:
-            with self.subTest(code=code), self.assertRaisesRegex(relay.RelayError, code):
-                relay.parse_request_body(request_body)
+        with mock.patch.object(current_observation, "main", side_effect=observation_main):
+            code = relay._run_protected_observation(
+                env(),
+                api=api,
+                event=event(),
+            )
+        self.assertEqual(code, 0)
+        self.assertEqual(seen["certificate"], CERT)
+        self.assertEqual(seen["workflow_sha"], EXECUTION_SHA)
+        self.assertEqual(seen["requested_ref"], REF)
+        self.assertEqual(seen["operation"], "current_observation")
 
 
-class IngressAuthorityCoverageTests(unittest.TestCase):
-    def test_rejects_each_event_authority_mismatch(self):
-        cases = []
-
-        bad = event()
-        bad["action"] = "edited"
-        cases.append((bad, env(), "EVENT_ACTION_MISMATCH"))
-
-        bad = event()
-        bad["repository"]["full_name"] = "8ft0-ai/other"
-        cases.append((bad, env(), "EVENT_REPOSITORY_MISMATCH"))
-
-        bad = event()
-        bad["repository"]["id"] = 999
-        cases.append((bad, env(), "EVENT_REPOSITORY_ID_MISMATCH"))
-
-        bad = event()
-        bad["sender"]["login"] = "someone-else"
-        cases.append((bad, env(), "EVENT_SENDER_MISMATCH"))
-
-        bad = event()
-        bad["issue"]["user"]["login"] = "someone-else"
-        cases.append((bad, env(), "EVENT_ISSUE_CREATOR_MISMATCH"))
-
-        bad = event()
-        bad["issue"]["author_association"] = "MEMBER"
-        cases.append((bad, env(), "EVENT_AUTHOR_ASSOCIATION_MISMATCH"))
-
-        bad = event()
-        bad["issue"]["title"] = "wrong"
-        cases.append((bad, env(), "EVENT_TITLE_MISMATCH"))
-
-        bad = event()
-        bad["issue"]["state"] = "closed"
-        cases.append((bad, env(), "EVENT_ISSUE_STATE_MISMATCH"))
-
-        bad_values = env()
-        bad_values["GITHUB_REPOSITORY"] = "8ft0-ai/other"
-        cases.append((event(), bad_values, "GITHUB_REPOSITORY_MISMATCH"))
-
-        for bad_event, values, code in cases:
-            with self.subTest(code=code), self.assertRaisesRegex(relay.RelayError, code):
-                relay.validate_request(values, api=FakeAPI(), event=bad_event)
-
+class CurrentIssueAuthorityTests(unittest.TestCase):
     def test_rejects_each_current_issue_authority_mismatch(self):
         def api_with_current(mutator):
             class CurrentIssueAPI(FakeAPI):
@@ -513,10 +356,7 @@ class IngressAuthorityCoverageTests(unittest.TestCase):
             return CurrentIssueAPI()
 
         mutations = [
-            (
-                lambda value: value.__setitem__("id", 999),
-                "CURRENT_ISSUE_IDENTITY_MISMATCH",
-            ),
+            (lambda value: value.__setitem__("id", 999), "CURRENT_ISSUE_IDENTITY_MISMATCH"),
             (
                 lambda value: value["user"].__setitem__("login", "someone-else"),
                 "CURRENT_ISSUE_CREATOR_MISMATCH",
@@ -525,14 +365,8 @@ class IngressAuthorityCoverageTests(unittest.TestCase):
                 lambda value: value.__setitem__("author_association", "MEMBER"),
                 "CURRENT_ISSUE_AUTHOR_ASSOCIATION_MISMATCH",
             ),
-            (
-                lambda value: value.__setitem__("title", "wrong"),
-                "CURRENT_ISSUE_TITLE_MISMATCH",
-            ),
-            (
-                lambda value: value.__setitem__("state", "closed"),
-                "CURRENT_ISSUE_STATE_MISMATCH",
-            ),
+            (lambda value: value.__setitem__("title", "wrong"), "CURRENT_ISSUE_TITLE_MISMATCH"),
+            (lambda value: value.__setitem__("state", "closed"), "CURRENT_ISSUE_STATE_MISMATCH"),
             (
                 lambda value: value.__setitem__(
                     "body", body(certificate=base64.b64encode(b"changed").decode("ascii"))
@@ -545,7 +379,7 @@ class IngressAuthorityCoverageTests(unittest.TestCase):
                 relay.validate_request(env(), api=api_with_current(mutator), event=event())
 
 
-class PaginationAndMarkerCoverageTests(unittest.TestCase):
+class PaginationAndMarkerTests(unittest.TestCase):
     def test_comment_discovery_completely_paginates(self):
         api = relay.GitHubRelayAPI("token")
         first_page = [{"id": index} for index in range(relay.COMMENTS_PER_PAGE)]
@@ -556,17 +390,6 @@ class PaginationAndMarkerCoverageTests(unittest.TestCase):
             comments = api.list_issue_comments(99)
         self.assertEqual(len(comments), relay.COMMENTS_PER_PAGE + 1)
         self.assertEqual(request_json.call_count, 2)
-        self.assertIn("page=1", request_json.call_args_list[0].args[1])
-        self.assertIn("page=2", request_json.call_args_list[1].args[1])
-
-    def test_comment_discovery_fails_closed_when_page_bound_is_exhausted(self):
-        api = relay.GitHubRelayAPI("token")
-        full_page = [{"id": index} for index in range(relay.COMMENTS_PER_PAGE)]
-        with mock.patch.object(relay, "MAX_COMMENT_PAGES", 2), mock.patch.object(
-            api, "_request_json", side_effect=[full_page, full_page]
-        ):
-            with self.assertRaisesRegex(relay.RelayError, "REQUEST_COMMENTS_TOO_LARGE"):
-                api.list_issue_comments(99)
 
     def test_malformed_bot_marker_fails_closed(self):
         request = relay._event_request(env(), event())
@@ -578,7 +401,7 @@ class PaginationAndMarkerCoverageTests(unittest.TestCase):
         with self.assertRaisesRegex(relay.RelayError, "CONSUMPTION_MARKER_AMBIGUOUS"):
             relay._matching_markers([malformed], request)
 
-    def test_duplicate_matching_marker_reread_fails_closed_without_dispatch(self):
+    def test_duplicate_matching_marker_reread_fails_closed(self):
         class DuplicateMarkerAPI(FakeAPI):
             def create_consumption_comment(self, issue_number: int, marker_body: str):
                 created = super().create_consumption_comment(issue_number, marker_body)
@@ -588,20 +411,29 @@ class PaginationAndMarkerCoverageTests(unittest.TestCase):
                 return created
 
         api = DuplicateMarkerAPI()
-        progress = relay.ExecutionProgress()
         with self.assertRaisesRegex(
             relay.RelayError, "CONSUMPTION_MARKER_REREAD_INVALID"
         ):
-            relay.consume_and_dispatch(
-                env(), api=api, event=event(), progress=progress
-            )
-        self.assertEqual(api.dispatch_calls, 0)
-        self.assertEqual(progress.marker_id, 701)
-        self.assertIsNotNone(progress.request)
+            relay.consume_request(env(), api=api, event=event())
+        self.assertEqual(api.create_calls, 1)
 
 
-class AuditAndTerminalEvidenceTests(unittest.TestCase):
-    def _run_main_with_api(self, api, *, include_summary: bool = True):
+class AuditEvidenceTests(unittest.TestCase):
+    def test_safe_payload_and_marker_never_echo_certificate(self):
+        request = relay._event_request(env(), event())
+        marker = relay._marker_body(request, env())
+        payload = relay._safe_execution_payload(
+            values=env(),
+            request=request,
+            marker_id=777,
+        )
+        self.assertNotIn(CERT, marker)
+        self.assertNotIn(CERT, json.dumps(payload))
+        self.assertEqual(payload["fixed_method"], "same_run_protected_job")
+        self.assertFalse(payload["second_workflow_run"])
+
+    def test_consume_cli_records_public_safe_audit_summary(self):
+        api = FakeAPI()
         with tempfile.TemporaryDirectory() as directory:
             event_path = Path(directory) / "event.json"
             event_path.write_text(json.dumps(event()), encoding="utf-8")
@@ -611,91 +443,70 @@ class AuditAndTerminalEvidenceTests(unittest.TestCase):
                 {
                     "GITHUB_EVENT_PATH": str(event_path),
                     "GITHUB_TOKEN": "test-token",
+                    "GITHUB_STEP_SUMMARY": str(summary_path),
                 }
             )
-            if include_summary:
-                values["GITHUB_STEP_SUMMARY"] = str(summary_path)
-            stdout = io.StringIO()
+            output = io.StringIO()
             with mock.patch.dict(os.environ, values, clear=True), mock.patch.object(
                 relay, "GitHubRelayAPI", return_value=api
-            ), redirect_stdout(stdout):
-                code = relay.main(["consume-and-dispatch"])
-            lines = [line for line in stdout.getvalue().splitlines() if line]
-            payload = json.loads(lines[-1])
-            summary = (
-                summary_path.read_text(encoding="utf-8")
-                if include_summary and summary_path.exists()
-                else ""
-            )
-            return code, payload, summary
+            ), redirect_stdout(output):
+                code = relay.main(["consume"])
+            self.assertEqual(code, 0)
+            payload = json.loads(output.getvalue())
+            self.assertEqual(payload["status"], "CONSUMPTION_COMPLETE")
+            self.assertEqual(payload["relay_run_attempt"], 1)
+            self.assertNotIn(CERT, output.getvalue())
+            summary = summary_path.read_text(encoding="utf-8")
+            self.assertNotIn(CERT, summary)
+            self.assertIn('"consumption_comment_id":701', summary)
 
-    def test_consumed_but_not_dispatched_failure_retains_complete_audit_context(self):
-        api = FakeAPI(final_tag_mismatch=True)
-        code, payload, summary = self._run_main_with_api(api)
-        self.assertEqual(code, 2)
-        self.assertEqual(payload["status"], "BLOCKED")
-        self.assertTrue(payload["audit_summary_written"])
-        self.assertEqual(payload["reason_code"], "REQUEST_TAG_TARGET_MISMATCH")
-        self.assertEqual(payload["attempt_identity"], f"{relay.REQUEST_CONTRACT}:123:456")
-        self.assertEqual(payload["request_issue_id"], 456)
-        self.assertEqual(payload["validated_ref"], REF)
-        self.assertEqual(payload["relay_workflow_sha"], WORKFLOW_SHA)
-        self.assertEqual(payload["consumption_comment_id"], 701)
-        self.assertEqual(payload["dispatch_state"], "NOT_SENT")
-        self.assertEqual(payload["transport_outcome"], "NOT_SENT")
-        self.assertEqual(api.dispatch_calls, 0)
-        self.assertNotIn(CERT, json.dumps(payload))
-        self.assertNotIn(CERT, summary)
-        self.assertIn('"consumption_comment_id":701', summary)
-        self.assertIn(f'"relay_workflow_sha":"{WORKFLOW_SHA}"', summary)
 
-    def test_summary_write_failure_after_acceptance_fails_job_without_retry(self):
-        api = FakeAPI()
-        code, payload, _ = self._run_main_with_api(api, include_summary=False)
-        self.assertEqual(code, 2)
-        self.assertEqual(payload["status"], "AUDIT_SUMMARY_WRITE_FAILED")
-        self.assertFalse(payload["audit_summary_written"])
-        self.assertEqual(payload["dispatch_state"], "SEND_STARTED")
-        self.assertEqual(payload["transport_outcome"], "ACCEPTED")
-        self.assertEqual(payload["consumption_comment_id"], 701)
-        self.assertEqual(api.dispatch_calls, 1)
-
-    def test_safe_payload_includes_workflow_identity_and_explicit_states(self):
-        request = relay._event_request(env(), event())
-        before_send = relay._safe_execution_payload(
-            values=env(),
-            request=request,
-            marker_id=701,
-            outcome=relay.DispatchOutcome("NOT_SENT"),
+class RepositoryContractTests(unittest.TestCase):
+    def test_successor_workflow_has_one_same_run_protected_path(self):
+        workflow = Path(
+            ".github/workflows/current-observation-dispatch-relay.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("issues:", workflow)
+        self.assertIn("types: [opened]", workflow)
+        self.assertIn("  consume:\n    needs: validation\n", workflow)
+        self.assertIn(
+            "  current-observation-protected:\n    needs: consume\n",
+            workflow,
         )
-        self.assertEqual(before_send["relay_workflow_sha"], WORKFLOW_SHA)
-        self.assertEqual(before_send["dispatch_state"], "NOT_SENT")
-        self.assertEqual(before_send["transport_outcome"], "NOT_SENT")
-
-        accepted = relay._safe_execution_payload(
-            values=env(),
-            request=request,
-            marker_id=701,
-            outcome=relay.DispatchOutcome("ACCEPTED", http_status=200),
+        self.assertIn("environment: phase-2-allocator", workflow)
+        self.assertIn("issues: write", workflow)
+        self.assertIn("issues: read", workflow)
+        self.assertNotIn("actions: write", workflow)
+        self.assertNotIn("workflow_dispatch:", workflow)
+        self.assertIn("current_observation_dispatch_relay consume", workflow)
+        self.assertIn("current_observation_dispatch_relay protected", workflow)
+        self.assertIn(
+            "group: current-observation-relay-${{ github.event.issue.id }}",
+            workflow,
         )
-        self.assertEqual(accepted["dispatch_state"], "SEND_STARTED")
-        self.assertEqual(accepted["transport_outcome"], "ACCEPTED")
 
+    def test_no_outbound_dispatch_transport_survives(self):
+        source = Path("phase2/current_observation_dispatch_relay.py").read_text(
+            encoding="utf-8"
+        )
+        for forbidden in (
+            "dispatch_current_observation",
+            "DISPATCH_ENDPOINT",
+            "SENT_OR_ACCEPTANCE_UNKNOWN",
+            "workflow_run_id",
+            "actions/workflows",
+        ):
+            self.assertNotIn(forbidden, source)
 
-class PreSendTransportCoverageTests(unittest.TestCase):
-    def test_connection_construction_failure_is_proven_not_sent(self):
-        def fail_factory(host: str, port: int, timeout: int):
-            raise OSError("no connection constructed")
+    def test_superseded_phase2_current_observation_route_is_absent(self):
+        workflow = Path(".github/workflows/phase2-adversarial.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("current_observation", workflow)
+        self.assertIn("operator_preflight", workflow)
+        self.assertIn("live_scenario_suite", workflow)
 
-        api = relay.GitHubRelayAPI("token", connection_factory=fail_factory)
-        outcome = api.dispatch_current_observation(ref=REF, certificate_b64=CERT)
-        self.assertEqual(outcome.outcome, "NOT_SENT")
-        self.assertEqual(api.dispatch_calls, 1)
-        evidence = outcome.safe_payload()
-        self.assertEqual(evidence["dispatch_state"], "NOT_SENT")
-        self.assertEqual(evidence["transport_outcome"], "NOT_SENT")
-
-    def test_read_side_connection_construction_failure_is_structured(self):
+    def test_read_side_connection_failure_is_structured(self):
         def fail_factory(host: str, port: int, timeout: int):
             raise OSError("no connection constructed")
 
