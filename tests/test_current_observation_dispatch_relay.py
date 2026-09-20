@@ -83,15 +83,34 @@ class FakeAPI:
         tag_target: str = EXECUTION_SHA,
         final_tag_target: str | None = None,
         request_body: str | None = None,
+        app_payload: object | None = None,
+        final_app_payload: object | None = None,
+        app_read_error: str | None = None,
     ) -> None:
         self.comments: list[dict[str, object]] = []
         self.create_calls = 0
         self.tag_reads = 0
         self.issue_reads = 0
+        self.app_reads = 0
         self.marker_write_error = marker_write_error
         self.tag_target = tag_target
         self.final_tag_target = final_tag_target
         self.request_body = request_body
+        self.app_payload = (
+            {
+                "id": relay.FIXED_ALLOCATOR_APP_ID,
+                "slug": relay.FIXED_ALLOCATOR_APP_SLUG,
+                "permissions": {
+                    "environments": "read",
+                    "metadata": "read",
+                    "contents": "write",
+                },
+            }
+            if app_payload is None
+            else app_payload
+        )
+        self.final_app_payload = final_app_payload
+        self.app_read_error = app_read_error
 
     @staticmethod
     def assert_issue_number(issue_number: int) -> None:
@@ -115,6 +134,14 @@ class FakeAPI:
         if self.final_tag_target is not None and self.tag_reads >= 2:
             target = self.final_tag_target
         return {"object": {"type": "commit", "sha": target}}
+
+    def get_allocator_app(self):
+        self.app_reads += 1
+        if self.app_read_error is not None:
+            raise relay.RelayError(self.app_read_error)
+        if self.final_app_payload is not None and self.app_reads >= 2:
+            return self.final_app_payload
+        return self.app_payload
 
     def create_consumption_comment(self, issue_number: int, marker_body: str):
         self.assert_issue_number(issue_number)
@@ -175,6 +202,7 @@ class PreConsumptionAuthorityTests(unittest.TestCase):
         self.assertEqual(marker_id, 701)
         self.assertEqual(api.create_calls, 1)
         self.assertEqual(api.tag_reads, 2)
+        self.assertEqual(api.app_reads, 2)
         marker = str(api.comments[0]["body"])
         self.assertNotIn(CERT, marker)
         self.assertIn('"relay_run_attempt":1', marker)
@@ -212,6 +240,76 @@ class PreConsumptionAuthorityTests(unittest.TestCase):
         with self.assertRaisesRegex(relay.RelayError, "REQUEST_TAG_TARGET_MISMATCH"):
             relay.consume_request(env(), api=api, event=event())
         self.assertEqual(api.create_calls, 0)
+
+    def test_allocator_app_capability_mismatches_are_zero_write(self):
+        valid = {
+            "id": relay.FIXED_ALLOCATOR_APP_ID,
+            "slug": relay.FIXED_ALLOCATOR_APP_SLUG,
+            "permissions": {"environments": "read", "metadata": "read"},
+        }
+        cases = [
+            ({**valid, "id": 1}, "wrong-id"),
+            ({**valid, "slug": "wrong"}, "wrong-slug"),
+            ({**valid, "permissions": {"metadata": "read"}}, "missing-environments"),
+            (
+                {**valid, "permissions": {"environments": "write", "metadata": "read"}},
+                "widened-environments",
+            ),
+            (
+                {**valid, "permissions": {"environments": "read"}},
+                "missing-metadata",
+            ),
+            (
+                {**valid, "permissions": {"environments": "read", "metadata": "write"}},
+                "widened-metadata",
+            ),
+            ({**valid, "permissions": "invalid"}, "malformed-permissions"),
+        ]
+        for app_payload, label in cases:
+            api = FakeAPI(app_payload=app_payload)
+            with self.subTest(label=label), self.assertRaisesRegex(
+                relay.RelayError, "ALLOCATOR_APP_CAPABILITY_MISMATCH"
+            ):
+                relay.consume_request(env(), api=api, event=event())
+            self.assertEqual(api.create_calls, 0)
+
+    def test_allocator_app_read_failure_is_zero_write(self):
+        api = FakeAPI(app_read_error="ALLOCATOR_APP_READ_FAILED")
+        with self.assertRaisesRegex(relay.RelayError, "ALLOCATOR_APP_READ_FAILED"):
+            relay.consume_request(env(), api=api, event=event())
+        self.assertEqual(api.create_calls, 0)
+
+    def test_allocator_app_capability_movement_before_write_is_zero_write(self):
+        moved = {
+            "id": relay.FIXED_ALLOCATOR_APP_ID,
+            "slug": relay.FIXED_ALLOCATOR_APP_SLUG,
+            "permissions": {"metadata": "read"},
+        }
+        api = FakeAPI(final_app_payload=moved)
+        with self.assertRaisesRegex(
+            relay.RelayError, "ALLOCATOR_APP_CAPABILITY_MISMATCH"
+        ):
+            relay.consume_request(env(), api=api, event=event())
+        self.assertEqual(api.app_reads, 2)
+        self.assertEqual(api.create_calls, 0)
+
+    def test_allocator_app_metadata_is_not_emitted(self):
+        sentinel = "PRIVATE-APP-METADATA-SENTINEL"
+        api = FakeAPI(
+            app_payload={
+                "id": relay.FIXED_ALLOCATOR_APP_ID,
+                "slug": relay.FIXED_ALLOCATOR_APP_SLUG,
+                "permissions": {"environments": "read", "metadata": "read"},
+                "owner": {"private": sentinel},
+            }
+        )
+        request, marker_id = relay.consume_request(env(), api=api, event=event())
+        marker = str(api.comments[0]["body"])
+        payload = relay._safe_execution_payload(
+            values=env(), request=request, marker_id=marker_id
+        )
+        self.assertNotIn(sentinel, marker)
+        self.assertNotIn(sentinel, json.dumps(payload))
 
     def test_ambiguous_marker_write_is_terminal_without_second_consequence(self):
         api = FakeAPI(marker_write_error=True)

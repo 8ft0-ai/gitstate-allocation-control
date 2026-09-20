@@ -1,6 +1,7 @@
 import unittest
 from unittest.mock import Mock, patch
 
+from phase2.current_observation import CurrentObservationError
 from phase2.credentials import CredentialPolicyError
 from phase2.trusted_intake import run
 
@@ -51,7 +52,52 @@ class TrustedBoundaryTests(unittest.TestCase):
         self.assertFalse(result["canonical_accessed"])
         mint.assert_not_called()
 
-    def test_scope_probe_uses_two_separate_tokens(self):
+    def test_scope_probe_proves_environment_before_two_separate_scope_tokens(self):
+        app_api = Mock()
+        values = environment("scope_probe")
+        events = []
+
+        def prove_environment(*args, **kwargs):
+            events.append("environment")
+            return {
+                "environment_observation_access": True,
+                "environment_observation_token_revoked": True,
+            }
+
+        def mint_token(*args, **kwargs):
+            profile = args[2]
+            events.append(profile.name)
+            return f"{profile.name}-token"
+
+        with (
+            patch("phase2.trusted_intake.GitHubAPI", side_effect=[Mock(), app_api]),
+            patch("phase2.trusted_intake.create_app_jwt", return_value="jwt"),
+            patch("phase2.trusted_intake.verify_live_installation"),
+            patch(
+                "phase2.trusted_intake.prove_environment_observation_access",
+                side_effect=prove_environment,
+            ) as prove,
+            patch("phase2.trusted_intake.mint_token", side_effect=mint_token) as mint,
+            patch("phase2.trusted_intake.require_cross_repository_denial"),
+            patch("phase2.trusted_intake.require_public_repository_write_denial"),
+        ):
+            result = run(values)
+        self.assertEqual(result["status"], "SCOPE_PROBE_PASSED")
+        self.assertTrue(result["environment_observation_access"])
+        self.assertTrue(result["environment_observation_token_revoked"])
+        prove.assert_called_once_with(
+            app_api,
+            installation_id=20,
+            api_url="https://api.github.invalid",
+        )
+        self.assertEqual(mint.call_count, 2)
+        self.assertEqual(events, ["environment", "control", "state"])
+        self.assertNotEqual(
+            mint.call_args_list[0].args[2].repository_id,
+            mint.call_args_list[1].args[2].repository_id,
+        )
+
+    def test_scope_probe_environment_capability_failure_prevents_control_and_state_tokens(self):
         app_api = Mock()
         values = environment("scope_probe")
         with (
@@ -59,19 +105,16 @@ class TrustedBoundaryTests(unittest.TestCase):
             patch("phase2.trusted_intake.create_app_jwt", return_value="jwt"),
             patch("phase2.trusted_intake.verify_live_installation"),
             patch(
-                "phase2.trusted_intake.mint_token",
-                side_effect=["control-token", "state-token"],
-            ) as mint,
-            patch("phase2.trusted_intake.require_cross_repository_denial"),
-            patch("phase2.trusted_intake.require_public_repository_write_denial"),
+                "phase2.trusted_intake.prove_environment_observation_access",
+                side_effect=CurrentObservationError("ENVIRONMENT_OBSERVATION_ACCESS_INVALID"),
+            ),
+            patch("phase2.trusted_intake.mint_token") as mint,
         ):
-            result = run(values)
-        self.assertEqual(result["status"], "SCOPE_PROBE_PASSED")
-        self.assertEqual(mint.call_count, 2)
-        self.assertNotEqual(
-            mint.call_args_list[0].args[2].repository_id,
-            mint.call_args_list[1].args[2].repository_id,
-        )
+            with self.assertRaisesRegex(
+                CurrentObservationError, "ENVIRONMENT_OBSERVATION_ACCESS_INVALID"
+            ):
+                run(values)
+        mint.assert_not_called()
 
     def test_scope_probe_rejects_same_repository_identity(self):
         values = environment("scope_probe")
@@ -80,6 +123,13 @@ class TrustedBoundaryTests(unittest.TestCase):
             patch("phase2.trusted_intake.GitHubAPI", side_effect=[Mock(), Mock()]),
             patch("phase2.trusted_intake.create_app_jwt", return_value="jwt"),
             patch("phase2.trusted_intake.verify_live_installation"),
+            patch(
+                "phase2.trusted_intake.prove_environment_observation_access",
+                return_value={
+                    "environment_observation_access": True,
+                    "environment_observation_token_revoked": True,
+                },
+            ),
         ):
             with self.assertRaises(CredentialPolicyError) as error:
                 run(values)

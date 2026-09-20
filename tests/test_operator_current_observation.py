@@ -508,6 +508,73 @@ class CurrentObservationUnitTests(unittest.TestCase):
         self.assertTrue(variable_reads)
         self.assertEqual(environment_api.delete_calls, ["/installation/token"])
 
+    def test_environment_observation_access_proof_mints_reads_and_revokes_exact_token(self):
+        response = {
+            "token": "environment-token",
+            "permissions": {"environments": "read", "metadata": "read"},
+            "repositories": [{"id": CONTROL_REPOSITORY_ID}],
+        }
+        app_api = MintingAppAPI([response])
+
+        def get_handler(path: str):
+            self.assertEqual(
+                path,
+                "/repos/8ft0-ai/gitstate-allocation-control/environments/phase-2-allocator",
+            )
+            return {"name": observation.ENVIRONMENT_NAME}
+
+        environment_api = TokenAPI("environment-token", get_handler)
+        result = observation.prove_environment_observation_access(
+            app_api,
+            installation_id=77,
+            api_url="https://api.github.test",
+            api_factory=lambda token, url: environment_api,
+        )
+        self.assertEqual(
+            result,
+            {
+                "environment_observation_access": True,
+                "environment_observation_token_revoked": True,
+            },
+        )
+        self.assertEqual(
+            app_api.posts,
+            [
+                (
+                    "/app/installations/77/access_tokens",
+                    {
+                        "repository_ids": [CONTROL_REPOSITORY_ID],
+                        "permissions": {
+                            "environments": "read",
+                            "metadata": "read",
+                        },
+                    },
+                )
+            ],
+        )
+        self.assertEqual(environment_api.delete_calls, ["/installation/token"])
+
+    def test_environment_observation_access_failure_still_revokes_token(self):
+        response = {
+            "token": "environment-token",
+            "permissions": {"environments": "read", "metadata": "read"},
+            "repositories": [{"id": CONTROL_REPOSITORY_ID}],
+        }
+        app_api = MintingAppAPI([response])
+
+        def get_handler(path: str):
+            raise RuntimeError("ENVIRONMENT_READ_FAILED")
+
+        environment_api = TokenAPI("environment-token", get_handler)
+        with self.assertRaisesRegex(RuntimeError, "ENVIRONMENT_READ_FAILED"):
+            observation.prove_environment_observation_access(
+                app_api,
+                installation_id=77,
+                api_url="https://api.github.test",
+                api_factory=lambda token, url: environment_api,
+            )
+        self.assertEqual(environment_api.delete_calls, ["/installation/token"])
+
     def test_environment_token_permission_widening_still_revokes(self):
         response = {
             "token": "environment-token",

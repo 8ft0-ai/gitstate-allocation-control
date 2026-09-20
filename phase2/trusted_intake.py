@@ -16,6 +16,7 @@ from .credentials import (
     state_profile,
     verify_live_installation,
 )
+from .current_observation import prove_environment_observation_access
 from .github_api import GitHubAPI
 from .policy import load_policy
 
@@ -88,6 +89,12 @@ def run(env: dict[str, str] | None = None) -> dict[str, Any]:
     if action == "live_check":
         return {"status": "LIVE_CHECK_PASSED", "state_token_requested": False, "canonical_accessed": False}
 
+    environment_observation = prove_environment_observation_access(
+        app_api,
+        installation_id=installation_id,
+        api_url=api_url,
+    )
+
     control_id = int(policy["control_repository_id"])
     state_id = int(values[policy["state_repository_id_env"]])
     if state_id <= 0 or state_id == control_id:
@@ -98,7 +105,11 @@ def run(env: dict[str, str] | None = None) -> dict[str, Any]:
     state_token = mint_token(app_api, installation_id, state_profile(state_id))
     require_public_repository_write_denial(state_token, owner, repository, api_url)
     state_token = ""
-    return {"status": "SCOPE_PROBE_PASSED", "cross_repository_access": False}
+    return {
+        "status": "SCOPE_PROBE_PASSED",
+        "cross_repository_access": False,
+        **environment_observation,
+    }
 
 
 def main() -> int:
