@@ -1,4 +1,4 @@
-name: Current observation governed dispatch relay
+name: Current observation governed same-run execution
 
 on:
   issues:
@@ -24,18 +24,17 @@ jobs:
           persist-credentials: false
           fetch-depth: 1
 
-      - name: Validate exact governed dispatch request
+      - name: Validate exact governed observation request
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: python3 -m phase2.current_observation_dispatch_relay validate
 
-  consume-and-dispatch:
+  consume:
     needs: validation
     runs-on: ubuntu-24.04
     permissions:
       contents: read
       issues: write
-      actions: write
     steps:
       - name: Checkout immutable relay implementation without persisted credentials
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -44,7 +43,31 @@ jobs:
           persist-credentials: false
           fetch-depth: 1
 
-      - name: Consume request and attempt exactly one fixed workflow dispatch
+      - name: Revalidate and durably consume exact governed observation request
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: python3 -m phase2.current_observation_dispatch_relay consume-and-dispatch
+        run: python3 -m phase2.current_observation_dispatch_relay consume
+
+  current-observation-protected:
+    needs: consume
+    runs-on: ubuntu-24.04
+    environment: phase-2-allocator
+    permissions:
+      contents: read
+      issues: read
+    steps:
+      - name: Checkout immutable same-run protected implementation without persisted credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Independently reconstruct authority and execute protected observation
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PHASE2_ALLOCATOR_APP_ID: ${{ vars.PHASE2_ALLOCATOR_APP_ID }}
+          PHASE2_ALLOCATOR_INSTALLATION_ID: ${{ vars.PHASE2_ALLOCATOR_INSTALLATION_ID }}
+          PHASE2_ALLOCATOR_APP_PRIVATE_KEY: ${{ secrets['PHASE2_ALLOCATOR_APP_PRIVATE_KEY'] }}
+          PHASE2_STATE_REPOSITORY_ID: ${{ secrets.PHASE2_STATE_REPOSITORY_ID }}
+        run: PYTHONPATH=. python3 -m phase2.current_observation_dispatch_relay protected
