@@ -21,7 +21,8 @@ from phase2.successor_runtime import state_observation_sha256 as predecessor_sta
 COMMIT_SHA = "b" * 40
 TREE_SHA = "c" * 40
 RUNTIME_SHA = "a" * 40
-RUNTIME_REF = f"{observation.CURRENT_OBSERVATION_TAG_REF_PREFIX}{RUNTIME_SHA}"
+RUNTIME_REF = observation.CURRENT_OBSERVATION_EXECUTION_REF
+REQUEST_REF = f"{observation.CURRENT_OBSERVATION_TAG_REF_PREFIX}{RUNTIME_SHA}"
 
 
 class MintingAppAPI:
@@ -165,37 +166,53 @@ class EphemeralRecipientMixin:
 
 
 class CurrentObservationUnitTests(unittest.TestCase):
-    def test_context_accepts_exact_protected_tag_runtime_and_workflow_sha(self):
+    def test_context_accepts_same_run_protected_main_and_requested_subject(self):
         values = {
             "GITHUB_REPOSITORY": observation.CONTROL_REPOSITORY,
+            "GITHUB_EVENT_NAME": "issues",
+            "GITHUB_ACTOR": observation.CONTROL_OWNER,
+            "GITHUB_TRIGGERING_ACTOR": observation.CONTROL_OWNER,
             "GITHUB_REF": RUNTIME_REF,
             "GITHUB_SHA": RUNTIME_SHA,
             observation.WORKFLOW_SHA_ENV: RUNTIME_SHA,
+            observation.REQUESTED_REF_ENV: REQUEST_REF,
             "GITHUB_RUN_ID": "99",
             "GITHUB_RUN_ATTEMPT": "1",
             "INPUT_OPERATION": "current_observation",
         }
         context = observation._context(values)
         self.assertEqual(context.ref, RUNTIME_REF)
+        self.assertEqual(context.requested_ref, REQUEST_REF)
         self.assertEqual(context.trusted_sha, RUNTIME_SHA)
         self.assertEqual(context.workflow_sha, RUNTIME_SHA)
 
-    def test_context_rejects_non_tag_malformed_tag_and_sha_mismatches(self):
+    def test_context_rejects_provenance_main_subject_and_sha_mismatches(self):
         base = {
             "GITHUB_REPOSITORY": observation.CONTROL_REPOSITORY,
+            "GITHUB_EVENT_NAME": "issues",
+            "GITHUB_ACTOR": observation.CONTROL_OWNER,
+            "GITHUB_TRIGGERING_ACTOR": observation.CONTROL_OWNER,
             "GITHUB_REF": RUNTIME_REF,
             "GITHUB_SHA": RUNTIME_SHA,
             observation.WORKFLOW_SHA_ENV: RUNTIME_SHA,
+            observation.REQUESTED_REF_ENV: REQUEST_REF,
             "GITHUB_RUN_ID": "99",
             "GITHUB_RUN_ATTEMPT": "1",
             "INPUT_OPERATION": "current_observation",
         }
         cases = (
-            ("GITHUB_REF", "refs/heads/main", "OBSERVATION_PROTECTED_TAG_REQUIRED"),
+            ("GITHUB_EVENT_NAME", "workflow_dispatch", "OBSERVATION_EVENT_REQUIRED"),
+            ("GITHUB_ACTOR", "github-actions[bot]", "OBSERVATION_OWNER_ACTOR_REQUIRED"),
             (
-                "GITHUB_REF",
+                "GITHUB_TRIGGERING_ACTOR",
+                "github-actions[bot]",
+                "OBSERVATION_OWNER_TRIGGERING_ACTOR_REQUIRED",
+            ),
+            ("GITHUB_REF", "refs/tags/other", "OBSERVATION_PROTECTED_MAIN_REQUIRED"),
+            (
+                observation.REQUESTED_REF_ENV,
                 observation.CURRENT_OBSERVATION_TAG_REF_PREFIX + ("a" * 39),
-                "OBSERVATION_PROTECTED_TAG_INVALID",
+                "OBSERVATION_REQUESTED_TAG_INVALID",
             ),
             ("GITHUB_SHA", "b" * 40, "OBSERVATION_TRUSTED_SHA_MISMATCH"),
             (
@@ -203,6 +220,7 @@ class CurrentObservationUnitTests(unittest.TestCase):
                 "b" * 40,
                 "OBSERVATION_WORKFLOW_SHA_MISMATCH",
             ),
+            ("GITHUB_RUN_ATTEMPT", "2", "OBSERVATION_RUN_IDENTITY_INVALID"),
         )
         for name, value, reason in cases:
             with self.subTest(name=name, reason=reason):
@@ -214,12 +232,15 @@ class CurrentObservationUnitTests(unittest.TestCase):
     def test_runtime_identity_gate_precedes_allocator_private_key_access(self):
         values = {
             "GITHUB_REPOSITORY": observation.CONTROL_REPOSITORY,
+            "GITHUB_EVENT_NAME": "issues",
+            "GITHUB_ACTOR": observation.CONTROL_OWNER,
+            "GITHUB_TRIGGERING_ACTOR": observation.CONTROL_OWNER,
             "GITHUB_REF": RUNTIME_REF,
             "GITHUB_SHA": RUNTIME_SHA,
             observation.WORKFLOW_SHA_ENV: "b" * 40,
+            observation.REQUESTED_REF_ENV: REQUEST_REF,
             "GITHUB_RUN_ID": "99",
             "GITHUB_RUN_ATTEMPT": "1",
-            "GITHUB_ACTOR": observation.CONTROL_OWNER,
             "INPUT_OPERATION": "current_observation",
             observation.RECIPIENT_CERTIFICATE_ENV: "not-reached",
             "PHASE2_ALLOCATOR_APP_PRIVATE_KEY": "untouched-private-key",
@@ -1014,9 +1035,12 @@ class CurrentObservationEndToEndTests(EphemeralRecipientMixin, unittest.TestCase
 
         values = {
             "GITHUB_REPOSITORY": observation.CONTROL_REPOSITORY,
+            "GITHUB_EVENT_NAME": "issues",
+            "GITHUB_TRIGGERING_ACTOR": observation.CONTROL_OWNER,
             "GITHUB_REF": RUNTIME_REF,
             "GITHUB_SHA": RUNTIME_SHA,
             observation.WORKFLOW_SHA_ENV: RUNTIME_SHA,
+            observation.REQUESTED_REF_ENV: REQUEST_REF,
             "GITHUB_RUN_ID": "99",
             "GITHUB_RUN_ATTEMPT": "1",
             "GITHUB_ACTOR": observation.CONTROL_OWNER,
@@ -1116,9 +1140,12 @@ class CurrentObservationEndToEndTests(EphemeralRecipientMixin, unittest.TestCase
         def values():
             return {
                 "GITHUB_REPOSITORY": observation.CONTROL_REPOSITORY,
+                "GITHUB_EVENT_NAME": "issues",
+                "GITHUB_TRIGGERING_ACTOR": observation.CONTROL_OWNER,
                 "GITHUB_REF": RUNTIME_REF,
                 "GITHUB_SHA": RUNTIME_SHA,
                 observation.WORKFLOW_SHA_ENV: RUNTIME_SHA,
+                observation.REQUESTED_REF_ENV: REQUEST_REF,
                 "GITHUB_RUN_ID": "99",
                 "GITHUB_RUN_ATTEMPT": "1",
                 "GITHUB_ACTOR": observation.CONTROL_OWNER,
@@ -1242,9 +1269,12 @@ class CurrentObservationEndToEndTests(EphemeralRecipientMixin, unittest.TestCase
     def test_private_key_is_removed_even_if_jwt_construction_fails(self):
         values = {
             "GITHUB_REPOSITORY": observation.CONTROL_REPOSITORY,
+            "GITHUB_EVENT_NAME": "issues",
+            "GITHUB_TRIGGERING_ACTOR": observation.CONTROL_OWNER,
             "GITHUB_REF": RUNTIME_REF,
             "GITHUB_SHA": RUNTIME_SHA,
             observation.WORKFLOW_SHA_ENV: RUNTIME_SHA,
+            observation.REQUESTED_REF_ENV: REQUEST_REF,
             "GITHUB_RUN_ID": "99",
             "GITHUB_RUN_ATTEMPT": "1",
             "GITHUB_ACTOR": observation.CONTROL_OWNER,
@@ -1287,9 +1317,12 @@ class CurrentObservationEndToEndTests(EphemeralRecipientMixin, unittest.TestCase
             with self.subTest(reason=reason):
                 values = {
                     "GITHUB_REPOSITORY": observation.CONTROL_REPOSITORY,
+                    "GITHUB_EVENT_NAME": "issues",
+                    "GITHUB_TRIGGERING_ACTOR": observation.CONTROL_OWNER,
                     "GITHUB_REF": RUNTIME_REF,
                     "GITHUB_SHA": RUNTIME_SHA,
                     observation.WORKFLOW_SHA_ENV: RUNTIME_SHA,
+                    observation.REQUESTED_REF_ENV: REQUEST_REF,
                     "GITHUB_RUN_ID": "99",
                     "GITHUB_RUN_ATTEMPT": "1",
                     "GITHUB_ACTOR": actor,
@@ -1439,40 +1472,35 @@ class CurrentObservationWorkflowTests(unittest.TestCase):
         cls.workflow = Path(".github/workflows/phase2-adversarial.yml").read_text(
             encoding="utf-8"
         )
+        cls.relay_workflow = Path(
+            ".github/workflows/current-observation-dispatch-relay.yml"
+        ).read_text(encoding="utf-8")
         cls.source = Path("phase2/current_observation.py").read_text(encoding="utf-8")
 
-    def test_operation_dispatch_is_isolated_and_has_no_authority_dependencies(self):
-        self.assertIn("          - current_observation\n", self.workflow)
-        current = self.workflow.split("\n  current-observation:\n", 1)[1].split(
-            "\n  operator-preflight:\n", 1
-        )[0]
-        self.assertIn("    needs: contract-check\n", current)
-        self.assertIn("inputs.operation == 'current_observation'", current)
+    def test_same_run_successor_retires_old_dispatch_and_preserves_isolation(self):
+        self.assertNotIn("current_observation", self.workflow)
+        self.assertIn("operator_preflight", self.workflow)
+        self.assertIn("live_scenario_suite", self.workflow)
+
+        current = self.relay_workflow.split(
+            "\n  current-observation-protected:\n", 1
+        )[1]
+        self.assertIn("    needs: consume\n", current)
         self.assertIn("environment: phase-2-allocator", current)
+        self.assertIn("issues: read", current)
+        self.assertNotIn("issues: write", current)
+        self.assertNotIn("actions: write", self.relay_workflow)
+        self.assertNotIn("workflow_dispatch:", self.relay_workflow)
+        self.assertIn(
+            "python3 -m phase2.current_observation_dispatch_relay protected",
+            self.relay_workflow,
+        )
+        self.assertIn("GITHUB_TOKEN:", current)
         self.assertNotIn("PHASE2_CONFIGURATION_VARIABLES_JSON", current)
         self.assertNotIn("toJSON(vars)", current)
         self.assertNotIn("successor-capsule", current)
-        self.assertNotIn("operator_preflight", current)
-        self.assertNotIn("live-scenario-suite", current)
-        self.assertNotIn("issues: write", current)
-        self.assertNotIn("GITHUB_TOKEN:", current)
         self.assertNotIn("_control_api(", self.source)
-        self.assertNotIn(
-            "PHASE2_WORKSTREAM_D_EXECUTION_ENABLED: ${{ vars.", current
-        )
-        self.assertIn(
-            "INPUT_CURRENT_OBSERVATION_RECIPIENT_CERT_B64: ${{ inputs.current_observation_recipient_cert_b64 }}",
-            current,
-        )
-        self.assertIn(
-            "CURRENT_OBSERVATION_WORKFLOW_SHA: ${{ github.workflow_sha }}",
-            current,
-        )
         self.assertNotIn("expected_sha", current.lower())
-        self.assertIn(
-            "current_observation_recipient_cert_b64:\n",
-            self.workflow,
-        )
 
     def test_observation_runtime_has_no_live_or_mutation_profile_path(self):
         for forbidden in (
