@@ -15,7 +15,6 @@ on:
         type: choice
         options:
           - contract_check
-          - current_observation
           - operator_preflight
           - live_scenario_suite
       preflight_projection_comment_id:
@@ -45,11 +44,6 @@ on:
         type: string
       successor_manifest_sha256:
         description: Exact guarded-manifest SHA-256 bound by the successor capsule; live_scenario_suite only
-        required: false
-        default: ""
-        type: string
-      current_observation_recipient_cert_b64:
-        description: One-use base64 DER X.509 recipient certificate; current_observation only
         required: false
         default: ""
         type: string
@@ -266,33 +260,6 @@ jobs:
           echo 'Gate L2 uses only an installation-wide Metadata-read inventory token and positively revokes it before control/state token minting.'
           echo 'The successor capsule is single-use and the live workflow is not rerunnable as authority.'
           echo 'No result from this workflow authorises another Workstream D attempt or Workstream E.'
-
-  current-observation:
-    needs: contract-check
-    if: ${{ inputs.operation == 'current_observation' }}
-    runs-on: ubuntu-24.04
-    environment: phase-2-allocator
-    permissions:
-      actions: read
-      contents: read
-    steps:
-      - name: Checkout immutable dispatched content without persisted credentials
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-          fetch-depth: 1
-
-      - name: Reconstruct current read-only allocator observation
-        env:
-          CURRENT_OBSERVATION_WORKFLOW_SHA: ${{ github.workflow_sha }}
-          INPUT_OPERATION: ${{ inputs.operation }}
-          INPUT_CURRENT_OBSERVATION_RECIPIENT_CERT_B64: ${{ inputs.current_observation_recipient_cert_b64 }}
-          PHASE2_ALLOCATOR_APP_ID: ${{ vars.PHASE2_ALLOCATOR_APP_ID }}
-          PHASE2_ALLOCATOR_INSTALLATION_ID: ${{ vars.PHASE2_ALLOCATOR_INSTALLATION_ID }}
-          PHASE2_ALLOCATOR_APP_PRIVATE_KEY: ${{ secrets['PHASE2_ALLOCATOR_APP_PRIVATE_KEY'] }}
-          PHASE2_STATE_REPOSITORY_ID: ${{ secrets.PHASE2_STATE_REPOSITORY_ID }}
-        run: PYTHONPATH=. python3 -m phase2.current_observation
 
   operator-preflight:
     needs: [contract-check]
