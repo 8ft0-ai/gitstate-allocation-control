@@ -15,9 +15,9 @@ from typing import Any, Callable, Mapping
 
 FIXED_REPOSITORY = "8ft0-ai/gitstate-allocation-control"
 FIXED_OWNER = "8ft0-ai"
-FIXED_WORKFLOW = ".github/workflows/phase2-adversarial.yml"
+FIXED_EXECUTION_REF = "refs/heads/main"
 FIXED_OPERATION = "current_observation"
-FIXED_METHOD = "workflow_dispatch"
+FIXED_METHOD = "same_run_protected_job"
 API_HOST = "api.github.com"
 API_VERSION = "2026-03-10"
 REQUEST_TITLE = "[gitstate-current-observation-dispatch/v1]"
@@ -32,10 +32,6 @@ MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 MAX_COMMENT_PAGES = 100
 COMMENTS_PER_PAGE = 100
 HTTP_TIMEOUT_SECONDS = 30
-DISPATCH_ENDPOINT = (
-    "/repos/8ft0-ai/gitstate-allocation-control/actions/workflows/"
-    ".github%2Fworkflows%2Fphase2-adversarial.yml/dispatches"
-)
 
 
 class RelayError(RuntimeError):
@@ -68,31 +64,6 @@ class ValidatedRequest:
 class ExecutionProgress:
     request: ValidatedRequest | None = None
     marker_id: int | None = None
-
-
-@dataclass(frozen=True)
-class DispatchOutcome:
-    outcome: str
-    http_status: int | None = None
-    workflow_run_id: int | None = None
-    run_url: str | None = None
-    html_url: str | None = None
-
-    def safe_payload(self) -> dict[str, object]:
-        dispatch_state = "NOT_SENT" if self.outcome == "NOT_SENT" else "SEND_STARTED"
-        payload: dict[str, object] = {
-            "dispatch_state": dispatch_state,
-            "transport_outcome": self.outcome,
-        }
-        if self.http_status is not None:
-            payload["http_status"] = self.http_status
-        if self.workflow_run_id is not None:
-            payload["workflow_run_id"] = self.workflow_run_id
-        if self.run_url is not None:
-            payload["run_url"] = self.run_url
-        if self.html_url is not None:
-            payload["html_url"] = self.html_url
-        return payload
 
 
 def _positive_int(value: object, code: str) -> int:
@@ -174,7 +145,6 @@ class GitHubRelayAPI:
             raise RelayError("GITHUB_TOKEN_MISSING")
         self._token = token
         self._connection_factory = connection_factory
-        self.dispatch_calls = 0
 
     def _headers(self) -> dict[str, str]:
         return {
@@ -182,7 +152,7 @@ class GitHubRelayAPI:
             "Authorization": f"Bearer {self._token}",
             "Content-Type": "application/json",
             "X-GitHub-Api-Version": API_VERSION,
-            "User-Agent": "gitstate-current-observation-dispatch-relay",
+            "User-Agent": "gitstate-current-observation-same-run",
         }
 
     def _connection(self) -> Any:
@@ -300,81 +270,6 @@ class GitHubRelayAPI:
         if not isinstance(payload, Mapping):
             raise RelayError("CONSUMPTION_MARKER_ACK_INVALID")
         return payload
-
-    def dispatch_current_observation(
-        self,
-        *,
-        ref: str,
-        certificate_b64: str,
-    ) -> DispatchOutcome:
-        # This is the only call site in the module capable of sending workflow_dispatch.
-        self.dispatch_calls += 1
-        if self.dispatch_calls != 1:
-            raise RelayError("DISPATCH_MUTATION_COUNT_EXCEEDED")
-        body = {
-            "ref": ref,
-            "inputs": {
-                "operation": FIXED_OPERATION,
-                "current_observation_recipient_cert_b64": certificate_b64,
-            },
-        }
-        data = json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        try:
-            connection = self._connection()
-        except Exception:
-            return DispatchOutcome("NOT_SENT")
-        try:
-            # SEND_STARTED: every condition after entering request() is terminal and
-            # must never be retried by this execution.
-            connection.request(
-                "POST",
-                DISPATCH_ENDPOINT,
-                body=data,
-                headers=self._headers(),
-            )
-            response = connection.getresponse()
-            payload = self._read_response(response)
-            status = int(response.status)
-        except Exception:
-            try:
-                connection.close()
-            except Exception:
-                pass
-            return DispatchOutcome("SENT_OR_ACCEPTANCE_UNKNOWN")
-        finally:
-            try:
-                connection.close()
-            except Exception:
-                pass
-
-        if status != 200:
-            return DispatchOutcome("SENT_OR_ACCEPTANCE_UNKNOWN", http_status=status)
-        try:
-            decoded = self._decode_json(payload, "DISPATCH_SUCCESS_BODY_INVALID")
-        except RelayError:
-            return DispatchOutcome("SENT_OR_ACCEPTANCE_UNKNOWN", http_status=status)
-        if not isinstance(decoded, Mapping):
-            return DispatchOutcome("SENT_OR_ACCEPTANCE_UNKNOWN", http_status=status)
-        run_id = decoded.get("workflow_run_id")
-        run_url = decoded.get("run_url")
-        html_url = decoded.get("html_url")
-        if type(run_id) is not int or run_id <= 0:
-            return DispatchOutcome("SENT_OR_ACCEPTANCE_UNKNOWN", http_status=status)
-        expected_run_url = (
-            f"https://api.github.com/repos/{FIXED_REPOSITORY}/actions/runs/{run_id}"
-        )
-        expected_html_url = (
-            f"https://github.com/{FIXED_REPOSITORY}/actions/runs/{run_id}"
-        )
-        if run_url != expected_run_url or html_url != expected_html_url:
-            return DispatchOutcome("SENT_OR_ACCEPTANCE_UNKNOWN", http_status=status)
-        return DispatchOutcome(
-            "ACCEPTED",
-            http_status=status,
-            workflow_run_id=run_id,
-            run_url=run_url,
-            html_url=html_url,
-        )
 
 
 def _load_event(values: Mapping[str, str]) -> Mapping[str, object]:
@@ -494,10 +389,38 @@ def _workflow_sha(values: Mapping[str, str]) -> str:
     return value
 
 
+def _execution_sha(values: Mapping[str, str]) -> str:
+    value = values.get("GITHUB_SHA", "")
+    if SHA40.fullmatch(value) is None:
+        raise RelayError("EXECUTION_SHA_INVALID")
+    return value
+
+
+def _require_execution_identity(
+    values: Mapping[str, str],
+    request: ValidatedRequest,
+) -> None:
+    _require_runtime_identity(values)
+    if values.get("GITHUB_TRIGGERING_ACTOR") != FIXED_OWNER:
+        raise RelayError("GITHUB_TRIGGERING_ACTOR_MISMATCH")
+    if values.get("GITHUB_REF") != FIXED_EXECUTION_REF:
+        raise RelayError("GITHUB_REF_MISMATCH")
+    _env_positive_int(values, "GITHUB_RUN_ID")
+    if _env_positive_int(values, "GITHUB_RUN_ATTEMPT") != 1:
+        raise RelayError("GITHUB_RUN_ATTEMPT_MISMATCH")
+    execution_sha = _execution_sha(values)
+    workflow_sha = _workflow_sha(values)
+    if workflow_sha != execution_sha:
+        raise RelayError("EXECUTION_WORKFLOW_SHA_MISMATCH")
+    if request.ref_sha != execution_sha:
+        raise RelayError("REQUEST_EXECUTION_SHA_MISMATCH")
+
+
 def _marker_body(request: ValidatedRequest, values: Mapping[str, str]) -> str:
     payload = {
         "attempt_identity": request.attempt_identity,
         "relay_run_id": _env_positive_int(values, "GITHUB_RUN_ID"),
+        "relay_run_attempt": _env_positive_int(values, "GITHUB_RUN_ATTEMPT"),
         "relay_workflow_sha": _workflow_sha(values),
         "request_body_sha256": request.body_sha256,
         "request_issue_id": request.issue_id,
@@ -530,6 +453,7 @@ def _parse_bot_marker(
     required = {
         "attempt_identity",
         "relay_run_id",
+        "relay_run_attempt",
         "relay_workflow_sha",
         "request_body_sha256",
         "request_issue_id",
@@ -573,6 +497,8 @@ def _validate_marker_payload(
         raise RelayError("CONSUMPTION_MARKER_MISMATCH")
     if payload.get("attempt_identity") != request.attempt_identity:
         raise RelayError("CONSUMPTION_MARKER_MISMATCH")
+    if payload.get("relay_run_attempt") != 1:
+        raise RelayError("CONSUMPTION_MARKER_MISMATCH")
     if payload.get("relay_workflow_sha") != _workflow_sha(values):
         raise RelayError("CONSUMPTION_MARKER_MISMATCH")
 
@@ -588,17 +514,20 @@ def validate_request(
     return request
 
 
-def consume_and_dispatch(
+def consume_request(
     values: Mapping[str, str],
     *,
     api: GitHubRelayAPI,
     event: Mapping[str, object] | None = None,
     progress: ExecutionProgress | None = None,
-) -> tuple[ValidatedRequest, int, DispatchOutcome]:
+) -> tuple[ValidatedRequest, int]:
     execution = ExecutionProgress() if progress is None else progress
     request = validate_request(values, api=api, event=event)
     execution.request = request
 
+    # No durable write is permitted before the complete request, execution-attempt
+    # and immutable-subject identity has been independently established.
+    _require_execution_identity(values, request)
     _revalidate_tag(api, request)
     comments = api.list_issue_comments(request.issue_number)
     if _matching_markers(comments, request):
@@ -628,13 +557,44 @@ def consume_and_dispatch(
     )
 
     _revalidate_current_issue(api, request)
+    _require_execution_identity(values, request)
+    _revalidate_tag(api, request)
+    return request, created_id
+
+
+def reconstruct_protected_request(
+    values: Mapping[str, str],
+    *,
+    api: GitHubRelayAPI,
+    event: Mapping[str, object] | None = None,
+    progress: ExecutionProgress | None = None,
+) -> ValidatedRequest:
+    execution = ExecutionProgress() if progress is None else progress
+    request = validate_request(values, api=api, event=event)
+    execution.request = request
+
+    _require_execution_identity(values, request)
     _revalidate_tag(api, request)
 
-    outcome = api.dispatch_current_observation(
-        ref=request.ref,
-        certificate_b64=request.certificate_b64,
+    comments = api.list_issue_comments(request.issue_number)
+    matches = _matching_markers(comments, request)
+    if len(matches) != 1:
+        raise RelayError("CONSUMPTION_MARKER_CARDINALITY_INVALID")
+    execution.marker_id = matches[0][0]
+    expected_body = _marker_body(request, values)
+    _validate_marker_payload(
+        matches[0][1],
+        request=request,
+        expected_body=expected_body,
+        values=values,
     )
-    return request, created_id, outcome
+
+    # Re-read mutable request state and immutable subject immediately before
+    # entering the credentialed observation engine. Job outputs are not authority.
+    _revalidate_current_issue(api, request)
+    _require_execution_identity(values, request)
+    _revalidate_tag(api, request)
+    return request
 
 
 def _safe_execution_payload(
@@ -642,23 +602,30 @@ def _safe_execution_payload(
     values: Mapping[str, str],
     request: ValidatedRequest | None,
     marker_id: int | None,
-    outcome: DispatchOutcome,
     reason_code: str | None = None,
 ) -> dict[str, object]:
     payload: dict[str, object] = {
         "contract": REQUEST_CONTRACT,
         "fixed_repository": FIXED_REPOSITORY,
-        "fixed_workflow": FIXED_WORKFLOW,
-        "fixed_operation": FIXED_OPERATION,
         "fixed_method": FIXED_METHOD,
         "automatic_retry": False,
         "fallback_transport": False,
-        "max_dispatch_mutation_requests": 1,
-        **outcome.safe_payload(),
+        "second_workflow_run": False,
     }
     workflow_sha = values.get("GITHUB_WORKFLOW_SHA", "")
     if SHA40.fullmatch(workflow_sha) is not None:
         payload["relay_workflow_sha"] = workflow_sha
+    execution_sha = values.get("GITHUB_SHA", "")
+    if SHA40.fullmatch(execution_sha) is not None:
+        payload["execution_sha"] = execution_sha
+    try:
+        payload["relay_run_id"] = _env_positive_int(values, "GITHUB_RUN_ID")
+    except RelayError:
+        pass
+    try:
+        payload["relay_run_attempt"] = _env_positive_int(values, "GITHUB_RUN_ATTEMPT")
+    except RelayError:
+        pass
     if request is not None:
         payload.update(
             {
@@ -681,7 +648,7 @@ def _write_summary(values: Mapping[str, str], payload: Mapping[str, object]) -> 
         return False
     try:
         with open(path, "a", encoding="utf-8") as handle:
-            handle.write("### Current observation dispatch relay\n\n```json\n")
+            handle.write("### Current observation same-run consumption\n\n```json\n")
             handle.write(json.dumps(payload, sort_keys=True, separators=(",", ":")))
             handle.write("\n```\n")
     except OSError:
@@ -689,9 +656,43 @@ def _write_summary(values: Mapping[str, str], payload: Mapping[str, object]) -> 
     return True
 
 
+def _run_protected_observation(
+    values: Mapping[str, str],
+    *,
+    api: GitHubRelayAPI,
+    event: Mapping[str, object] | None = None,
+    progress: ExecutionProgress | None = None,
+) -> int:
+    request = reconstruct_protected_request(
+        values,
+        api=api,
+        event=event,
+        progress=progress,
+    )
+
+    from . import current_observation
+
+    injected = {
+        current_observation.RECIPIENT_CERTIFICATE_ENV: request.certificate_b64,
+        current_observation.WORKFLOW_SHA_ENV: _workflow_sha(values),
+        current_observation.REQUESTED_REF_ENV: request.ref,
+        "INPUT_OPERATION": FIXED_OPERATION,
+    }
+    prior = {key: os.environ.get(key) for key in injected}
+    try:
+        os.environ.update(injected)
+        return current_observation.main([])
+    finally:
+        for key, previous in prior.items():
+            if previous is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = previous
+
+
 def main(argv: list[str] | None = None) -> int:
     arguments = sys.argv[1:] if argv is None else argv
-    if arguments not in (["validate"], ["consume-and-dispatch"]):
+    if arguments not in (["validate"], ["consume"], ["protected"]):
         print(json.dumps({"status": "BLOCKED", "reason_code": "RELAY_ARGUMENT_INVALID"}))
         return 2
 
@@ -705,12 +706,18 @@ def main(argv: list[str] | None = None) -> int:
                 values=values,
                 request=progress.request,
                 marker_id=None,
-                outcome=DispatchOutcome("NOT_SENT"),
             )
             print(json.dumps({"status": "VALIDATED", **payload}, sort_keys=True))
             return 0
 
-        request, marker_id, outcome = consume_and_dispatch(
+        if arguments == ["protected"]:
+            return _run_protected_observation(
+                values,
+                api=api,
+                progress=progress,
+            )
+
+        request, marker_id = consume_request(
             values,
             api=api,
             progress=progress,
@@ -719,7 +726,6 @@ def main(argv: list[str] | None = None) -> int:
             values=values,
             request=request,
             marker_id=marker_id,
-            outcome=outcome,
         )
         summary_written = _write_summary(values, payload)
         if not summary_written:
@@ -735,32 +741,26 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 2
 
-        status = {
-            "NOT_SENT": "DISPATCH_NOT_SENT",
-            "ACCEPTED": "DISPATCH_ACCEPTED",
-            "SENT_OR_ACCEPTANCE_UNKNOWN": "DISPATCH_TERMINAL_UNKNOWN",
-        }.get(outcome.outcome, "DISPATCH_OUTCOME_INVALID")
         print(
             json.dumps(
                 {
-                    "status": status,
+                    "status": "CONSUMPTION_COMPLETE",
                     "audit_summary_written": True,
                     **payload,
                 },
                 sort_keys=True,
             )
         )
-        return 0 if outcome.outcome == "ACCEPTED" else 2
+        return 0
     except RelayError as exc:
         payload = _safe_execution_payload(
             values=values,
             request=progress.request,
             marker_id=progress.marker_id,
-            outcome=DispatchOutcome("NOT_SENT"),
             reason_code=str(exc).split(":", 1)[0],
         )
         summary_written = False
-        if arguments == ["consume-and-dispatch"]:
+        if arguments == ["consume"]:
             summary_written = _write_summary(values, payload)
         print(
             json.dumps(
