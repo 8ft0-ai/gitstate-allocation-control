@@ -12,9 +12,9 @@ Only non-sensitive synthetic identifiers and content are permitted in this repos
 
 Issue #1 is the sole `/beads-v0.2` allocation-intake request surface and must remain open with the trusted control-surface label. An allocation-intake request is exactly one UTF-8 line beginning with `/beads-v0.2 ` followed immediately by one strict JSON object. Allocation-intake requests elsewhere are rejected before App credentials are available.
 
-### Governed `current_observation` dispatch relay
+### Governed `current_observation` same-run protected execution
 
-A separately governed transport-only relay may accept one dedicated issue per `current_observation` dispatch attempt. This relay is not an allocation-intake surface and grants no allocation, Workstream D or Workstream E authority.
+A separately governed same-run path may accept one dedicated issue for one `current_observation` attempt. This path is not an allocation-intake surface and grants no allocation, retry, Workstream D or Workstream E authority.
 
 The request issue must be opened by repository owner `8ft0-ai`, have the exact title:
 
@@ -28,9 +28,9 @@ and contain exactly one UTF-8 line with one strict JSON object containing only:
 {"ref":"refs/tags/gitstate-current-observation/<40-lowercase-hex>","current_observation_recipient_cert_b64":"<public-base64-DER-X509-certificate>"}
 ```
 
-The relay is structurally fixed to repository `8ft0-ai/gitstate-allocation-control`, workflow `.github/workflows/phase2-adversarial.yml`, operation `current_observation` and method `workflow_dispatch`. It requires a direct protected-tag target matching the 40-hex suffix, durably consumes the request before transmission, permits at most one outbound dispatch mutation attempt, has no automatic retry or fallback transport, and uses only the ordinary ephemeral repository `GITHUB_TOKEN`.
+The path is structurally fixed to repository `8ft0-ai/gitstate-allocation-control` and the owner-authenticated `issues: opened` workflow. Before the first durable write it requires the request identity, run-attempt identity and immutable subject identity to agree: protected `main` execution, owner actor and triggering actor, run attempt 1, workflow SHA equal to execution SHA, and a direct governed tag target whose 40-hex suffix equals that same SHA. It then writes and positively re-reads exactly one public-safe consumption marker before entering the existing `phase-2-allocator` environment in the same workflow run.
 
-The recipient certificate is public request/input material but is not echoed to relay logs, summaries or diagnostics. Allocator credentials and recipient private-key material are not relay inputs.
+The protected job independently reconstructs the current request, exact consumption marker and governed tag before allocator private-key use. No second `workflow_dispatch`, outbound dispatch transport or `actions: write` authority exists on this path. The public recipient certificate is reconstructed from the freshly revalidated request body and is not echoed to logs, summaries or diagnostics; recipient private-key material is never accepted.
 
 ## Trust boundary
 
