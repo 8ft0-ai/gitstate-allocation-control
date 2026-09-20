@@ -775,6 +775,39 @@ def _with_environment_observation_token(
     return result
 
 
+def prove_environment_observation_access(
+    app_api: GitHubAPI,
+    *,
+    installation_id: int,
+    api_url: str,
+    api_factory: Callable[[str, str], GitHubAPI] = GitHubAPI,
+) -> dict[str, bool]:
+    environment_path = (
+        f"/repos/{CONTROL_REPOSITORY}/environments/"
+        f"{quote(ENVIRONMENT_NAME, safe='')}"
+    )
+
+    def observe(environment_api: GitHubAPI) -> dict[str, object]:
+        payload = environment_api.get(environment_path)
+        if not isinstance(payload, Mapping) or payload.get("name") != ENVIRONMENT_NAME:
+            raise CurrentObservationError("ENVIRONMENT_OBSERVATION_ACCESS_INVALID")
+        return {"environment_observation_access": True}
+
+    result = _with_environment_observation_token(
+        app_api,
+        installation_id=installation_id,
+        api_url=api_url,
+        api_factory=api_factory,
+        observe=observe,
+    )
+    if result != {"environment_observation_access": True}:
+        raise CurrentObservationError("ENVIRONMENT_OBSERVATION_ACCESS_INVALID")
+    return {
+        "environment_observation_access": True,
+        "environment_observation_token_revoked": True,
+    }
+
+
 def _observe_state_baseline(
     app_api: GitHubAPI,
     *,

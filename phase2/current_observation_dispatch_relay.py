@@ -18,6 +18,8 @@ FIXED_OWNER = "8ft0-ai"
 FIXED_EXECUTION_REF = "refs/heads/main"
 FIXED_OPERATION = "current_observation"
 FIXED_METHOD = "same_run_protected_job"
+FIXED_ALLOCATOR_APP_ID = 4478117
+FIXED_ALLOCATOR_APP_SLUG = "gitstate-phase-2-allocator"
 API_HOST = "api.github.com"
 API_VERSION = "2026-03-10"
 REQUEST_TITLE = "[gitstate-current-observation-dispatch/v1]"
@@ -257,6 +259,16 @@ class GitHubRelayAPI:
             raise RelayError("REQUEST_TAG_READ_INVALID")
         return payload
 
+    def get_allocator_app(self) -> Mapping[str, object]:
+        payload = self._request_json(
+            "GET",
+            f"/apps/{FIXED_ALLOCATOR_APP_SLUG}",
+            error_code="ALLOCATOR_APP_READ_FAILED",
+        )
+        if not isinstance(payload, Mapping):
+            raise RelayError("ALLOCATOR_APP_CAPABILITY_MISMATCH")
+        return payload
+
     def create_consumption_comment(
         self, issue_number: int, body: str
     ) -> Mapping[str, object]:
@@ -380,6 +392,19 @@ def _revalidate_tag(api: GitHubRelayAPI, request: ValidatedRequest) -> None:
         raise RelayError("REQUEST_TAG_TARGET_INVALID")
     if obj.get("type") != "commit" or obj.get("sha") != request.ref_sha:
         raise RelayError("REQUEST_TAG_TARGET_MISMATCH")
+
+
+def _revalidate_allocator_app_capability(api: GitHubRelayAPI) -> None:
+    payload = api.get_allocator_app()
+    permissions = payload.get("permissions")
+    if (
+        payload.get("id") != FIXED_ALLOCATOR_APP_ID
+        or payload.get("slug") != FIXED_ALLOCATOR_APP_SLUG
+        or not isinstance(permissions, Mapping)
+        or permissions.get("environments") != "read"
+        or permissions.get("metadata") != "read"
+    ):
+        raise RelayError("ALLOCATOR_APP_CAPABILITY_MISMATCH")
 
 
 def _workflow_sha(values: Mapping[str, str]) -> str:
@@ -511,6 +536,7 @@ def validate_request(
 ) -> ValidatedRequest:
     request = _event_request(values, _load_event(values) if event is None else event)
     _revalidate_current_issue(api, request)
+    _revalidate_allocator_app_capability(api)
     return request
 
 
@@ -532,6 +558,10 @@ def consume_request(
     comments = api.list_issue_comments(request.issue_number)
     if _matching_markers(comments, request):
         raise RelayError("REQUEST_ALREADY_CONSUMED")
+
+    # Re-read the live public App registration as the final mutable external
+    # precondition before the one durable consumption write.
+    _revalidate_allocator_app_capability(api)
 
     marker_body = _marker_body(request, values)
     created = api.create_consumption_comment(request.issue_number, marker_body)
