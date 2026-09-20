@@ -82,6 +82,7 @@ class FakeAPI:
         marker_write_error: bool = False,
         tag_target: str = EXECUTION_SHA,
         final_tag_target: str | None = None,
+        request_body: str | None = None,
     ) -> None:
         self.comments: list[dict[str, object]] = []
         self.create_calls = 0
@@ -90,6 +91,7 @@ class FakeAPI:
         self.marker_write_error = marker_write_error
         self.tag_target = tag_target
         self.final_tag_target = final_tag_target
+        self.request_body = request_body
 
     @staticmethod
     def assert_issue_number(issue_number: int) -> None:
@@ -99,7 +101,7 @@ class FakeAPI:
     def get_issue(self, issue_number: int):
         self.issue_reads += 1
         self.assert_issue_number(issue_number)
-        return current_issue()
+        return current_issue(self.request_body)
 
     def list_issue_comments(self, issue_number: int):
         self.assert_issue_number(issue_number)
@@ -199,7 +201,7 @@ class PreConsumptionAuthorityTests(unittest.TestCase):
         request_body = body(
             ref="refs/tags/gitstate-current-observation/" + ("2" * 40)
         )
-        api = FakeAPI()
+        api = FakeAPI(request_body=request_body)
         with self.assertRaisesRegex(relay.RelayError, "REQUEST_EXECUTION_SHA_MISMATCH"):
             relay.consume_request(env(), api=api, event=event(request_body))
         self.assertEqual(api.create_calls, 0)
