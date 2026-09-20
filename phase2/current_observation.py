@@ -49,7 +49,9 @@ PERMISSION_PROFILE_SHA256 = (
 )
 RECIPIENT_CERTIFICATE_ENV = "INPUT_CURRENT_OBSERVATION_RECIPIENT_CERT_B64"
 CURRENT_OBSERVATION_TAG_REF_PREFIX = "refs/tags/gitstate-current-observation/"
+CURRENT_OBSERVATION_EXECUTION_REF = "refs/heads/main"
 WORKFLOW_SHA_ENV = "CURRENT_OBSERVATION_WORKFLOW_SHA"
+REQUESTED_REF_ENV = "CURRENT_OBSERVATION_REQUESTED_REF"
 ENVELOPE_CONTRACT_VERSION = "gitstate-current-observation-envelope-v1"
 MAX_RECIPIENT_CERTIFICATE_B64_CHARS = 16_384
 MAX_RECIPIENT_CERTIFICATE_DER_BYTES = 12_288
@@ -79,9 +81,13 @@ class RecipientCertificate:
 @dataclass(frozen=True)
 class ObservationContext:
     repository: str
+    event_name: str
+    actor: str
+    triggering_actor: str
     ref: str
     trusted_sha: str
     workflow_sha: str
+    requested_ref: str
     run_id: int
     run_attempt: int
     operation: str
@@ -89,18 +95,26 @@ class ObservationContext:
     def validate(self) -> None:
         if self.repository != CONTROL_REPOSITORY:
             raise CurrentObservationError("OBSERVATION_REPOSITORY_MISMATCH")
-        if not self.ref.startswith(CURRENT_OBSERVATION_TAG_REF_PREFIX):
-            raise CurrentObservationError("OBSERVATION_PROTECTED_TAG_REQUIRED")
-        ref_sha = self.ref[len(CURRENT_OBSERVATION_TAG_REF_PREFIX) :]
-        if SHA40.fullmatch(ref_sha) is None:
-            raise CurrentObservationError("OBSERVATION_PROTECTED_TAG_INVALID")
+        if self.event_name != "issues":
+            raise CurrentObservationError("OBSERVATION_EVENT_REQUIRED")
+        if self.actor != CONTROL_OWNER:
+            raise CurrentObservationError("OBSERVATION_OWNER_ACTOR_REQUIRED")
+        if self.triggering_actor != CONTROL_OWNER:
+            raise CurrentObservationError("OBSERVATION_OWNER_TRIGGERING_ACTOR_REQUIRED")
+        if self.ref != CURRENT_OBSERVATION_EXECUTION_REF:
+            raise CurrentObservationError("OBSERVATION_PROTECTED_MAIN_REQUIRED")
+        if not self.requested_ref.startswith(CURRENT_OBSERVATION_TAG_REF_PREFIX):
+            raise CurrentObservationError("OBSERVATION_REQUESTED_TAG_REQUIRED")
+        requested_sha = self.requested_ref[len(CURRENT_OBSERVATION_TAG_REF_PREFIX) :]
+        if SHA40.fullmatch(requested_sha) is None:
+            raise CurrentObservationError("OBSERVATION_REQUESTED_TAG_INVALID")
         if SHA40.fullmatch(self.trusted_sha) is None:
             raise CurrentObservationError("OBSERVATION_TRUSTED_SHA_INVALID")
-        if self.trusted_sha != ref_sha:
+        if self.trusted_sha != requested_sha:
             raise CurrentObservationError("OBSERVATION_TRUSTED_SHA_MISMATCH")
         if SHA40.fullmatch(self.workflow_sha) is None:
             raise CurrentObservationError("OBSERVATION_WORKFLOW_SHA_INVALID")
-        if self.workflow_sha != ref_sha:
+        if self.workflow_sha != self.trusted_sha:
             raise CurrentObservationError("OBSERVATION_WORKFLOW_SHA_MISMATCH")
         if self.run_id <= 0 or self.run_attempt != 1:
             raise CurrentObservationError("OBSERVATION_RUN_IDENTITY_INVALID")
@@ -112,9 +126,13 @@ def _context(values: Mapping[str, str]) -> ObservationContext:
     try:
         result = ObservationContext(
             repository=values["GITHUB_REPOSITORY"],
+            event_name=values["GITHUB_EVENT_NAME"],
+            actor=values["GITHUB_ACTOR"],
+            triggering_actor=values["GITHUB_TRIGGERING_ACTOR"],
             ref=values["GITHUB_REF"],
             trusted_sha=values["GITHUB_SHA"],
             workflow_sha=values[WORKFLOW_SHA_ENV],
+            requested_ref=values[REQUESTED_REF_ENV],
             run_id=int(values["GITHUB_RUN_ID"]),
             run_attempt=int(values["GITHUB_RUN_ATTEMPT"]),
             operation=values["INPUT_OPERATION"],
