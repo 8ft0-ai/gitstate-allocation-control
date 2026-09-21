@@ -26,9 +26,17 @@ REQUEST_REF = f"{observation.CURRENT_OBSERVATION_TAG_REF_PREFIX}{RUNTIME_SHA}"
 
 
 class MintingAppAPI:
-    def __init__(self, responses):
+    def __init__(self, responses, get_handler=None):
         self.responses = list(responses)
+        self.get_handler = get_handler
+        self.get_calls: list[str] = []
         self.posts: list[tuple[str, dict]] = []
+
+    def get(self, path: str):
+        self.get_calls.append(path)
+        if self.get_handler is None:
+            raise AssertionError(path)
+        return self.get_handler(path)
 
     def post(self, path: str, body: dict):
         self.posts.append((path, body))
@@ -553,6 +561,165 @@ class CurrentObservationUnitTests(unittest.TestCase):
             ],
         )
         self.assertEqual(environment_api.delete_calls, ["/installation/token"])
+
+    def test_preconsumption_allocator_capability_proves_registration_installation_and_effective_token(self):
+        registration = {
+            "id": observation.ALLOCATOR_APP_ID,
+            "slug": observation.ALLOCATOR_APP_SLUG,
+            "permissions": {
+                "contents": "write",
+                "environments": "read",
+                "issues": "write",
+                "metadata": "read",
+            },
+        }
+        installation = {
+            "id": 77,
+            "app_id": observation.ALLOCATOR_APP_ID,
+            "app_slug": observation.ALLOCATOR_APP_SLUG,
+            "repository_selection": "selected",
+            "account": {"login": observation.CONTROL_OWNER},
+            "permissions": {
+                "contents": "write",
+                "environments": "read",
+                "issues": "write",
+                "metadata": "read",
+            },
+        }
+        environment_response = {
+            "token": "environment-token",
+            "permissions": {"environments": "read", "metadata": "read"},
+            "repositories": [{"id": CONTROL_REPOSITORY_ID}],
+        }
+
+        def app_get(path: str):
+            if path == "/app":
+                return registration
+            if path == "/repos/8ft0-ai/gitstate-allocation-control/installation":
+                return installation
+            raise AssertionError(path)
+
+        app_api = MintingAppAPI([environment_response], get_handler=app_get)
+        environment_api = TokenAPI(
+            "environment-token",
+            lambda path: {"name": observation.ENVIRONMENT_NAME}
+            if path.endswith("/environments/phase-2-allocator")
+            else (_ for _ in ()).throw(AssertionError(path)),
+        )
+
+        def api_factory(token: str, url: str):
+            self.assertEqual(url, "https://api.github.test")
+            if token == "app-jwt":
+                return app_api
+            if token == "environment-token":
+                return environment_api
+            raise AssertionError(token)
+
+        result = observation.prove_preconsumption_allocator_capability(
+            app_id=observation.ALLOCATOR_APP_ID,
+            installation_id=77,
+            private_key="private-key",
+            api_url="https://api.github.test",
+            api_factory=api_factory,
+            jwt_factory=lambda app_id, private_key: "app-jwt",
+        )
+        self.assertEqual(
+            result,
+            {
+                "environment_observation_access": True,
+                "environment_observation_token_revoked": True,
+            },
+        )
+        self.assertEqual(
+            app_api.get_calls,
+            ["/app", "/repos/8ft0-ai/gitstate-allocation-control/installation"],
+        )
+        self.assertEqual(environment_api.delete_calls, ["/installation/token"])
+
+    def test_preconsumption_allocator_registration_mismatches_fail_before_token_mint(self):
+        valid = {
+            "id": observation.ALLOCATOR_APP_ID,
+            "slug": observation.ALLOCATOR_APP_SLUG,
+            "permissions": {"environments": "read", "metadata": "read"},
+        }
+        cases = [
+            ({**valid, "id": 1}, "wrong-id"),
+            ({**valid, "slug": "wrong"}, "wrong-slug"),
+            ({**valid, "permissions": {"metadata": "read"}}, "missing-environments"),
+            (
+                {
+                    **valid,
+                    "permissions": {"environments": "write", "metadata": "read"},
+                },
+                "widened-environments",
+            ),
+            ({**valid, "permissions": {"environments": "read"}}, "missing-metadata"),
+            (
+                {
+                    **valid,
+                    "permissions": {"environments": "read", "metadata": "write"},
+                },
+                "widened-metadata",
+            ),
+            ({**valid, "permissions": "invalid"}, "malformed"),
+        ]
+        for registration, label in cases:
+            app_api = MintingAppAPI(
+                [],
+                get_handler=lambda path, registration=registration: registration
+                if path == "/app"
+                else (_ for _ in ()).throw(AssertionError(path)),
+            )
+            with self.subTest(label=label), self.assertRaisesRegex(
+                observation.CurrentObservationError,
+                "ALLOCATOR_APP_CAPABILITY_MISMATCH",
+            ):
+                observation.prove_preconsumption_allocator_capability(
+                    app_id=observation.ALLOCATOR_APP_ID,
+                    installation_id=77,
+                    private_key="private-key",
+                    api_url="https://api.github.test",
+                    api_factory=lambda token, url, app_api=app_api: app_api,
+                    jwt_factory=lambda app_id, private_key: "app-jwt",
+                )
+            self.assertEqual(app_api.posts, [])
+
+    def test_preconsumption_installation_permission_view_mismatch_fails_before_token_mint(self):
+        registration = {
+            "id": observation.ALLOCATOR_APP_ID,
+            "slug": observation.ALLOCATOR_APP_SLUG,
+            "permissions": {"environments": "read", "metadata": "read"},
+        }
+        installation = {
+            "id": 77,
+            "app_id": observation.ALLOCATOR_APP_ID,
+            "app_slug": observation.ALLOCATOR_APP_SLUG,
+            "repository_selection": "selected",
+            "account": {"login": observation.CONTROL_OWNER},
+            "permissions": {"environments": "write", "metadata": "read"},
+        }
+
+        def app_get(path: str):
+            if path == "/app":
+                return registration
+            if path == "/repos/8ft0-ai/gitstate-allocation-control/installation":
+                return installation
+            raise AssertionError(path)
+
+        app_api = MintingAppAPI([], get_handler=app_get)
+        with self.assertRaisesRegex(
+            observation.CurrentObservationError,
+            "INSTALLATION_PERMISSION_VIEW_MISMATCH",
+        ):
+            observation.prove_preconsumption_allocator_capability(
+                app_id=observation.ALLOCATOR_APP_ID,
+                installation_id=77,
+                private_key="private-key",
+                api_url="https://api.github.test",
+                api_factory=lambda token, url: app_api,
+                jwt_factory=lambda app_id, private_key: "app-jwt",
+            )
+        self.assertEqual(app_api.posts, [])
 
     def test_environment_observation_access_failure_still_revokes_token(self):
         response = {
