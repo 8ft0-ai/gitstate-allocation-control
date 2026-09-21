@@ -157,6 +157,24 @@ class FakeAPI:
         return dict(comment)
 
 
+def consume(
+    values: dict[str, str],
+    *,
+    api: FakeAPI,
+    event: dict[str, object] | None = None,
+    progress: relay.ExecutionProgress | None = None,
+    protected_capability_check=None,
+):
+    check = (lambda: None) if protected_capability_check is None else protected_capability_check
+    return relay.consume_request(
+        values,
+        api=api,
+        protected_capability_check=check,
+        event=event,
+        progress=progress,
+    )
+
+
 class RequestSchemaTests(unittest.TestCase):
     def test_accepts_exact_two_key_request(self):
         self.assertEqual(relay.parse_request_body(body()), (REF, CERT))
@@ -197,12 +215,11 @@ class RequestSchemaTests(unittest.TestCase):
 class PreConsumptionAuthorityTests(unittest.TestCase):
     def test_exact_identity_consumes_once_and_binds_attempt(self):
         api = FakeAPI()
-        request, marker_id = relay.consume_request(env(), api=api, event=event())
+        request, marker_id = consume(env(), api=api, event=event())
         self.assertEqual(request.ref, REF)
         self.assertEqual(marker_id, 701)
         self.assertEqual(api.create_calls, 1)
         self.assertEqual(api.tag_reads, 2)
-        self.assertEqual(api.app_reads, 2)
         marker = str(api.comments[0]["body"])
         self.assertNotIn(CERT, marker)
         self.assertIn('"relay_run_attempt":1', marker)
@@ -222,7 +239,7 @@ class PreConsumptionAuthorityTests(unittest.TestCase):
             values[name] = value
             api = FakeAPI()
             with self.subTest(name=name), self.assertRaisesRegex(relay.RelayError, code):
-                relay.consume_request(values, api=api, event=event())
+                consume(values, api=api, event=event())
             self.assertEqual(api.create_calls, 0)
 
     def test_requested_tag_execution_sha_mismatch_is_zero_write(self):
@@ -231,107 +248,106 @@ class PreConsumptionAuthorityTests(unittest.TestCase):
         )
         api = FakeAPI(request_body=request_body)
         with self.assertRaisesRegex(relay.RelayError, "REQUEST_EXECUTION_SHA_MISMATCH"):
-            relay.consume_request(env(), api=api, event=event(request_body))
+            consume(env(), api=api, event=event(request_body))
         self.assertEqual(api.create_calls, 0)
         self.assertEqual(api.tag_reads, 0)
 
     def test_direct_tag_target_mismatch_is_zero_write(self):
         api = FakeAPI(tag_target="f" * 40)
         with self.assertRaisesRegex(relay.RelayError, "REQUEST_TAG_TARGET_MISMATCH"):
-            relay.consume_request(env(), api=api, event=event())
+            consume(env(), api=api, event=event())
         self.assertEqual(api.create_calls, 0)
 
-    def test_allocator_app_capability_mismatches_are_zero_write(self):
-        valid = {
-            "id": relay.FIXED_ALLOCATOR_APP_ID,
-            "slug": relay.FIXED_ALLOCATOR_APP_SLUG,
-            "permissions": {"environments": "read", "metadata": "read"},
-        }
-        cases = [
-            ({**valid, "id": 1}, "wrong-id"),
-            ({**valid, "slug": "wrong"}, "wrong-slug"),
-            ({**valid, "permissions": {"metadata": "read"}}, "missing-environments"),
-            (
-                {**valid, "permissions": {"environments": "write", "metadata": "read"}},
-                "widened-environments",
-            ),
-            (
-                {**valid, "permissions": {"environments": "read"}},
-                "missing-metadata",
-            ),
-            (
-                {**valid, "permissions": {"environments": "read", "metadata": "write"}},
-                "widened-metadata",
-            ),
-            ({**valid, "permissions": "invalid"}, "malformed-permissions"),
-        ]
-        for app_payload, label in cases:
-            api = FakeAPI(app_payload=app_payload)
-            with self.subTest(label=label), self.assertRaisesRegex(
-                relay.RelayError, "ALLOCATOR_APP_CAPABILITY_MISMATCH"
-            ):
-                relay.consume_request(env(), api=api, event=event())
-            self.assertEqual(api.create_calls, 0)
-
-    def test_allocator_app_read_failure_is_zero_write(self):
-        api = FakeAPI(app_read_error="ALLOCATOR_APP_READ_FAILED")
-        with self.assertRaisesRegex(relay.RelayError, "ALLOCATOR_APP_READ_FAILED"):
-            relay.consume_request(env(), api=api, event=event())
+    def test_static_validation_never_reads_allocator_app(self):
+        api = FakeAPI(app_read_error="SHOULD_NOT_BE_READ")
+        request = relay.validate_request(env(), api=api, event=event())
+        self.assertEqual(request.ref, REF)
+        self.assertEqual(api.app_reads, 0)
         self.assertEqual(api.create_calls, 0)
 
-    def test_allocator_app_capability_movement_before_write_is_zero_write(self):
-        moved = {
-            "id": relay.FIXED_ALLOCATOR_APP_ID,
-            "slug": relay.FIXED_ALLOCATOR_APP_SLUG,
-            "permissions": {"metadata": "read"},
-        }
-        api = FakeAPI(final_app_payload=moved)
+    def test_protected_capability_check_is_last_prewrite_gate(self):
+        api = FakeAPI()
+        observed: list[tuple[int, int, int, int]] = []
+
+        def check():
+            observed.append(
+                (
+                    api.issue_reads,
+                    api.tag_reads,
+                    len(api.comments),
+                    api.create_calls,
+                )
+            )
+
+        request, marker_id = consume(
+            env(),
+            api=api,
+            event=event(),
+            protected_capability_check=check,
+        )
+        self.assertEqual(request.ref, REF)
+        self.assertEqual(marker_id, 701)
+        self.assertEqual(observed, [(1, 1, 0, 0)])
+        self.assertEqual(api.create_calls, 1)
+
+    def test_protected_capability_failure_is_zero_write(self):
+        api = FakeAPI()
+
+        def fail():
+            raise relay.RelayError("PROTECTED_CAPABILITY_CHECK_FAILED")
+
         with self.assertRaisesRegex(
-            relay.RelayError, "ALLOCATOR_APP_CAPABILITY_MISMATCH"
+            relay.RelayError, "PROTECTED_CAPABILITY_CHECK_FAILED"
         ):
-            relay.consume_request(env(), api=api, event=event())
-        self.assertEqual(api.app_reads, 2)
+            consume(
+                env(),
+                api=api,
+                event=event(),
+                protected_capability_check=fail,
+            )
         self.assertEqual(api.create_calls, 0)
 
-    def test_allocator_app_metadata_is_not_emitted(self):
-        sentinel = "PRIVATE-APP-METADATA-SENTINEL"
-        api = FakeAPI(
-            app_payload={
-                "id": relay.FIXED_ALLOCATOR_APP_ID,
-                "slug": relay.FIXED_ALLOCATOR_APP_SLUG,
-                "permissions": {"environments": "read", "metadata": "read"},
-                "owner": {"private": sentinel},
-            }
-        )
-        request, marker_id = relay.consume_request(env(), api=api, event=event())
-        marker = str(api.comments[0]["body"])
-        payload = relay._safe_execution_payload(
-            values=env(), request=request, marker_id=marker_id
-        )
-        self.assertNotIn(sentinel, marker)
-        self.assertNotIn(sentinel, json.dumps(payload))
+    def test_execution_identity_failure_precedes_protected_capability(self):
+        values = env()
+        values["GITHUB_RUN_ATTEMPT"] = "2"
+        api = FakeAPI()
+        calls = 0
+
+        def check():
+            nonlocal calls
+            calls += 1
+
+        with self.assertRaisesRegex(relay.RelayError, "GITHUB_RUN_ATTEMPT_MISMATCH"):
+            consume(
+                values,
+                api=api,
+                event=event(),
+                protected_capability_check=check,
+            )
+        self.assertEqual(calls, 0)
+        self.assertEqual(api.create_calls, 0)
 
     def test_ambiguous_marker_write_is_terminal_without_second_consequence(self):
         api = FakeAPI(marker_write_error=True)
         with self.assertRaisesRegex(
             relay.RelayError, "CONSUMPTION_MARKER_WRITE_AMBIGUOUS"
         ):
-            relay.consume_request(env(), api=api, event=event())
+            consume(env(), api=api, event=event())
         self.assertEqual(api.create_calls, 1)
 
     def test_post_consumption_tag_movement_burns_request_fail_closed(self):
         api = FakeAPI(final_tag_target="f" * 40)
         progress = relay.ExecutionProgress()
         with self.assertRaisesRegex(relay.RelayError, "REQUEST_TAG_TARGET_MISMATCH"):
-            relay.consume_request(env(), api=api, event=event(), progress=progress)
+            consume(env(), api=api, event=event(), progress=progress)
         self.assertEqual(api.create_calls, 1)
         self.assertEqual(progress.marker_id, 701)
 
     def test_prior_marker_and_serialised_duplicate_cannot_create_second_marker(self):
         api = FakeAPI()
-        relay.consume_request(env(), api=api, event=event())
+        consume(env(), api=api, event=event())
         with self.assertRaisesRegex(relay.RelayError, "REQUEST_ALREADY_CONSUMED"):
-            relay.consume_request(env(), api=api, event=event())
+            consume(env(), api=api, event=event())
         self.assertEqual(api.create_calls, 1)
 
         workflow = Path(
@@ -345,11 +361,11 @@ class PreConsumptionAuthorityTests(unittest.TestCase):
 
     def test_attempt_two_fails_before_existing_marker_discovery_or_write(self):
         api = FakeAPI()
-        relay.consume_request(env(), api=api, event=event())
+        consume(env(), api=api, event=event())
         values = env()
         values["GITHUB_RUN_ATTEMPT"] = "2"
         with self.assertRaisesRegex(relay.RelayError, "GITHUB_RUN_ATTEMPT_MISMATCH"):
-            relay.consume_request(values, api=api, event=event())
+            consume(values, api=api, event=event())
         self.assertEqual(api.create_calls, 1)
 
     def test_user_spoof_marker_is_not_consumption(self):
@@ -362,14 +378,14 @@ class PreConsumptionAuthorityTests(unittest.TestCase):
                 "user": {"login": relay.FIXED_OWNER},
             }
         )
-        relay.consume_request(env(), api=api, event=event())
+        consume(env(), api=api, event=event())
         self.assertEqual(api.create_calls, 1)
 
 
 class ProtectedReconstructionTests(unittest.TestCase):
     def consumed_api(self) -> FakeAPI:
         api = FakeAPI()
-        relay.consume_request(env(), api=api, event=event())
+        consume(env(), api=api, event=event())
         return api
 
     def test_protected_job_reconstructs_exact_request_marker_and_subject(self):
@@ -405,21 +421,27 @@ class ProtectedReconstructionTests(unittest.TestCase):
         with self.assertRaisesRegex(relay.RelayError, "CONSUMPTION_MARKER_MISMATCH"):
             relay.reconstruct_protected_request(env(), api=api, event=event())
 
-    def test_protected_rerun_is_rejected_before_observation_engine(self):
-        api = self.consumed_api()
+    def test_protected_rerun_is_rejected_before_capability_or_observation(self):
+        api = FakeAPI()
         values = env()
         values["GITHUB_RUN_ATTEMPT"] = "2"
-        with mock.patch.object(current_observation, "main") as observation_main:
+        with mock.patch.object(
+            relay, "_run_preconsumption_protected_capability"
+        ) as capability, mock.patch.object(
+            current_observation, "main"
+        ) as observation_main:
             with self.assertRaisesRegex(relay.RelayError, "GITHUB_RUN_ATTEMPT_MISMATCH"):
                 relay._run_protected_observation(
                     values,
                     api=api,
                     event=event(),
                 )
+        capability.assert_not_called()
         observation_main.assert_not_called()
+        self.assertEqual(api.create_calls, 0)
 
-    def test_certificate_and_subject_are_reconstructed_inside_protected_job(self):
-        api = self.consumed_api()
+    def test_certificate_and_subject_are_reconstructed_after_same_job_consumption(self):
+        api = FakeAPI()
         seen: dict[str, str] = {}
 
         def observation_main(argv):
@@ -429,18 +451,25 @@ class ProtectedReconstructionTests(unittest.TestCase):
             seen["operation"] = os.environ["INPUT_OPERATION"]
             return 0
 
-        with mock.patch.object(current_observation, "main", side_effect=observation_main):
+        with mock.patch.object(
+            relay, "_run_preconsumption_protected_capability", return_value=None
+        ), mock.patch.object(
+            relay, "_write_summary", return_value=True
+        ), mock.patch.object(
+            current_observation, "main", side_effect=observation_main
+        ):
             code = relay._run_protected_observation(
                 env(),
                 api=api,
                 event=event(),
             )
         self.assertEqual(code, 0)
+        self.assertEqual(api.create_calls, 1)
+        self.assertEqual(len(api.comments), 1)
         self.assertEqual(seen["certificate"], CERT)
         self.assertEqual(seen["workflow_sha"], EXECUTION_SHA)
         self.assertEqual(seen["requested_ref"], REF)
         self.assertEqual(seen["operation"], "current_observation")
-
 
 class CurrentIssueAuthorityTests(unittest.TestCase):
     def test_rejects_each_current_issue_authority_mismatch(self):
@@ -514,7 +543,7 @@ class PaginationAndMarkerTests(unittest.TestCase):
         with self.assertRaisesRegex(
             relay.RelayError, "CONSUMPTION_MARKER_REREAD_INVALID"
         ):
-            relay.consume_request(env(), api=api, event=event())
+            consume(env(), api=api, event=event())
         self.assertEqual(api.create_calls, 1)
 
 
@@ -532,7 +561,7 @@ class AuditEvidenceTests(unittest.TestCase):
         self.assertEqual(payload["fixed_method"], "same_run_protected_job")
         self.assertFalse(payload["second_workflow_run"])
 
-    def test_consume_cli_records_public_safe_audit_summary(self):
+    def test_protected_cli_records_public_safe_consumption_summary(self):
         api = FakeAPI()
         with tempfile.TemporaryDirectory() as directory:
             event_path = Path(directory) / "event.json"
@@ -549,17 +578,25 @@ class AuditEvidenceTests(unittest.TestCase):
             output = io.StringIO()
             with mock.patch.dict(os.environ, values, clear=True), mock.patch.object(
                 relay, "GitHubRelayAPI", return_value=api
+            ), mock.patch.object(
+                relay, "_run_preconsumption_protected_capability", return_value=None
+            ), mock.patch.object(
+                current_observation, "main", return_value=0
             ), redirect_stdout(output):
-                code = relay.main(["consume"])
+                code = relay.main(["protected"])
             self.assertEqual(code, 0)
-            payload = json.loads(output.getvalue())
-            self.assertEqual(payload["status"], "CONSUMPTION_COMPLETE")
-            self.assertEqual(payload["relay_run_attempt"], 1)
+            self.assertEqual(api.create_calls, 1)
             self.assertNotIn(CERT, output.getvalue())
             summary = summary_path.read_text(encoding="utf-8")
             self.assertNotIn(CERT, summary)
             self.assertIn('"consumption_comment_id":701', summary)
 
+    def test_retired_consume_cli_is_rejected(self):
+        output = io.StringIO()
+        with redirect_stdout(output):
+            code = relay.main(["consume"])
+        self.assertEqual(code, 2)
+        self.assertIn("RELAY_ARGUMENT_INVALID", output.getvalue())
 
 class RepositoryContractTests(unittest.TestCase):
     def test_successor_workflow_has_one_same_run_protected_path(self):
@@ -568,9 +605,9 @@ class RepositoryContractTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("issues:", workflow)
         self.assertIn("types: [opened]", workflow)
-        self.assertIn("  consume:\n    needs: validation\n", workflow)
+        self.assertNotIn("  consume:\n", workflow)
         self.assertIn(
-            "  current-observation-protected:\n    needs: consume\n",
+            "  current-observation-protected:\n    needs: validation\n",
             workflow,
         )
         self.assertIn("environment: phase-2-allocator", workflow)
@@ -578,7 +615,7 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertIn("issues: read", workflow)
         self.assertNotIn("actions: write", workflow)
         self.assertNotIn("workflow_dispatch:", workflow)
-        self.assertIn("current_observation_dispatch_relay consume", workflow)
+        self.assertNotIn("current_observation_dispatch_relay consume", workflow)
         self.assertIn("current_observation_dispatch_relay protected", workflow)
         self.assertIn(
             "group: current-observation-relay-${{ github.event.issue.id }}",
