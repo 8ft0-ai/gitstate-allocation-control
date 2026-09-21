@@ -1719,10 +1719,11 @@ class CurrentObservationWorkflowTests(unittest.TestCase):
         current = self.relay_workflow.split(
             "\n  current-observation-protected:\n", 1
         )[1]
-        self.assertIn("    needs: consume\n", current)
+        self.assertIn("    needs: validation\n", current)
         self.assertIn("environment: phase-2-allocator", current)
-        self.assertIn("issues: read", current)
-        self.assertNotIn("issues: write", current)
+        self.assertIn("issues: write", current)
+        self.assertNotIn("issues: read", current)
+        self.assertNotIn("\n  consume:\n", self.relay_workflow)
         self.assertNotIn("actions: write", self.relay_workflow)
         self.assertNotIn("workflow_dispatch:", self.relay_workflow)
         self.assertIn(
