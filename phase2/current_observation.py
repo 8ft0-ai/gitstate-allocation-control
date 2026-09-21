@@ -36,6 +36,8 @@ from .policy import load_policy
 CONTROL_REPOSITORY = "8ft0-ai/gitstate-allocation-control"
 CONTROL_OWNER = "8ft0-ai"
 CONTROL_NAME = "gitstate-allocation-control"
+ALLOCATOR_APP_ID = 4478117
+ALLOCATOR_APP_SLUG = "gitstate-phase-2-allocator"
 ENVIRONMENT_NAME = "phase-2-allocator"
 EXECUTION_VARIABLE = "PHASE2_WORKSTREAM_D_EXECUTION_ENABLED"
 STATE_REPOSITORY = "8ft0-ai/gitstate-allocation-state"
@@ -806,6 +808,95 @@ def prove_environment_observation_access(
         "environment_observation_access": True,
         "environment_observation_token_revoked": True,
     }
+
+
+def _validate_preconsumption_app_registration(
+    payload: Mapping[str, Any],
+) -> None:
+    permissions = payload.get("permissions")
+    if (
+        payload.get("id") != ALLOCATOR_APP_ID
+        or payload.get("slug") != ALLOCATOR_APP_SLUG
+        or not isinstance(permissions, Mapping)
+        or permissions.get("environments") != "read"
+        or permissions.get("metadata") != "read"
+    ):
+        raise CurrentObservationError("ALLOCATOR_APP_CAPABILITY_MISMATCH")
+
+
+def _validate_preconsumption_installation_permissions(
+    installation: Mapping[str, Any],
+) -> None:
+    if "permissions" not in installation:
+        return
+    permissions = installation.get("permissions")
+    if (
+        not isinstance(permissions, Mapping)
+        or permissions.get("environments") != "read"
+        or permissions.get("metadata") != "read"
+    ):
+        raise CurrentObservationError("INSTALLATION_PERMISSION_VIEW_MISMATCH")
+
+
+def prove_preconsumption_allocator_capability(
+    *,
+    app_id: int,
+    installation_id: int,
+    private_key: str,
+    api_url: str,
+    api_factory: Callable[[str, str], GitHubAPI] = GitHubAPI,
+    jwt_factory: Callable[[int, str], str] = create_app_jwt,
+) -> dict[str, bool]:
+    if type(app_id) is not int or app_id != ALLOCATOR_APP_ID:
+        raise CurrentObservationError("ALLOCATOR_APP_ID_MISMATCH")
+    if type(installation_id) is not int or installation_id <= 0:
+        raise CurrentObservationError("ALLOCATOR_INSTALLATION_ID_INVALID")
+    if not isinstance(private_key, str) or not private_key:
+        raise CurrentObservationError("ALLOCATOR_PRIVATE_KEY_MISSING")
+
+    try:
+        app_jwt = jwt_factory(app_id, private_key)
+    finally:
+        private_key = ""
+    if not isinstance(app_jwt, str) or not app_jwt:
+        raise CurrentObservationError("ALLOCATOR_APP_JWT_MISSING")
+    try:
+        app_api = api_factory(app_jwt, api_url)
+    finally:
+        app_jwt = ""
+
+    registration = app_api.get("/app")
+    if not isinstance(registration, Mapping):
+        raise CurrentObservationError("ALLOCATOR_APP_CAPABILITY_MISMATCH")
+    _validate_preconsumption_app_registration(registration)
+
+    installation = verify_live_installation(
+        app_api,
+        CONTROL_OWNER,
+        CONTROL_NAME,
+        {
+            "app_id": app_id,
+            "installation_id": installation_id,
+            "app_slug": ALLOCATOR_APP_SLUG,
+            "owner": CONTROL_OWNER,
+        },
+    )
+    if not isinstance(installation, Mapping):
+        raise CurrentObservationError("LIVE_INSTALLATION_MISMATCH")
+    _validate_preconsumption_installation_permissions(installation)
+
+    result = prove_environment_observation_access(
+        app_api,
+        installation_id=installation_id,
+        api_url=api_url,
+        api_factory=api_factory,
+    )
+    if result != {
+        "environment_observation_access": True,
+        "environment_observation_token_revoked": True,
+    }:
+        raise CurrentObservationError("ENVIRONMENT_OBSERVATION_ACCESS_INVALID")
+    return result
 
 
 def _observe_state_baseline(
