@@ -29,32 +29,13 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: python3 -m phase2.current_observation_dispatch_relay validate
 
-  consume:
-    needs: validation
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-      issues: write
-    steps:
-      - name: Checkout immutable relay implementation without persisted credentials
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          ref: ${{ github.workflow_sha }}
-          persist-credentials: false
-          fetch-depth: 1
-
-      - name: Revalidate and durably consume exact governed observation request
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: python3 -m phase2.current_observation_dispatch_relay consume
-
   current-observation-protected:
-    needs: consume
+    needs: validation
     runs-on: ubuntu-24.04
     environment: phase-2-allocator
     permissions:
       contents: read
-      issues: read
+      issues: write
     steps:
       - name: Checkout immutable same-run protected implementation without persisted credentials
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
