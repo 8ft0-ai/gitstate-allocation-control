@@ -66,6 +66,7 @@ class ValidatedRequest:
 class ExecutionProgress:
     request: ValidatedRequest | None = None
     marker_id: int | None = None
+    audit_summary_written: bool = False
 
 
 def _positive_int(value: object, code: str) -> int:
@@ -259,16 +260,6 @@ class GitHubRelayAPI:
             raise RelayError("REQUEST_TAG_READ_INVALID")
         return payload
 
-    def get_allocator_app(self) -> Mapping[str, object]:
-        payload = self._request_json(
-            "GET",
-            f"/apps/{FIXED_ALLOCATOR_APP_SLUG}",
-            error_code="ALLOCATOR_APP_READ_FAILED",
-        )
-        if not isinstance(payload, Mapping):
-            raise RelayError("ALLOCATOR_APP_CAPABILITY_MISMATCH")
-        return payload
-
     def create_consumption_comment(
         self, issue_number: int, body: str
     ) -> Mapping[str, object]:
@@ -392,19 +383,6 @@ def _revalidate_tag(api: GitHubRelayAPI, request: ValidatedRequest) -> None:
         raise RelayError("REQUEST_TAG_TARGET_INVALID")
     if obj.get("type") != "commit" or obj.get("sha") != request.ref_sha:
         raise RelayError("REQUEST_TAG_TARGET_MISMATCH")
-
-
-def _revalidate_allocator_app_capability(api: GitHubRelayAPI) -> None:
-    payload = api.get_allocator_app()
-    permissions = payload.get("permissions")
-    if (
-        payload.get("id") != FIXED_ALLOCATOR_APP_ID
-        or payload.get("slug") != FIXED_ALLOCATOR_APP_SLUG
-        or not isinstance(permissions, Mapping)
-        or permissions.get("environments") != "read"
-        or permissions.get("metadata") != "read"
-    ):
-        raise RelayError("ALLOCATOR_APP_CAPABILITY_MISMATCH")
 
 
 def _workflow_sha(values: Mapping[str, str]) -> str:
@@ -536,7 +514,6 @@ def validate_request(
 ) -> ValidatedRequest:
     request = _event_request(values, _load_event(values) if event is None else event)
     _revalidate_current_issue(api, request)
-    _revalidate_allocator_app_capability(api)
     return request
 
 
@@ -544,6 +521,7 @@ def consume_request(
     values: Mapping[str, str],
     *,
     api: GitHubRelayAPI,
+    protected_capability_check: Callable[[], None],
     event: Mapping[str, object] | None = None,
     progress: ExecutionProgress | None = None,
 ) -> tuple[ValidatedRequest, int]:
@@ -559,9 +537,10 @@ def consume_request(
     if _matching_markers(comments, request):
         raise RelayError("REQUEST_ALREADY_CONSUMED")
 
-    # Re-read the live public App registration as the final mutable external
-    # precondition before the one durable consumption write.
-    _revalidate_allocator_app_capability(api)
+    # The final mutable external precondition must be proven inside the
+    # protected environment, after all request/run/tag/prior-marker gates and
+    # immediately before the one durable consumption write.
+    protected_capability_check()
 
     marker_body = _marker_body(request, values)
     created = api.create_consumption_comment(request.issue_number, marker_body)
@@ -686,6 +665,34 @@ def _write_summary(values: Mapping[str, str], payload: Mapping[str, object]) -> 
     return True
 
 
+def _run_preconsumption_protected_capability(
+    values: Mapping[str, str],
+) -> None:
+    # This function is intentionally called only after request/run/tag/no-marker
+    # gates have succeeded. Do not move secret access above those gates.
+    from . import current_observation
+
+    app_id = _env_positive_int(values, "PHASE2_ALLOCATOR_APP_ID")
+    if app_id != FIXED_ALLOCATOR_APP_ID:
+        raise RelayError("PROTECTED_ALLOCATOR_APP_ID_MISMATCH")
+    installation_id = _env_positive_int(values, "PHASE2_ALLOCATOR_INSTALLATION_ID")
+    private_key = values.get("PHASE2_ALLOCATOR_APP_PRIVATE_KEY", "")
+    if not isinstance(private_key, str) or not private_key:
+        raise RelayError("PROTECTED_ALLOCATOR_PRIVATE_KEY_MISSING")
+
+    try:
+        current_observation.prove_preconsumption_allocator_capability(
+            app_id=app_id,
+            installation_id=installation_id,
+            private_key=private_key,
+            api_url=values.get("GITHUB_API_URL", "https://api.github.com"),
+        )
+    except Exception as exc:
+        raise RelayError("PROTECTED_CAPABILITY_CHECK_FAILED") from exc
+    finally:
+        private_key = ""
+
+
 def _run_protected_observation(
     values: Mapping[str, str],
     *,
@@ -693,11 +700,28 @@ def _run_protected_observation(
     event: Mapping[str, object] | None = None,
     progress: ExecutionProgress | None = None,
 ) -> int:
+    execution = ExecutionProgress() if progress is None else progress
+    request, marker_id = consume_request(
+        values,
+        api=api,
+        protected_capability_check=lambda: _run_preconsumption_protected_capability(values),
+        event=event,
+        progress=execution,
+    )
+    payload = _safe_execution_payload(
+        values=values,
+        request=request,
+        marker_id=marker_id,
+    )
+    if not _write_summary(values, payload):
+        raise RelayError("AUDIT_SUMMARY_WRITE_FAILED")
+    execution.audit_summary_written = True
+
     request = reconstruct_protected_request(
         values,
         api=api,
         event=event,
-        progress=progress,
+        progress=execution,
     )
 
     from . import current_observation
@@ -722,7 +746,7 @@ def _run_protected_observation(
 
 def main(argv: list[str] | None = None) -> int:
     arguments = sys.argv[1:] if argv is None else argv
-    if arguments not in (["validate"], ["consume"], ["protected"]):
+    if arguments not in (["validate"], ["protected"]):
         print(json.dumps({"status": "BLOCKED", "reason_code": "RELAY_ARGUMENT_INVALID"}))
         return 2
 
@@ -746,42 +770,6 @@ def main(argv: list[str] | None = None) -> int:
                 api=api,
                 progress=progress,
             )
-
-        request, marker_id = consume_request(
-            values,
-            api=api,
-            progress=progress,
-        )
-        payload = _safe_execution_payload(
-            values=values,
-            request=request,
-            marker_id=marker_id,
-        )
-        summary_written = _write_summary(values, payload)
-        if not summary_written:
-            print(
-                json.dumps(
-                    {
-                        "status": "AUDIT_SUMMARY_WRITE_FAILED",
-                        "audit_summary_written": False,
-                        **payload,
-                    },
-                    sort_keys=True,
-                )
-            )
-            return 2
-
-        print(
-            json.dumps(
-                {
-                    "status": "CONSUMPTION_COMPLETE",
-                    "audit_summary_written": True,
-                    **payload,
-                },
-                sort_keys=True,
-            )
-        )
-        return 0
     except RelayError as exc:
         payload = _safe_execution_payload(
             values=values,
@@ -789,9 +777,7 @@ def main(argv: list[str] | None = None) -> int:
             marker_id=progress.marker_id,
             reason_code=str(exc).split(":", 1)[0],
         )
-        summary_written = False
-        if arguments == ["consume"]:
-            summary_written = _write_summary(values, payload)
+        summary_written = progress.audit_summary_written
         print(
             json.dumps(
                 {
