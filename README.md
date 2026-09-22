@@ -35,9 +35,11 @@ Only after those gates pass may the protected job lazily use the allocator App k
 
 #### Immutable runtime-subject rollover
 
-A consumed `current_observation` subject is not a reusable execution identity. Because protected execution is fixed to `main` and requires the requested direct tag target, `GITHUB_SHA` and `GITHUB_WORKFLOW_SHA` to identify the same commit on run attempt 1, a later separately governed observation must use a fresh reviewed protected-`main` commit and a fresh direct `refs/tags/gitstate-current-observation/<commit>` tag.
+The runtime's durable replay guard is request-scoped: consumption markers are bound to the governed request attempt. Independently, protected execution is fixed to `main` and requires the requested direct tag target, `GITHUB_SHA` and `GITHUB_WORKFLOW_SHA` to identify the same commit on run attempt 1.
 
-The immutable observation tag namespace is append-only: an existing subject tag is never moved, replaced or reused for another request. Establishing a fresh runtime subject does not itself create or authorise an observation request, retry, allocation, Workstream D action or Workstream E action; those remain separate governance boundaries.
+Subject freshness is a separate governance precondition for any later separately authorised observation. Governance must not authorise a new request that reuses a previously consumed immutable subject; a successor must instead use a fresh reviewed protected-`main` commit and a fresh direct `refs/tags/gitstate-current-observation/<commit>` tag.
+
+The immutable observation tag namespace is append-only: an existing subject tag is never moved or replaced. Tag immutability preserves the selected subject but does not make runtime consumption subject-global. Establishing a fresh runtime subject does not itself create or authorise an observation request, retry, allocation, Workstream D action or Workstream E action; those remain separate governance boundaries.
 
 ## Trust boundary
 
