@@ -32,6 +32,15 @@ The path is structurally fixed to repository `8ft0-ai/gitstate-allocation-contro
 
 Only after those gates pass may the protected job lazily use the allocator App key to prove the fixed App registration, live installation identity and the exact reduced `environments:read` + `metadata:read` capability by minting, using and positively revoking the control-repository environment-observation token. That proof and the durable consequence are colocated: only after the live capability proof succeeds does the same protected job write and positively re-read exactly one public-safe consumption marker. It then independently reconstructs the current request, exact marker and governed tag again before entering the existing observation engine. No second `workflow_dispatch`, outbound dispatch transport or `actions: write` authority exists on this path. The public recipient certificate is reconstructed from the freshly revalidated request body and is not echoed to logs, summaries or diagnostics; recipient private-key material is never accepted.
 
+
+#### Immutable runtime-subject rollover
+
+The runtime's durable replay guard is request-scoped: consumption markers are bound to the governed request attempt. Independently, protected execution is fixed to `main` and requires the requested direct tag target, `GITHUB_SHA` and `GITHUB_WORKFLOW_SHA` to identify the same commit on run attempt 1.
+
+Subject freshness is a separate governance precondition for any later separately authorised observation. Governance must not authorise a new request that reuses a previously consumed immutable subject; a successor must instead use a fresh reviewed protected-`main` commit and a fresh direct `refs/tags/gitstate-current-observation/<commit>` tag.
+
+The immutable observation tag namespace is append-only: an existing subject tag is never moved or replaced. Tag immutability preserves the selected subject but does not make runtime consumption subject-global. Establishing a fresh runtime subject does not itself create or authorise an observation request, retry, allocation, Workstream D action or Workstream E action; those remain separate governance boundaries.
+
 ## Trust boundary
 
 The static job validates the repository and current control-surface metadata, strictly parses requests and authorises actor namespaces with a read-only workflow token. It does not attempt to read allocator App registration metadata, receive allocator credentials or create durable consumption authority.
