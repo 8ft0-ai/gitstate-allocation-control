@@ -41,6 +41,12 @@ Subject freshness is a separate governance precondition for any later separately
 
 The immutable observation tag namespace is append-only: an existing subject tag is never moved or replaced. Tag immutability preserves the selected subject but does not make runtime consumption subject-global. Establishing a fresh runtime subject does not itself create or authorise an observation request, retry, allocation, Workstream D action or Workstream E action; those remain separate governance boundaries.
 
+#### Content-addressed successor-readiness handoff
+
+A fresh runtime subject may be handed to separately governed Gitstate Lab successor governance only through `gitstate-current-observation-runtime-subject-readiness-reconciliation/v2`. The v2 payload is canonical JSON and must carry the exact status `READY_FOR_GITSTATE_LAB_FRESH_SUCCESSOR_OBSERVATION_GOVERNANCE`, the fresh subject/tree/direct protected tag, the active immutable-tag ruleset, zero matching request/consumption/execution/rerun counts, and explicit negative authority/consequence fields. `phase2.current_observation_readiness` validates and renders this closed payload and computes independent body and payload SHA-256 identities. A missing, altered or paraphrased status is not equivalent evidence.
+
+The readiness handoff remains implementation/readiness evidence only. It does not authorise a Gitstate Lab successor, observation request, workflow dispatch, rerun, Workstream D action, Workstream E action or canonical/retained-state mutation. A later receiver must bind the exact handoff comment plus body/payload digests and independently re-establish contemporaneous subject-global duplicate exclusion before any observation authority or request.
+
 ## Trust boundary
 
 The static job validates the repository and current control-surface metadata, strictly parses requests and authorises actor namespaces with a read-only workflow token. It does not attempt to read allocator App registration metadata, receive allocator credentials or create durable consumption authority.

@@ -20,13 +20,36 @@ from .governance_state_v3 import (
     GuardedExecutionManifestV3,
     GovernanceStateV3,
     attach_manifest_comment_id_v3,
+    parse_governance_comments_for_manifest_v3,
     parse_guarded_execution_manifest_v3,
     reduce_governance_history_v3,
     validate_governance_history_v3,
     validate_transition_witness_v3,
 )
+from .operator_manifest_v1 import parse_governance_comments as _parse_governance_comments_v1
 from .operator_manifest_v2 import MANIFEST_V2_CONTRACT
-from .operator_manifest_v3 import MANIFEST_V3_CONTRACT
+from .operator_manifest_v3 import ExecutionManifestV3, MANIFEST_V3_CONTRACT
+
+
+def parse_governance_comments_for_manifest(
+    manifest,
+    comments,
+    *,
+    expected_owner: str,
+    expected_issue: int,
+):
+    if isinstance(manifest, ExecutionManifestV3):
+        return parse_governance_comments_for_manifest_v3(
+            manifest,
+            comments,
+            expected_owner=expected_owner,
+            expected_issue=expected_issue,
+        )
+    return _parse_governance_comments_v1(
+        comments,
+        expected_owner=expected_owner,
+        expected_issue=expected_issue,
+    )
 
 
 def attach_manifest_comment_id(manifest, manifest_comment_id: int):

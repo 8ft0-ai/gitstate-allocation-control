@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, replace
-from typing import Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 from . import governance_state_v1 as _state_v1
 from . import governance_state_v2 as _v2
@@ -10,6 +11,11 @@ from .operator_manifest_v3 import (
     MANIFEST_V3_FIELDS,
     ExecutionManifestV3,
     parse_execution_manifest_v3,
+)
+from .current_observation_readiness import (
+    CONTROL_REPOSITORY as READINESS_CONTROL_REPOSITORY,
+    READINESS_CONTRACT as CURRENT_OBSERVATION_READINESS_CONTRACT,
+    READINESS_STATUS_READY,
 )
 from .transition_witness import TransitionWitness
 
@@ -89,6 +95,316 @@ def parse_guarded_execution_manifest_v3(
     )
 
 
+EXTERNAL_PROPOSAL_FIELDS = frozenset(
+    {
+        "contract",
+        "record_type",
+        "proposal_contract",
+        "governing_issue",
+        "operation",
+        "manifest_contract",
+        "lineage_id",
+        "implementation",
+        "governance",
+        "transport_preparation",
+        "current_observation_execution",
+        "external_readiness",
+        "constraints",
+    }
+)
+EXTERNAL_PROPOSAL_CONTRACT = "gitstate-v3-first-manifest-proposal/v4"
+EXTERNAL_IMPLEMENTATION_FIELDS = frozenset(
+    {
+        "repository",
+        "commit",
+        "tree",
+        "workflow",
+        "module_blobs",
+        "protocol_sha",
+        "protected_tag",
+        "relay_workflow",
+        "relay_module",
+        "policy_blob",
+    }
+)
+EXTERNAL_READINESS_FIELDS = frozenset(
+    {
+        "repository",
+        "pr",
+        "comment_id",
+        "contract",
+        "body_sha256",
+        "payload_sha256",
+        "provenance_class",
+        "subject_commit",
+        "subject_tree",
+        "protected_tag",
+        "readiness_status",
+        "matching_request_count_at_handoff",
+        "matching_consumption_count_at_handoff",
+        "matching_execution_count_at_handoff",
+        "matching_rerun_count_at_handoff",
+    }
+)
+EXTERNAL_LINEAGE = re.compile(
+    r"^gitstate-lab#([1-9][0-9]*)/v3-first-manifest/([1-9][0-9]*)$"
+)
+EXTERNAL_RECORD_DOMAIN = "gitstate-external-proposal-record/v1"
+EXTERNAL_LINEAGE_DOMAIN = "gitstate-external-proposal-lineage/v1"
+
+
+def external_proposal_record_id(comment_id: int, body_sha256: str) -> str:
+    if type(comment_id) is not int or comment_id <= 0:
+        raise _manifest_v1.OperatorContractError("GOVERNANCE_COMMENT_INVALID")
+    _manifest_v1._require_hex(
+        body_sha256, _manifest_v1.SHA256, "GOVERNANCE_BODY_DIGEST_MISMATCH"
+    )
+    return _manifest_v1.sha256_text(
+        f"{EXTERNAL_RECORD_DOMAIN}\n{comment_id}\n{body_sha256}"
+    )
+
+
+def external_proposal_lineage_id(lineage_id: str) -> str:
+    if not isinstance(lineage_id, str) or EXTERNAL_LINEAGE.fullmatch(lineage_id) is None:
+        raise _manifest_v1.OperatorContractError("GOVERNANCE_SUBJECT_INVALID")
+    return _manifest_v1.sha256_text(f"{EXTERNAL_LINEAGE_DOMAIN}\n{lineage_id}")
+
+
+def _external_proposal_source_v3(
+    comment: Mapping[str, Any],
+    manifest: ExecutionManifestV3,
+    *,
+    expected_owner: str,
+) -> _manifest_v1.GovernanceRecord:
+    comment_id = comment.get("id")
+    body = comment.get("body")
+    if type(comment_id) is not int or comment_id <= 0 or not isinstance(body, str):
+        raise _manifest_v1.OperatorContractError("GOVERNANCE_COMMENT_INVALID")
+    if comment_id != manifest.proposal.comment_id:
+        raise _manifest_v1.OperatorContractError("GOVERNANCE_RECORD_INVALID")
+
+    lines = body.splitlines()
+    reserved_like = [line for line in lines if line.startswith("/gitstate-governance-v1")]
+    machine_lines = [
+        line for line in lines if line.startswith(_manifest_v1.GOVERNANCE_PREFIX)
+    ]
+    if len(reserved_like) != 1 or len(machine_lines) != 1:
+        raise _manifest_v1.OperatorContractError("GOVERNANCE_RESERVED_LINE_INVALID")
+
+    user = comment.get("user")
+    if not isinstance(user, Mapping) or user.get("login") != expected_owner:
+        raise _manifest_v1.OperatorContractError("GOVERNANCE_WRONG_OWNER")
+    created = comment.get("created_at")
+    updated = comment.get("updated_at")
+    _manifest_v1._parse_time(created, "GOVERNANCE_COMMENT_TIME_INVALID")
+    if created != updated:
+        raise _manifest_v1.OperatorContractError("GOVERNANCE_SOURCE_EDITED")
+
+    body_digest = _manifest_v1.sha256_text(body)
+    if body_digest != manifest.proposal.body_sha256:
+        raise _manifest_v1.OperatorContractError("GOVERNANCE_BODY_DIGEST_MISMATCH")
+
+    value = _manifest_v1._strict_json(
+        machine_lines[0][len(_manifest_v1.GOVERNANCE_PREFIX) :],
+        "GOVERNANCE_JSON_INVALID",
+    )
+    _manifest_v1._require_exact_keys(
+        value, EXTERNAL_PROPOSAL_FIELDS, "GOVERNANCE_SCHEMA_MISMATCH"
+    )
+    if value.get("contract") != _manifest_v1.GOVERNANCE_CONTRACT:
+        raise _manifest_v1.OperatorContractError("GOVERNANCE_CONTRACT_MISMATCH")
+    if value.get("record_type") != "proposal":
+        raise _manifest_v1.OperatorContractError("GOVERNANCE_RECORD_TYPE_INVALID")
+    proposal_contract = value.get("proposal_contract")
+    if proposal_contract != EXTERNAL_PROPOSAL_CONTRACT:
+        raise _manifest_v1.OperatorContractError("GOVERNANCE_EXTERNAL_PROPOSAL_CONTRACT_INVALID")
+    if value.get("governing_issue") != manifest.governing_issue:
+        raise _manifest_v1.OperatorContractError("GOVERNANCE_ISSUE_MISMATCH")
+    if value.get("operation") != manifest.operation:
+        raise _manifest_v1.OperatorContractError("GOVERNANCE_OPERATION_INVALID")
+    if value.get("manifest_contract") != "gitstate-live-execution-manifest/v3":
+        raise _manifest_v1.OperatorContractError("GOVERNANCE_EXTERNAL_MANIFEST_CONTRACT_INVALID")
+
+    external_lineage = value.get("lineage_id")
+    match = EXTERNAL_LINEAGE.fullmatch(external_lineage) if isinstance(external_lineage, str) else None
+    if match is None or int(match.group(1)) != manifest.governing_issue:
+        raise _manifest_v1.OperatorContractError("GOVERNANCE_SUBJECT_INVALID")
+
+    for key in (
+        "implementation",
+        "governance",
+        "transport_preparation",
+        "current_observation_execution",
+        "external_readiness",
+        "constraints",
+    ):
+        if not isinstance(value.get(key), dict):
+            raise _manifest_v1.OperatorContractError("GOVERNANCE_EXTERNAL_PROPOSAL_INVALID")
+
+    implementation = value["implementation"]
+    executor = manifest.payload["executor"]
+    if frozenset(implementation) != EXTERNAL_IMPLEMENTATION_FIELDS:
+        raise _manifest_v1.OperatorContractError("GOVERNANCE_EXTERNAL_IMPLEMENTATION_MISMATCH")
+    if (
+        implementation.get("repository") != executor["repository"]
+        or implementation.get("commit") != executor["commit_sha"]
+        or implementation.get("tree") != executor["tree_sha"]
+        or implementation.get("protocol_sha") != manifest.payload["protocol_sha"]
+        or implementation.get("protected_tag")
+        != f"refs/tags/gitstate-current-observation/{executor['commit_sha']}"
+    ):
+        raise _manifest_v1.OperatorContractError("GOVERNANCE_EXTERNAL_IMPLEMENTATION_MISMATCH")
+
+    readiness = value["external_readiness"]
+    if frozenset(readiness) != EXTERNAL_READINESS_FIELDS:
+        raise _manifest_v1.OperatorContractError("GOVERNANCE_EXTERNAL_READINESS_MISMATCH")
+    if (
+        readiness.get("repository") != READINESS_CONTROL_REPOSITORY
+        or readiness.get("contract") != CURRENT_OBSERVATION_READINESS_CONTRACT
+        or readiness.get("readiness_status") != READINESS_STATUS_READY
+        or readiness.get("subject_commit") != executor["commit_sha"]
+        or readiness.get("subject_tree") != executor["tree_sha"]
+        or readiness.get("protected_tag")
+        != f"refs/tags/gitstate-current-observation/{executor['commit_sha']}"
+    ):
+        raise _manifest_v1.OperatorContractError("GOVERNANCE_EXTERNAL_READINESS_MISMATCH")
+    for key in ("body_sha256", "payload_sha256"):
+        _manifest_v1._require_hex(
+            readiness.get(key),
+            _manifest_v1.SHA256,
+            "GOVERNANCE_EXTERNAL_READINESS_MISMATCH",
+        )
+    for key in (
+        "matching_request_count_at_handoff",
+        "matching_consumption_count_at_handoff",
+        "matching_execution_count_at_handoff",
+        "matching_rerun_count_at_handoff",
+    ):
+        if type(readiness.get(key)) is not int or readiness.get(key) != 0:
+            raise _manifest_v1.OperatorContractError("GOVERNANCE_EXTERNAL_READINESS_MISMATCH")
+
+    record_id = external_proposal_record_id(comment_id, body_digest)
+    lineage_id = external_proposal_lineage_id(str(external_lineage))
+    synthetic = {
+        "contract": _manifest_v1.GOVERNANCE_CONTRACT,
+        "record_id": record_id,
+        "record_type": "proposal",
+        "governing_issue": manifest.governing_issue,
+        "operation": manifest.operation,
+        "subject": {
+            "lineage_id": lineage_id,
+            "record_ids": [],
+            "comment_bindings": [],
+        },
+        "details": {"disposition": "proposed"},
+        "workstream_e_authorised": False,
+    }
+    source = _manifest_v1.GovernanceSource(
+        comment_id=comment_id,
+        body=body,
+        owner=str(user["login"]),
+        created_at=str(created),
+        updated_at=str(updated),
+    )
+    return _manifest_v1.GovernanceRecord(
+        _state_v1._freeze(synthetic), comment_id, body_digest, source
+    )
+
+
+def parse_governance_comments_for_manifest_v3(
+    manifest: ExecutionManifestV3,
+    comments: Iterable[Mapping[str, Any]],
+    *,
+    expected_owner: str,
+    expected_issue: int,
+) -> tuple[_manifest_v1.GovernanceRecord, ...]:
+    if not isinstance(manifest, ExecutionManifestV3):
+        raise _manifest_v1.OperatorContractError("MANIFEST_CONTRACT_MISMATCH")
+    if expected_issue != manifest.governing_issue:
+        raise _manifest_v1.OperatorContractError("GOVERNANCE_ISSUE_MISMATCH")
+
+    records: list[_manifest_v1.GovernanceRecord] = []
+    seen_comments: set[int] = set()
+    seen_records: set[str] = set()
+    for comment in comments:
+        comment_id = comment.get("id")
+        if comment_id == manifest.proposal.comment_id:
+            body = comment.get("body")
+            if not isinstance(body, str):
+                raise _manifest_v1.OperatorContractError("GOVERNANCE_COMMENT_INVALID")
+            lines = body.splitlines()
+            machine_lines = [
+                line for line in lines if line.startswith(_manifest_v1.GOVERNANCE_PREFIX)
+            ]
+            if len(machine_lines) != 1:
+                raise _manifest_v1.OperatorContractError("GOVERNANCE_RESERVED_LINE_INVALID")
+            value = _manifest_v1._strict_json(
+                machine_lines[0][len(_manifest_v1.GOVERNANCE_PREFIX) :],
+                "GOVERNANCE_JSON_INVALID",
+            )
+            if frozenset(value) == _manifest_v1.GOVERNANCE_FIELDS:
+                record = _v2.parse_governance_comment_v2(
+                    comment,
+                    expected_owner=expected_owner,
+                    expected_issue=expected_issue,
+                    expected_body_sha256=manifest.proposal.body_sha256,
+                )
+            elif frozenset(value) == EXTERNAL_PROPOSAL_FIELDS:
+                record = _external_proposal_source_v3(
+                    comment, manifest, expected_owner=expected_owner
+                )
+            else:
+                raise _manifest_v1.OperatorContractError("GOVERNANCE_SCHEMA_MISMATCH")
+        else:
+            record = _v2.parse_governance_comment_v2(
+                comment,
+                expected_owner=expected_owner,
+                expected_issue=expected_issue,
+            )
+        if record is None:
+            continue
+        if record.comment_id in seen_comments:
+            raise _manifest_v1.OperatorContractError("GOVERNANCE_DUPLICATE_COMMENT_ID")
+        if record.record_id in seen_records:
+            raise _manifest_v1.OperatorContractError("GOVERNANCE_DUPLICATE_RECORD_ID")
+        seen_comments.add(record.comment_id)
+        seen_records.add(record.record_id)
+        records.append(record)
+    return tuple(sorted(records, key=lambda item: item.comment_id))
+
+
+def _records_from_sources_v3(
+    manifest: GuardedExecutionManifestV3,
+    sources: tuple[_manifest_v1.GovernanceSource, ...],
+) -> tuple[_manifest_v1.GovernanceRecord, ...]:
+    comments: list[dict[str, Any]] = []
+    previous = 0
+    for source in sources:
+        if not isinstance(source, _manifest_v1.GovernanceSource):
+            raise _state_v1.GovernanceStateError("GOVERNANCE_HISTORY_CHANGED")
+        if source.comment_id <= previous:
+            raise _state_v1.GovernanceStateError("GOVERNANCE_HISTORY_CHANGED")
+        previous = source.comment_id
+        comments.append(
+            {
+                "id": source.comment_id,
+                "body": source.body,
+                "user": {"login": source.owner},
+                "created_at": source.created_at,
+                "updated_at": source.updated_at,
+            }
+        )
+    try:
+        return parse_governance_comments_for_manifest_v3(
+            manifest,
+            comments,
+            expected_owner=_manifest_v1.GOVERNANCE_OWNER,
+            expected_issue=manifest.governing_issue,
+        )
+    except (_manifest_v1.OperatorContractError, TypeError, ValueError, KeyError) as exc:
+        raise _state_v1.GovernanceStateError("GOVERNANCE_HISTORY_CHANGED") from exc
+
+
 def validate_governance_history_v3(
     manifest: GuardedExecutionManifestV3,
     history: _state_v1.GovernanceHistory,
@@ -100,7 +416,7 @@ def validate_governance_history_v3(
     if history.manifest_sha256 != manifest.sha256 or not isinstance(history.records, tuple):
         raise _state_v1.GovernanceStateError("GOVERNANCE_HISTORY_CHANGED")
 
-    records = _v2._records_from_sources_v2(manifest, history.records)
+    records = _records_from_sources_v3(manifest, history.records)
     if any(record.operation != manifest.operation for record in records):
         raise _state_v1.GovernanceStateError("GOVERNANCE_HISTORY_CHANGED")
     actual = _state_v1.governance_history_baseline(records)

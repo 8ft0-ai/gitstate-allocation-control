@@ -15,6 +15,7 @@ from .governance_state import (
     GovernanceHistory,
     GuardedExecutionManifest,
     build_governance_history,
+    parse_governance_comments_for_manifest,
     parse_guarded_execution_manifest,
 )
 from .github_api import GitHubAPI, GitHubAPIError
@@ -28,7 +29,6 @@ from .operator_manifest import (
     OperatorContractError,
     canonical_json,
     operator_history_baseline,
-    parse_governance_comments,
     parse_v1_operator_history,
     sha256_text,
 )
@@ -396,7 +396,8 @@ def parse_projection_comment(
         raise PreflightProjectionError("PREFLIGHT_GOVERNANCE_HISTORY_INVALID")
     source_comments = [_source_comment(item) for item in source_values]
     try:
-        records = parse_governance_comments(
+        records = parse_governance_comments_for_manifest(
+            manifest,
             source_comments,
             expected_owner=GOVERNANCE_OWNER,
             expected_issue=manifest.governing_issue,
